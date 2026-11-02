@@ -160,6 +160,118 @@ fn placeholder_streamed_deltas_count_as_one_message() {
 }
 
 #[test]
+fn a_fast_line_marks_its_hour_buckets_fast() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("fast.jsonl");
+    std::fs::write(
+        &path,
+        [
+            r#"{"timestamp":"2026-10-28T09:00:00+00:00","message":{"id":"msg_fast","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":2,"speed":"fast"}}}"#,
+            r#"{"timestamp":"2026-10-28T15:00:00+00:00","message":{"id":"msg_std","model":"claude-opus-5-5","usage":{"input_tokens":30,"output_tokens":40,"cache_read_input_tokens":7,"cache_creation_input_tokens":3,"speed":"standard"}}}"#,
+            // An older client writes no speed at all: standard, never guessed.
+            r#"{"timestamp":"2026-10-28T16:00:00+00:00","message":{"id":"msg_old","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let recs = parse_file(&path);
+    assert_eq!(recs.len(), 3);
+    let by_key = |key: &str| {
+        recs.iter()
+            .find(|r| r.tok_key == key)
+            .unwrap_or_else(|| panic!("no rec for {key}"))
+    };
+    assert!(by_key("msg_fast").fast, "usage.speed fast marks the line");
+    assert!(!by_key("msg_std").fast, "a standard line stays standard");
+    assert!(
+        !by_key("msg_old").fast,
+        "an absent speed is standard, not guessed"
+    );
+
+    // The fast subset rides the same hour buckets the totals do.
+    let mut acc = ModelDayAcc {
+        flat: ModelTokens {
+            model: "claude-opus-5-5".into(),
+            input: 41,
+            output: 62,
+            cache_read: 12,
+            cache_create: 5,
+            shape: UsageShape::Healthy,
+            ..Default::default()
+        },
+        hours: [HourTokens::default(); 24],
+    };
+    for r in &recs {
+        add_to_hour(&mut acc.hours[r.hour as usize], r);
+    }
+    assert_eq!(acc.hours[9].fast_output, 20);
+    assert_eq!(acc.hours[9].output, 20);
+    assert_eq!(acc.hours[9].fast_input, 10);
+    assert_eq!(acc.hours[9].fast_cache_read, 5);
+    assert_eq!(acc.hours[15].output, 40);
+    assert_eq!(acc.hours[15].fast_output, 0);
+    assert_eq!(acc.hours[16].output, 2, "an absent speed adds nothing fast");
+}
+
+/// The fast subset rides the flat aggregates beside the hour buckets: the
+/// lifetime model rows the merge accumulates, the pushed day rows' splits,
+/// and the buckets themselves always agree.
+#[test]
+fn a_fast_line_fills_the_flat_lifetime_aggregate_fast() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(
+        project.join("session.jsonl"),
+        [
+            r#"{"timestamp":"2026-06-11T10:00:00+00:00","message":{"id":"msg_fast","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":2,"speed":"fast"}}}"#,
+            r#"{"timestamp":"2026-06-11T15:00:00+00:00","message":{"id":"msg_std","model":"claude-opus-5-5","usage":{"input_tokens":30,"output_tokens":40,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+
+    let m = stats
+        .models
+        .iter()
+        .find(|m| m.model == "claude-opus-5-5")
+        .expect("lifetime model row");
+    assert_eq!(
+        (m.input, m.output, m.cache_read, m.cache_create),
+        (40, 60, 12, 5)
+    );
+    assert_eq!(
+        (
+            m.fast_input,
+            m.fast_output,
+            m.fast_cache_read,
+            m.fast_cache_create
+        ),
+        (10, 20, 5, 2),
+        "the fast subset rides the lifetime aggregate beside the totals"
+    );
+
+    let row = stats
+        .daily_models
+        .iter()
+        .find(|d| d.model == "claude-opus-5-5")
+        .expect("day row");
+    let split = row.split.as_ref().expect("split");
+    assert_eq!((split.fast_input, split.fast_output), (10, 20));
+    assert_eq!(
+        row.hours.as_ref().expect("hours")[10].fast_output,
+        20,
+        "the bucket and the flat split agree on the fast subset"
+    );
+}
+
+#[test]
 fn transcript_usage_without_a_model_keeps_unknown_bucket() {
     let sb = HomeSandbox::new();
     let dir = make_claude_dir(&sb);
@@ -174,6 +286,242 @@ fn transcript_usage_without_a_model_keeps_unknown_bucket() {
     assert!(records[0].has_usage);
     assert_eq!(records[0].model, "unknown");
     assert_eq!((records[0].input, records[0].output), (3, 1));
+}
+
+/// A read error that never clears (a `.jsonl` that is really a directory) ends
+/// the parse instead of looping forever. The read runs on a thread behind a
+/// bounded wait, so the loop fails by assertion instead of hanging the suite;
+/// `std` cannot cancel that thread, so a red leaves it spinning until the test
+/// process exits.
+#[cfg(unix)]
+#[test]
+fn a_persistent_read_error_ends_parse_file() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let target = dir.join("not-a-file-dir");
+    std::fs::create_dir_all(&target).expect("create target directory");
+    let path = dir.join("dir.jsonl");
+    std::os::unix::fs::symlink(&target, &path).expect("symlink transcript to a directory");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_path = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_file(&thread_path));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_file did not return within 10s: a persistent read error never ends the line loop"
+        );
+    };
+    assert!(
+        recs.is_empty(),
+        "a directory read yields no records, got {}",
+        recs.len()
+    );
+}
+
+/// One failed read is still skipped: a line that is not valid UTF-8 between two
+/// good lines drops only itself, so both good lines count.
+#[test]
+fn a_bad_utf8_line_between_two_good_lines_drops_only_itself() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let path = dir.join("mixed.jsonl");
+    let good_a = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let good_b = r#"{"timestamp":"2026-06-11T13:00:00+00:00","message":{"id":"b","usage":{"input_tokens":5,"output_tokens":2}}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(good_a.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&[0xff, 0xfe, b'x', b'\n']);
+    bytes.extend_from_slice(good_b.as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).expect("write transcript");
+
+    let recs = parse_file(&path);
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(tokens, vec![(3, 1), (5, 2)]);
+}
+
+/// A `BufRead` whose reads follow a script: each read yields either one line
+/// or an error. Once the script runs out, the last step repeats, so a trailing
+/// `Fail` is a read error that never clears.
+enum ReadStep {
+    Line(&'static str),
+    Fail,
+}
+
+struct ScriptedReader {
+    steps: Vec<ReadStep>,
+    next: usize,
+    served: Vec<u8>,
+    consumed: usize,
+    reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScriptedReader {
+    fn new(steps: Vec<ReadStep>, reads: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            steps,
+            next: 0,
+            served: Vec::new(),
+            consumed: 0,
+            reads,
+        }
+    }
+}
+
+impl std::io::Read for ScriptedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = std::io::BufRead::fill_buf(self)?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        std::io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+impl std::io::BufRead for ScriptedReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.consumed < self.served.len() {
+            return Ok(&self.served[self.consumed..]);
+        }
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let line = match &self.steps[self.next] {
+            ReadStep::Line(line) => Some(*line),
+            ReadStep::Fail => None,
+        };
+        if self.next + 1 < self.steps.len() {
+            self.next += 1;
+        }
+        match line {
+            Some(line) => {
+                // A newline-terminated read is what `read_until` needs to
+                // return the line before the next read's error arrives; a
+                // line without one reads as a partial line that the error
+                // discards, unlike any real transcript file.
+                self.served = format!("{line}\n").into_bytes();
+                self.consumed = 0;
+                Ok(&self.served)
+            }
+            None => Err(std::io::Error::other("scripted read failure")),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.consumed = (self.consumed + amt).min(self.served.len());
+    }
+}
+
+/// A reader that fails every read ends the parse after exactly three read
+/// attempts. The outcome alone (an empty list) cannot tell a capped loop from
+/// an early exit, so the read count is pinned too. The bounded wait turns a
+/// regression into a failed assertion instead of a hung suite.
+#[test]
+fn parse_lines_stops_after_three_consecutive_failed_reads() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(vec![ReadStep::Fail], std::sync::Arc::clone(&reads));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: a reader that fails every read never ends the loop"
+        );
+    };
+    assert!(
+        recs.is_empty(),
+        "a reader that never yields a line parses no records, got {}",
+        recs.len()
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "the loop must stop after the third failed read in a row"
+    );
+}
+
+/// Two failed reads, then a good line, then failed reads that never clear: the
+/// good line still counts, and the second run of failures stops the loop after
+/// three. Pins the failure counter's reset on the good read (6 reads, not 4)
+/// and the skip of a failed read (the good line survives two failures).
+#[test]
+fn parse_lines_counts_a_good_line_between_failed_read_runs() {
+    let good = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(
+        vec![
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line(good),
+            ReadStep::Fail,
+        ],
+        std::sync::Arc::clone(&reads),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: failed reads after a good line never end the loop"
+        );
+    };
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(
+        tokens,
+        vec![(3, 1)],
+        "the good line between two failed-read runs still counts"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        6,
+        "2 failed reads + 1 good read + 3 failed reads, then the loop stops"
+    );
+}
+
+/// A successful read resets the failure count even when its line records
+/// nothing: two failed reads, an unparseable line, two failed reads, a good
+/// line, then failed reads that never clear. The good line counts and the loop
+/// stops after 9 reads; a count reset only on a recorded line stops at the
+/// fourth read instead.
+#[test]
+fn parse_lines_resets_the_failure_count_on_an_unparseable_line() {
+    let good = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(
+        vec![
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line("not json"),
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line(good),
+            ReadStep::Fail,
+        ],
+        std::sync::Arc::clone(&reads),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: failed reads around an unparseable line never end the loop"
+        );
+    };
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(
+        tokens,
+        vec![(3, 1)],
+        "an unparseable line resets the failure count, so the later good line counts"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        9,
+        "2 failed + 1 unparseable + 2 failed + 1 good + 3 failed reads, then the loop stops"
+    );
 }
 
 // ── 1. base stats parsing ─────────────────────────────────────────────────────
@@ -284,6 +632,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 100,
             cache_create: 50,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "gpt-5.5".to_owned(),
@@ -292,6 +641,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "gemini-3-flash".to_owned(),
@@ -300,6 +650,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "claude-sonnet-4".to_owned(),
@@ -308,6 +659,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 50,
             cache_create: 25,
             shape: Default::default(),
+            ..Default::default()
         },
     ];
 
@@ -342,6 +694,7 @@ fn group_models_no_others_when_all_claude() {
         cache_read: 0,
         cache_create: 0,
         shape: Default::default(),
+        ..Default::default()
     }];
     let grouped = group_models(&models);
     assert!(grouped.iter().all(|m| m.model != "others"));
@@ -350,6 +703,46 @@ fn group_models_no_others_when_all_claude() {
 #[test]
 fn group_models_empty_input() {
     assert!(group_models(&[]).is_empty());
+}
+
+/// The "others" fold carries the fast subset beside the totals: a folded row
+/// holds the same fast split its sources do, so a fold never drops a fast
+/// token.
+#[test]
+fn group_models_others_fold_keeps_the_fast_tokens() {
+    let models = vec![
+        ModelTokens {
+            model: "tiny-a".to_owned(),
+            input: 200,
+            output: 100,
+            fast_input: 120,
+            fast_output: 60,
+            fast_cache_read: 30,
+            fast_cache_create: 3,
+            ..Default::default()
+        },
+        ModelTokens {
+            model: "tiny-b".to_owned(),
+            input: 100,
+            output: 50,
+            fast_input: 40,
+            fast_output: 20,
+            fast_cache_read: 10,
+            fast_cache_create: 1,
+            ..Default::default()
+        },
+    ];
+    let grouped = group_models(&models);
+    let others = grouped
+        .iter()
+        .find(|m| m.model == "others")
+        .expect("small models fold into others");
+    assert_eq!(others.input, 300);
+    assert_eq!(others.output, 150);
+    assert_eq!(others.fast_input, 160); // 120 + 40
+    assert_eq!(others.fast_output, 80); // 60 + 20
+    assert_eq!(others.fast_cache_read, 40); // 30 + 10
+    assert_eq!(others.fast_cache_create, 4); // 3 + 1
 }
 
 #[test]
@@ -363,6 +756,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         // < 1M total → folds into "others".
         ModelTokens {
@@ -372,6 +766,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "claude-opus-4-8".to_owned(),
@@ -380,6 +775,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
     ];
     let grouped = group_models(&models);
@@ -447,6 +843,8 @@ fn cache_hit_ratio_math() {
         first_session_date: None,
         last_computed_date: None,
         topped_up_through: None,
+        speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: None,
     };
     // cache_read / (cache_read + cache_create + input) = 500 / 2000 = 0.25
@@ -471,6 +869,8 @@ fn cache_hit_ratio_zero_denominator() {
         first_session_date: None,
         last_computed_date: None,
         topped_up_through: None,
+        speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: None,
     };
     assert_eq!(stats.cache_hit_ratio(), 0.0);
@@ -1300,6 +1700,7 @@ fn period_models_aggregates_range_and_split_flags() {
         cache_read: 500,
         cache_create: 5,
         shape: Default::default(),
+        ..Default::default()
     };
     let days = vec![
         // Outside the range — must not count.
@@ -1349,6 +1750,7 @@ fn period_model_metric_honors_split_completeness() {
         cache_read: 100,
         cache_create: 1,
         shape: Default::default(),
+        ..Default::default()
     };
     let full = PeriodModel::from_full(&m);
     assert_eq!(full.metric(false), 15);
@@ -1752,6 +2154,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         output: 20,
         cache_read: 500,
         cache_create: 5,
+        ..Default::default()
     };
     let mut h07 = [HourTokens::default(); 24];
     h07[9] = HourTokens {
@@ -1759,6 +2162,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         output: 8,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     let split_03 = ModelTokens {
         model: "claude-opus-4".into(),
@@ -1767,6 +2171,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         cache_read: 500,
         cache_create: 5,
         shape: Default::default(),
+        ..Default::default()
     };
     let split_07 = ModelTokens {
         model: "claude-opus-4".into(),
@@ -1775,6 +2180,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         cache_read: 0,
         cache_create: 0,
         shape: Default::default(),
+        ..Default::default()
     };
 
     let days = vec![
@@ -1849,6 +2255,48 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         gpt.days[0].hours.is_none(),
         "a split-bearing row without hours keeps None"
     );
+}
+
+/// The period aggregate's `split` folds each day's fast subset beside the
+/// totals, so it stays consistent with its own `days` rows: a period over one
+/// fast day carries the fast subset in `split`.
+#[test]
+fn period_models_split_carries_the_fast_token_subset() {
+    let fast_day = ModelTokens {
+        model: "claude-opus-4".into(),
+        input: 30,
+        output: 20,
+        cache_read: 500,
+        cache_create: 5,
+        fast_input: 12,
+        fast_output: 8,
+        fast_cache_read: 120,
+        fast_cache_create: 2,
+        shape: Default::default(),
+    };
+    let days = vec![day_model(
+        "2026-07-07",
+        "claude-opus-4",
+        50,
+        Some(fast_day),
+        None,
+    )];
+    let rows = period_models(&days, "2026-07-01", "2026-07-09");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].days[0].split.fast_input, 12,
+        "the day row carries the fast subset"
+    );
+    // The fold keeps the subset beside the totals: saturating, in-bounds.
+    assert_eq!(rows[0].split.fast_input, 12);
+    assert_eq!(rows[0].split.fast_output, 8);
+    assert_eq!(rows[0].split.fast_cache_read, 120);
+    assert_eq!(rows[0].split.fast_cache_create, 2);
+    // Totals unchanged by the subset fold.
+    assert_eq!(rows[0].split.input, 30);
+    assert_eq!(rows[0].split.output, 20);
+    assert_eq!(rows[0].split.cache_read, 500);
+    assert_eq!(rows[0].split.cache_create, 5);
 }
 
 /// [`file_hourly_model_tokens`] splits one multi-day transcript file by
@@ -1935,6 +2383,7 @@ fn backfill_fills_hours_when_corpus_totals_match() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2024,6 +2473,7 @@ fn backfill_leaves_mismatched_rows_untouched_and_marks_done() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2182,6 +2632,7 @@ fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2243,6 +2694,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2312,6 +2764,7 @@ fn backfill_persists_when_record_has_nothing_new() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2389,6 +2842,7 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2881,6 +3335,7 @@ fn lrec(input: u64, cache_read: u64) -> super::LineRec {
         cache_read,
         cache_create: 0,
         shape: UsageShape::Healthy,
+        fast: false,
         tool_calls: 0,
     }
 }
@@ -3537,5 +3992,41 @@ fn persist_ledger_rekeys_covered_days_onto_the_served_model() {
     assert_eq!(
         ledger.wire_model_fields("2026-06-14", "deepseek-v4-pro"),
         None
+    );
+}
+
+// ── tps: the tokens worker only reads the speed ledger ────────────────────────
+
+/// The tokens worker never writes `token_speed.json` (the producer folds it at
+/// day rollover); `persist_ledger` leaves the file untouched and the worker
+/// reads `TokenStats.speed_days` from it.
+#[test]
+fn persist_ledger_does_not_write_the_speed_ledger() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let clauth = sb.home().join(".clauth");
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::create_dir_all(&claude).unwrap();
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth);
+    let base = TokenStats::default();
+    persist_ledger(
+        &claude,
+        &mut ledger,
+        &clauth,
+        &base,
+        "2026-10-15",
+        |_, _| {},
+    );
+
+    assert!(
+        !clauth.join("token_speed.json").exists(),
+        "the tokens worker never writes the speed ledger"
+    );
+    assert!(
+        crate::token_ledger::SpeedLedger::load(&clauth)
+            .days
+            .is_empty(),
+        "an empty speed ledger loads empty"
     );
 }

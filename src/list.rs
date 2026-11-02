@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use crate::codex_profiles::CodexState;
 use crate::daemon::{ProfileEntry, build_codex_entries, build_profile_entries};
-use crate::format::format_pct;
+use crate::format::{format_pct, grapheme_cells};
 use crate::harness::Harness;
 use crate::out::out;
 use crate::profile::{AppConfig, load_config};
@@ -35,6 +35,7 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
         config.state.refresh_interval_ms,
         None,
         include_disabled,
+        &crate::claude_jobs::job_trees(),
     );
     out!("{}", render_table(&config, &entries));
     Ok(())
@@ -43,13 +44,13 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
 /// One rendered table row. Three sources for a claude row, because the status
 /// entry carries only the first: a single `build_profile_entries` profile
 /// entry, `config` for the disabled and keyless flags, and the profile's own
-/// `usage_cache.json` for the canceled one (via
+/// `usage_cache.json` for the canceled and org-refused ones (via
 /// `profile_json::is_canceled_cached`). A codex row reads its entry alone.
 struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,
     name: String,
-    /// Tier for an anthropic account (`Max 5x`), else the provider name for a
+    /// Tier for an anthropic account (`Max`), else the provider name for a
     /// third-party one; a codex account's ChatGPT plan, else `-`, since its
     /// provider names no plan. Typed off the entry's `tier` field, keeping this
     /// in lockstep with `status`. A canceled subscription reads as its
@@ -66,23 +67,31 @@ struct Row {
     /// surfaces cannot drift.
     keyless: bool,
     canceled: bool,
+    /// The organization refuses the account, named apart from `canceled`.
+    org_refused: bool,
     /// The entry's distrusted-reading flag, rendered as `(stale)`.
     stale: bool,
     /// Labels for dead credentials the user must act on. Two sources that
     /// can both fire on one hybrid (an OAuth pair plus a provider endpoint):
     /// `auth_status: "broken"` (the OAuth credential is dead — re-auth) and
     /// `fetch_status: "AuthExpired"` (the usage credential is dead and will not
-    /// self-heal). This table has no freshness column, so without the suffix
-    /// the stale window percentages above read as ordinary live numbers.
+    /// self-heal). The `key rejected` label additionally reads the durable
+    /// key-rejected verdict ([`crate::fallback::third_party_key_rejected`])
+    /// directly, so a hybrid whose key the provider refused is marked even when
+    /// a live daemon's OAuth store still reads the pair as Fresh. This table has
+    /// no freshness column, so without the suffix the stale window percentages
+    /// above read as ordinary live numbers.
     ///
-    /// Three fetch labels, because that state has three causes and they want
+    /// Four fetch labels, because that state has four causes and they want
     /// different actions: a stored session lapsed (`login expired`), none was
-    /// ever stored (`login needed`), or an api key the provider rejected
-    /// (`key rejected`). An api-key account reaches the second the moment it
+    /// ever stored (`login needed`), an api key the provider rejected
+    /// (`key rejected`), or a setup token the usage probe saw refused
+    /// (`token rejected`). An api-key account reaches the second the moment it
     /// gets a typed provider whose quota rides a separate credential, and
-    /// "expired" would tell that user to renew something they never had;
-    /// a non-Alibaba account reaches only the third, since it has no session
-    /// to lapse.
+    /// "expired" would tell that user to renew something they never had; a
+    /// non-Alibaba api-key account reaches only the third, since it has no
+    /// session to lapse, and an OAuth account whose sessions run on a setup
+    /// token reaches the fourth.
     usage_login: [Option<&'static str>; 2],
 }
 
@@ -132,30 +141,31 @@ impl Row {
             keyless: profile
                 .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
             canceled: claude && crate::profile_json::is_canceled_cached(typed_name),
+            org_refused: claude && crate::profile_json::is_org_refused_cached(typed_name),
             stale: entry.stale,
             usage_login: [
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),
-                (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
-                    if profile.is_some_and(|p| p.console.is_some()) {
-                        "login expired"
-                    } else if profile
-                        .is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))
-                    {
-                        // No console session can be the cause here: the verdict can
-                        // only come from a 401 on the api key.
-                        "key rejected"
-                    } else {
-                        "login needed"
-                    }
-                }),
+                profile
+                    .is_some_and(|p| crate::fallback::third_party_key_rejected(p, typed_name))
+                    .then(|| {
+                        if profile.is_some_and(crate::usage::dead_login_is_setup_token) {
+                            crate::format::DIAG_TOKEN_REJECTED
+                        } else {
+                            crate::format::DIAG_KEY_REJECTED
+                        }
+                    })
+                    .or_else(|| {
+                        (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
+                            profile.map_or("login needed", crate::format::auth_expired_label)
+                        })
+                    }),
             ],
         }
     }
 
     /// Trailing state marker: `(disabled)`, `(keyless)`, `(canceled)`,
-    /// `(stale)`, `(login expired)` /
-    /// `(login needed)`, or
-    /// any combination. All render rather than one winning — a user usually
+    /// `(org refused)`, `(stale)`, `(login expired)` / `(login needed)` /
+    /// `(key rejected)` / `(token rejected)`, or any combination. All render rather than one winning — a user usually
     /// disables an account BECAUSE it died, so letting `disabled` mask
     /// `canceled` is the erasure the Fallback tab's stacked pills already exist
     /// to prevent. One exception: the two dead-credential sources can render
@@ -168,6 +178,7 @@ impl Row {
             (self.disabled, "disabled"),
             (self.keyless, "keyless"),
             (self.canceled, "canceled"),
+            (self.org_refused, crate::format::DIAG_ORG_REFUSED),
             (self.stale, "stale"),
         ]
         .into_iter()
@@ -198,14 +209,28 @@ fn window_pct(windows: &[Window], label: &str) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// Minimum column width: the header vs every cell, counted in `char`s so a
-/// multibyte profile name still aligns.
+/// Minimum column width: the header vs every cell, counted in drawn cells, so
+/// a wide-script name widens its own column instead of shifting the ones after
+/// it.
 fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
     cells
-        .map(|c| c.chars().count())
-        .chain(std::iter::once(header.chars().count()))
+        .map(grapheme_cells)
+        .chain(std::iter::once(grapheme_cells(header)))
         .max()
         .unwrap_or(0)
+}
+
+/// `value` plus the spaces that bring it to `width` drawn cells: trailing for
+/// a left-aligned column, leading for a right-aligned one. `format!`'s own
+/// width pads by `char` count, which leaves a wide-script cell short by the
+/// extra cells its glyphs draw.
+fn pad_cells(value: &str, width: usize, right_align: bool) -> String {
+    let fill = " ".repeat(width.saturating_sub(grapheme_cells(value)));
+    if right_align {
+        format!("{fill}{value}")
+    } else {
+        format!("{value}{fill}")
+    }
 }
 
 fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
@@ -237,7 +262,13 @@ fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
     let w_5h = col_width(h_5h, all().map(|r| r.five_h.as_str()));
     let w_7d = col_width(h_7d, all().map(|r| r.seven_d.as_str()));
     let columns = |name: &str, plan: &str, five_h: &str, seven_d: &str| {
-        format!("{name:<w_name$}  {plan:<w_plan$}  {five_h:>w_5h$}  {seven_d:>w_7d$}")
+        format!(
+            "{}  {}  {}  {}",
+            pad_cells(name, w_name, false),
+            pad_cells(plan, w_plan, false),
+            pad_cells(five_h, w_5h, true),
+            pad_cells(seven_d, w_7d, true),
+        )
     };
 
     // Two leading columns: the 1-char active marker and a separating space.

@@ -431,7 +431,12 @@ impl Backend for Native {
                     .context("missing incoming OAuth login")?;
                 match crate::claude::follow_live_file_login(&[token], oauth)? {
                     crate::claude::LiveSlotFollow::Followed => {}
-                    crate::claude::LiveSlotFollow::Unreadable(e) => return Err(e.into()),
+                    crate::claude::LiveSlotFollow::Unreadable(pos) => {
+                        return Err(crate::format::parse_refusal(
+                            "live .credentials.json could not be parsed",
+                            pos,
+                        ));
+                    }
                     _ => anyhow::bail!("live login could not be synchronized"),
                 }
                 Ok(())
@@ -489,7 +494,13 @@ pub(crate) fn reconcile_with(
         if !source.exists() {
             return Ok(None);
         }
-        let incoming: ClaudeCredentials = crate::profile::read_json_file(&source)?;
+        // A torn store loads as logged out: there is no login to publish, and
+        // the live slot keeps whatever it holds. A store that cannot be read
+        // is an error, never a quiet success.
+        let Some(incoming) = crate::profile::read_json_file_or_torn::<ClaudeCredentials>(&source)?
+        else {
+            return Ok(None);
+        };
         let Some(token) = incoming.access_token().filter(|s| !s.is_empty()) else {
             return Ok(None);
         };

@@ -121,7 +121,7 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// not degrade: it fails the switch, so a locked keychain that prompts for a
 /// password rather than refusing outright has half as long to be answered before
 /// that.
-const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // `runtime::KEYCHAIN_MIRROR_BUDGET` still equals the READ+WRITE pair — the two
 // invocations a mirror was when it was derived. A landing now makes up to four
@@ -385,8 +385,9 @@ const SECURITY_STDIN_LINE_MAX: usize = 4096;
 /// other macOS versions get. A blob past it is refused rather than sent — not
 /// the only non-destructive disposition (E2BIG past the break fails safe too),
 /// but the only one that names the size and the remediation instead of
-/// surfacing as a bare spawn failure.
-const SECURITY_ARGV_VALUE_MAX: usize = 512 * 1024;
+/// surfacing as a bare spawn failure. The value is defined in `runtime` beside
+/// the record cap because the credentials reads share the same bound.
+const SECURITY_ARGV_VALUE_MAX: usize = crate::runtime::CREDENTIALS_READ_CAP as usize;
 
 /// How [`put_blob_at`] hands one write to `security`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -552,7 +553,10 @@ impl std::fmt::Debug for UnparseableItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnparseableItem")
             .field("raw_len", &self.raw.len())
-            .field("parse_error", &self.parse_error)
+            .field(
+                "parse_position",
+                &crate::format::json_parse_position(&self.parse_error),
+            )
             .finish()
     }
 }
@@ -561,8 +565,16 @@ impl std::fmt::Display for UnparseableItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The bytes stay off the Display: this text reaches event lines, and
         // the point of carrying them on the struct is to keep them out of
-        // exactly those lines until the quarantine file takes them.
-        write!(f, "Keychain item is not valid JSON: {}", self.parse_error)
+        // exactly those lines until the quarantine file takes them. The
+        // position renders through the shared fragment, never serde's text.
+        write!(
+            f,
+            "{}",
+            crate::format::parse_refusal(
+                "Keychain item is not valid JSON",
+                crate::format::json_parse_position(&self.parse_error)
+            )
+        )
     }
 }
 
@@ -668,7 +680,7 @@ fn blob_to_merge_with(service: &str, account: &str) -> Option<Value> {
                 Some(raw) => logline!(
                     "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
                      The MCP server logins it held are replaced by whatever this profile last \
-                     stored, which on macOS is older than the item's own set — their {}",
+                     stored, which on macOS is older than the item's own set. Their {}",
                     quarantine_tail(&quarantine_item_bytes(service, raw))
                 ),
                 None => logline!(
@@ -748,6 +760,13 @@ fn security_quote(s: &str) -> Result<String> {
     ))
 }
 
+/// [`merge_and_put_reporting_at`] refusing nothing: the throwaway-item legs'
+/// write. Every shipped write judges the item it replaces.
+#[cfg(test)]
+fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
+    merge_and_put_reporting_at(service, account, incoming, keep, |_| true).map(|_| ())
+}
+
 /// Merge `incoming` over whatever the item at `(service, account)` already holds
 /// (per `keep`) and write the result back. The read leg is what keeps CC's
 /// sibling blocks alive across the `-U` replace; see the module doc for the ACL
@@ -755,34 +774,34 @@ fn security_quote(s: &str) -> Result<String> {
 ///
 /// Whether a write happens at all is [`merge_write`]'s call, which is where the
 /// skip and its reasons live.
-#[cfg(test)]
-fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
-    merge_and_put_reporting_at(service, account, incoming, keep, |_| {})
-}
-
-/// [`merge_and_put_at`] that hands the item as read to `on_read` before
-/// anything is written, so a caller can save what the write is about to replace
+///
+/// The item as read goes to `on_read` before anything is written, so a caller
+/// can save what the write is about to replace
 /// into the store of the account it belongs to (`claude::sync_item_into_its_store`)
-/// whether or not the write then lands. Not called over an item that is absent
-/// or could not be read.
+/// whether or not the write then lands, and refuse the write by returning
+/// `false` (`claude::bare_item_may_be_replaced`: the item holds a login no
+/// store has saved). Not called over an item that is absent or could not be
+/// read. `Ok(false)` when `on_read` refused, else `Ok(true)`.
 fn merge_and_put_reporting_at(
     service: &str,
     account: &str,
     incoming: &Value,
     keep: Keep,
-    on_read: impl FnOnce(&Value),
-) -> Result<()> {
+    on_read: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
     let existing = blob_to_merge_with(service, account);
-    if let Some(item) = existing.as_ref() {
-        on_read(item);
+    if let Some(item) = existing.as_ref()
+        && !on_read(item)
+    {
+        return Ok(false);
     }
     match merge_write(incoming, existing.as_ref(), keep) {
-        Some(blob) => put_blob_at(service, account, &blob),
-        None => Ok(()),
+        Some(blob) => put_blob_at(service, account, &blob).map(|()| true),
+        None => Ok(true),
     }
 }
 
-/// The object [`merge_and_put_at`] must write, or `None` when the merge
+/// The object [`merge_and_put_reporting_at`] must write, or `None` when the merge
 /// reproduces the item byte for byte and the write is skipped.
 ///
 /// Split out of the IO so the skip is pinned without a Keychain — it is the one
@@ -1003,7 +1022,7 @@ fn verify_write(service: &str, account: &str, written: &str) -> Result<()> {
 /// the whole `{"claudeAiOauth":{…}, …}` JSON object Claude Code expects, via
 /// `security add-generic-password -U`. `-U` updates the item in place when it
 /// already exists (created by Claude Code) and adds it otherwise. Callers go
-/// through [`merge_and_put_at`] unless they have already derived the whole
+/// through [`merge_and_put_reporting_at`] unless they have already derived the whole
 /// object, as the sign-out has.
 ///
 /// The transport is chosen by size ([`put_transport`]). A command line that
@@ -1187,8 +1206,8 @@ pub(crate) fn census_namespaced_items() {
         Ok(owned) => owned,
         Err(e) => {
             census_log!(
-                "clauth: the Keychain census cannot read its ownership ledger ({e:#}); deleting \
-                 nothing — unreadable ownership must never authorize a delete"
+                "clauth: the Keychain census cannot read its ownership ledger ({e:#}). Deleting \
+                 nothing. Unreadable ownership must never authorize a delete"
             );
             return;
         }
@@ -1197,8 +1216,8 @@ pub(crate) fn census_namespaced_items() {
         Ok(live) => crate::claude::census_orphan_keychain_services(&dump, &live, &owned),
         Err(e) => {
             census_log!(
-                "clauth: the Keychain census cannot derive the live set ({e:#}); deleting nothing \
-                 — an underivable set must never read as every item orphaned"
+                "clauth: the Keychain census cannot derive the live set ({e:#}). Deleting nothing. \
+                 An underivable set must never read as every item orphaned"
             );
             return;
         }
@@ -1297,7 +1316,9 @@ impl SecurityOp {
 /// locked-keychain transient (exit 36, `errSecInteractionNotAllowed`): its
 /// diagnostic lives in exactly those withheld bytes, so the classification
 /// names the cause as a HARDCODED literal keyed on the code
-/// ([`crate::claude::SecurityExitClass::cause`]) instead of embedding them.
+/// ([`crate::claude::SecurityExitClass::cause`]) instead of embedding them. A
+/// READ of that classified code with an empty stderr renders the same literal,
+/// since there are no bytes to embed.
 fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Error {
     let code = output.status.code();
     let class = code.map_or(
@@ -1320,10 +1341,16 @@ fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Erro
         },
         SecurityOp::Read | SecurityOp::Delete | SecurityOp::Census => {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // A locked keychain's read exits 36 with nothing on stderr
+            // (measured 2026-10-29 on mac-6), so the classification's literal
+            // names the cause the empty bytes cannot.
+            let shown = match (op, stderr.trim(), class.cause()) {
+                (SecurityOp::Read, "", Some(cause)) => cause,
+                (_, trimmed, _) => trimmed,
+            };
             format!(
-                "Keychain {} failed (security exit {rendered}): {}",
-                op.as_str(),
-                stderr.trim()
+                "Keychain {} failed (security exit {rendered}): {shown}",
+                op.as_str()
             )
         }
     };
@@ -1380,8 +1407,13 @@ pub(crate) fn classified_exit(e: &anyhow::Error) -> crate::claude::SecurityExitC
 /// no signal that it happened.
 ///
 /// `on_replaced` gets the item this is about to replace, as read, before the
-/// write ([`merge_and_put_reporting_at`]).
-pub(crate) fn keychain_install(store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
+/// write, and leaves the item unwritten by returning `false`
+/// ([`merge_and_put_reporting_at`]). `Ok(true)` when the item holds `store`
+/// now.
+pub(crate) fn keychain_install(
+    store: &Value,
+    on_replaced: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
     install_at(SERVICE, store, on_replaced)
 }
 
@@ -1413,7 +1445,7 @@ pub(crate) fn keychain_install_for_config_dir(
          `{}`",
         owned.service()
     );
-    install_at(&service, store, |_| {})
+    install_at(&service, store, |_| true).map(|_| ())
 }
 
 /// Read the whole JSON object the per-config-dir item for `config_dir` holds,
@@ -1441,7 +1473,11 @@ pub(crate) fn read_failed_unparseable(e: &anyhow::Error) -> bool {
     carried_raw(e).is_some()
 }
 
-fn install_at(service: &str, store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
+fn install_at(
+    service: &str,
+    store: &Value,
+    on_replaced: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
     anyhow::ensure!(
         store.is_object(),
         "refusing to install a credential store that is not a JSON object into the Keychain"
@@ -1481,6 +1517,15 @@ fn write_sync_login_at(
     // explicit switch, a repair never treats an unreadable item as empty.
     let existing = match read_blob_at(service, &account) {
         Ok(blob) => {
+            // This equality is this writer's #106 protection. The reconciler
+            // only writes over a login whose access-token fingerprint its
+            // journal recorded clauth publishing, and Claude Code mints a new
+            // access token on every refresh, so a login a Claude Code outside
+            // clauth rotated in never matches and is left untouched. The
+            // explicit writers' `bare_item_may_be_replaced` is deliberately not
+            // run here: it checks the refresh token against a bounded spent
+            // record, so after enough private rotations it would refuse to
+            // repair a predecessor this journal still recognizes as its own.
             anyhow::ensure!(
                 &Observation::from_blob(blob.as_ref()) == expected,
                 "Keychain login changed during synchronization"
@@ -1517,15 +1562,39 @@ fn write_sync_login_at(
 ///
 /// `preserve` is the caller's `preserve_non_login_keys` reading, handed in so
 /// this module never reads profiles.toml itself and its tests stay pure.
-/// `saved_elsewhere` gets the item as read, before the strip, and reports
+/// `may_replace` gets the item as read first and leaves it whole by returning
+/// `false` (`claude::bare_item_may_be_replaced`: it holds a login no store has
+/// saved). `saved_elsewhere` gets it next, before the strip, and reports
 /// whether its non-login keys now sit in their account's store; the strip then
 /// drops the design login too ([`crate::claude::sign_out_keeps_non_login_keys`]).
-/// Not called over an item that is absent or could not be read.
+/// Neither is called over an item that is absent or could not be read.
+/// `Ok(true)` when the item is signed out, `Ok(false)` when it was left as it
+/// was (`may_replace`, or the locked-keychain skip).
 pub(crate) fn keychain_sign_out(
     preserve: bool,
+    may_replace: impl FnOnce(&Value) -> bool,
     saved_elsewhere: impl FnOnce(&Value) -> bool,
-) -> Result<SignOutOutcome> {
-    sign_out_saving_at(SERVICE, &account()?, preserve, saved_elsewhere)
+) -> Result<bool> {
+    sign_out_unless_at(SERVICE, &account()?, preserve, may_replace, saved_elsewhere)
+}
+
+/// [`keychain_sign_out`] over an arbitrary `(service, account)`, so the e2e
+/// leg drives the `may_replace` refusal against a THROWAWAY item.
+fn sign_out_unless_at(
+    service: &str,
+    account: &str,
+    preserve: bool,
+    may_replace: impl FnOnce(&Value) -> bool,
+    saved_elsewhere: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
+    let read = read_blob_at(service, account);
+    if let Ok(Some(item)) = &read
+        && !may_replace(item)
+    {
+        return Ok(false);
+    }
+    sign_out_saving_at(service, account, preserve, read, saved_elsewhere)
+        .map(|outcome| outcome == SignOutOutcome::SignedOut)
 }
 
 /// Sign out the NAMESPACED item for a config dir — the start-site twin of
@@ -1554,10 +1623,112 @@ pub(crate) fn keychain_sign_out_for_config_dir(
     sign_out_at(&service, &account()?, false)
 }
 
+/// Hand a session's NAMESPACED item over to the file layer, for a swap or a
+/// same-member convergence onto a refreshless store (a rolling or static
+/// session token): `store` is that store, the one the session's
+/// `.credentials.json` now points at. Unlike [`keychain_sign_out_for_config_dir`]
+/// the item never survives holding only its MCP logins: Claude Code resolves
+/// the item before any file, and an item with no `claudeAiOauth` reads as
+/// "Not logged in", so the session would never reach the store. Instead the
+/// item's MCP logins move into `store`
+/// ([`crate::claude::carry_item_keys_into_store`]) and the item is deleted,
+/// leaving the session on the store's login with its MCP logins beside it. A
+/// carry that fails quarantines the item's bytes before the delete
+/// ([`crate::claude::hand_off_after_carry`]); a failed read takes the
+/// sign-out's own arms ([`sign_out_over_failed_read`]), the locked-keychain
+/// skip among them.
+pub(crate) fn keychain_hand_off_for_config_dir(
+    config_dir: &Path,
+    owned: &crate::runtime::namespaced_keychain_ledger::OwnedKeychainWrite,
+    store: &Path,
+) -> Result<SignOutOutcome> {
+    let service = keychain_service_for_config_dir(config_dir)?;
+    anyhow::ensure!(
+        service == owned.service(),
+        "refusing to write per-session Keychain item `{service}`: the durable ownership row names \
+         `{}`",
+        owned.service()
+    );
+    let account = account()?;
+    let blob = match read_blob_at(&service, &account) {
+        Ok(None) => return delete_at(&service, &account).map(|_| SignOutOutcome::SignedOut),
+        Ok(Some(blob)) => blob,
+        Err(e) => return sign_out_over_failed_read(&service, &account, &e),
+    };
+    let landed = match crate::claude::carried_keys_of(&blob) {
+        None => true,
+        Some(carried) => match crate::claude::carry_item_keys_into_store(store, &carried) {
+            Ok(()) => true,
+            Err(e) => {
+                logline!(
+                    "clauth: could not save the per-session Keychain item's MCP server logins \
+                     into {}: {e:#}",
+                    store.display()
+                );
+                false
+            }
+        },
+    };
+    match crate::claude::hand_off_after_carry(landed) {
+        crate::claude::HandOff::Delete => logline!(
+            "clauth: handed the per-session Keychain item over to {}: its MCP server logins \
+             are in that store now and the item was deleted, so Claude Code reads the store",
+            store.display()
+        ),
+        crate::claude::HandOff::QuarantineThenDelete => {
+            // Names only on the line, never values: the bytes go to the
+            // quarantine file the tail names.
+            let raw = serde_json::to_string(&blob).unwrap_or_default();
+            logline!(
+                "clauth: handed the per-session Keychain item over to {} by deleting it \
+                 without saving its MCP server logins there. Their {}",
+                store.display(),
+                quarantine_tail(&quarantine_item_bytes(&service, &raw))
+            );
+        }
+    }
+    delete_at(&service, &account).map(|_| SignOutOutcome::SignedOut)
+}
+
+/// A sign-out over an item whose read FAILED: skip over the classified
+/// locked-keychain transient, otherwise delete the item, quarantining its raw
+/// bytes first whenever the read brought any back. Shared by
+/// [`sign_out_saving_at`] (whose doc carries the reasoning) and
+/// [`keychain_hand_off_for_config_dir`], so the two cannot drift apart.
+fn sign_out_over_failed_read(
+    service: &str,
+    account: &str,
+    e: &anyhow::Error,
+) -> Result<SignOutOutcome> {
+    if !crate::claude::failed_read_degrades_to_delete(classified_exit(e)) {
+        logline!(
+            "clauth: could not sign Claude Code out of the macOS Keychain: {e:#}. The \
+             item was left untouched; retry the operation once the keychain is unlocked"
+        );
+        return Ok(SignOutOutcome::SkippedLocked);
+    }
+    match carried_raw(e) {
+        Some(raw) => logline!(
+            "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
+             it could not be read first ({e:#}), so the MCP server logins stored beside \
+             the login went with it. Their {}",
+            quarantine_tail(&quarantine_item_bytes(service, raw))
+        ),
+        None => logline!(
+            "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
+             could not be read first ({e:#}), so the MCP server logins stored beside the \
+             login went with it. Re-authenticate any MCP server that reports a signed-out \
+             session"
+        ),
+    }
+    delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
+}
+
 /// [`sign_out_saving_at`] with nothing saved elsewhere: the per-session items
 /// and the e2e leg, whose items no account store takes over.
 fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOutcome> {
-    sign_out_saving_at(service, account, preserve, |_| false)
+    let read = read_blob_at(service, account);
+    sign_out_saving_at(service, account, preserve, read, |_| false)
 }
 
 /// What a sign-out actually did, so a caller whose downstream state follows
@@ -1602,10 +1773,14 @@ pub(crate) enum SignOutOutcome {
 /// where the delete is not. A read that failed WITH BYTES quarantines them
 /// first ([`quarantine_item_bytes`]) — the delete still removes the login, but
 /// the evidence survives it, and the event line says where.
+///
+/// `read` is the caller's [`read_blob_at`] of the item, so a caller can judge
+/// the item it read before anything here acts on it ([`sign_out_unless_at`]).
 fn sign_out_saving_at(
     service: &str,
     account: &str,
     preserve: bool,
+    read: Result<Option<Value>>,
     saved_elsewhere: impl FnOnce(&Value) -> bool,
 ) -> Result<SignOutOutcome> {
     // The two `None` cases part here rather than sharing an early return: an
@@ -1614,33 +1789,10 @@ fn sign_out_saving_at(
     // whole — now with its raw bytes quarantined first whenever the read
     // brought any back (#66/#76), and not at all over the classified
     // locked-keychain transient.
-    let mut blob = match read_blob_at(service, account) {
+    let mut blob = match read {
         Ok(None) => return delete_at(service, account).map(|_| SignOutOutcome::SignedOut),
         Ok(Some(blob)) => blob,
-        Err(e) => {
-            if !crate::claude::failed_read_degrades_to_delete(classified_exit(&e)) {
-                logline!(
-                    "clauth: could not sign Claude Code out of the macOS Keychain: {e:#}. The \
-                     item was left untouched; retry the operation once the keychain is unlocked"
-                );
-                return Ok(SignOutOutcome::SkippedLocked);
-            }
-            match carried_raw(&e) {
-                Some(raw) => logline!(
-                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
-                     it could not be read first ({e:#}), so the MCP server logins stored beside \
-                     the login went with it — their {}",
-                    quarantine_tail(&quarantine_item_bytes(service, raw))
-                ),
-                None => logline!(
-                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
-                     could not be read first ({e:#}), so the MCP server logins stored beside the \
-                     login went with it. Re-authenticate any MCP server that reports a signed-out \
-                     session"
-                ),
-            }
-            return delete_at(service, account).map(|_| SignOutOutcome::SignedOut);
-        }
+        Err(e) => return sign_out_over_failed_read(service, account, &e),
     };
     let saved = preserve && saved_elsewhere(&blob);
     let keep = crate::claude::sign_out_keeps_non_login_keys(preserve, saved);
@@ -1712,7 +1864,7 @@ fn sign_out_saving_at(
 pub(crate) fn keychain_service_for_config_dir(config_dir: &Path) -> Result<String> {
     // Canonicalize: CC resolves symlinks before hashing, and a relative path
     // would produce a different hash than the absolute one CC computes.
-    let canonical = std::fs::canonicalize(config_dir).with_context(|| {
+    let canonical = crate::canonical::identity(config_dir).with_context(|| {
         format!(
             "failed to canonicalize config dir: {}",
             config_dir.display()

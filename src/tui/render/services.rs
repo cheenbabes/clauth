@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -31,20 +31,22 @@ use super::super::app::{
     OUTDATED_PLUGIN_MARK, RouteFieldKind, SHUNT_OK_MS, ServiceFix, ServicesFocus, ShuntAddKind,
     ShuntConfigRead, ShuntDraftField, ShuntEntryKey, ShuntFieldEdit, ShuntFieldKey, ShuntFocus,
     ShuntOkKey, ShuntSaveKey, UnreadConfig, UpstreamFieldKind, add_row_offered, config_entry_keys,
-    config_field_stops, config_view, cycle_options, draft_field_keys, entry_field_keys,
-    entry_for_key, entry_kind, entry_name, escape_control, herdr_config_writable, is_cycle_field,
-    parse_herdr_tag_secs, pending_require_line, removable, shunt_field_value, written_display,
+    config_field_stops, config_view, cycle_options, daemon_binary_card_line, draft_field_keys,
+    entry_field_keys, entry_for_key, entry_kind, entry_name, escape_control, herdr_config_writable,
+    is_cycle_field, parse_herdr_tag_secs, pending_require_line, removable, shunt_block_in_view,
+    shunt_field_value, written_display,
 };
 use super::super::theme;
 use super::format::{fixed, grapheme_cells, middle_truncate, spinner_frame, truncate};
 use super::header::pulse_name_spans;
 use super::modals::danger_button;
 use super::panes::{
-    bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
+    MIN_VALUE_W, bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
-    footnote_lines, footnote_split, head_cols, help_tooltip_lines, help_tooltip_lines_at,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, section_box,
-    select_line, value_caret, wrap_words,
+    follow_scroll_offset, footnote_lines, footnote_split, head_cols, help_tooltip_lines,
+    help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell, label_style,
+    master_detail, place_caret, section_box, select_line, toggle_value, value_caret, with_bg,
+    wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -55,10 +57,10 @@ use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::profile::{HerdrSettings, PopupWidth};
 use crate::usage::humanize_duration;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let (selector, detail) = master_detail(area, app.services.row_count());
     draw_selector(frame, selector, app);
-    draw_detail(frame, detail, app);
+    draw_detail(frame, detail, app, toast_rects);
 }
 
 // ── Left panel: service rows selector ──────────────────────────────────────────
@@ -140,10 +142,6 @@ fn selector_row(
     content_w: usize,
 ) -> Line<'static> {
     let tint = selected.then(theme::bg_hover);
-    let with_bg = |style: Style| match tint {
-        Some(color) => style.bg(color),
-        None => style,
-    };
 
     let caret = if selected && focused {
         Span::styled(
@@ -152,16 +150,20 @@ fn selector_row(
                 Style::default()
                     .fg(theme::accent_color())
                     .add_modifier(Modifier::BOLD),
+                tint,
             ),
         )
     } else {
-        Span::styled("  ", with_bg(Style::default()))
+        Span::styled("  ", with_bg(Style::default(), tint))
     };
-    let dot = Span::styled("● ", with_bg(Style::default().fg(health_color(health))));
+    let dot = Span::styled(
+        "● ",
+        with_bg(Style::default().fg(health_color(health)), tint),
+    );
     let label_style = if selected && focused {
-        with_bg(theme::body().add_modifier(Modifier::BOLD))
+        with_bg(theme::body().add_modifier(Modifier::BOLD), tint)
     } else {
-        with_bg(theme::body())
+        with_bg(theme::body(), tint)
     };
 
     let mut spans = vec![caret, dot, Span::styled(label.to_string(), label_style)];
@@ -169,11 +171,14 @@ fn selector_row(
     let mark = has_fix && used + RIGHT_COLUMN_GAP < content_w;
     let pad = content_w.saturating_sub(used + usize::from(mark));
     if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad), with_bg(Style::default())));
+        spans.push(Span::styled(
+            " ".repeat(pad),
+            with_bg(Style::default(), tint),
+        ));
     }
     if mark {
         let f = fix_mark();
-        let style = with_bg(f.style);
+        let style = with_bg(f.style, tint);
         spans.push(f.style(style));
     }
     Line::from(spans)
@@ -221,7 +226,7 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
 
 // ── Right panel: selected-row detail ────────────────────────────────────────────
 
-fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let focused = app.services.focus == ServicesFocus::Detail;
 
     let Some(check) = app.services.selected_check() else {
@@ -247,7 +252,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // the MOVE PLAN copy holds a literal `: ` that the shared `key: value`
     // splitter would misread.
     if check.label == "shunt" {
-        draw_shunt_detail(frame, inner, app, check);
+        draw_shunt_detail(frame, inner, app, check, toast_rects);
         return;
     }
 
@@ -260,11 +265,13 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Width of the key column = widest `key: value` key, capped so a long key
     // can't shove the values off-pane. Fix lines (`f  <verb>`) and indented
-    // sub-lines never split on `": "`, so they stay out of the column.
+    // sub-lines never split on `": "`, so they stay out of the column, and so
+    // does the daemon's changed-binary line, which renders whole.
+    let daemon_line = app.daemon_binary_change.map(daemon_binary_card_line);
     let key_w = check
         .detail
         .iter()
-        .filter(|line| !line.starts_with("  "))
+        .filter(|line| !line.starts_with("  ") && Some(line.as_str()) != daemon_line)
         .filter_map(|line| line.split_once(": ").map(|(k, _)| k.chars().count()))
         .max()
         .unwrap_or(0)
@@ -286,17 +293,26 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .detail
         .iter()
         .enumerate()
-        .map(|(idx, line)| match problem_index(check, idx) {
+        .flat_map(|(idx, line)| match problem_index(check, idx) {
             Some(pidx) => {
                 let selected = problem_focus == Some(pidx);
                 let line = problem_line(line, selected);
-                if selected {
+                vec![if selected {
                     highlight_row(line, inner.width as usize)
                 } else {
                     line
-                }
+                }]
             }
-            None => detail_line(line, key_w, inner.width as usize),
+            // Wrapped, never cut: its tail is the command that clears it.
+            None if Some(line.as_str()) == daemon_line => prose::wrap(
+                &prose::mark_commands(line),
+                inner.width as usize,
+                theme::warning(),
+            )
+            .into_iter()
+            .map(Line::from)
+            .collect(),
+            None => vec![detail_line(line, key_w, inner.width as usize)],
         })
         .collect();
 
@@ -306,7 +322,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let fix_focus = problem_focus
             .and_then(|i| check.problems.get(i))
             .map(|p| p.line);
-        draw_herdr_detail(frame, inner, app, lines, fix_focus);
+        draw_herdr_detail(frame, inner, app, lines, fix_focus, toast_rects);
         return;
     }
 
@@ -378,13 +394,21 @@ fn draw_diagnostic_lines(frame: &mut Frame<'_>, inner: Rect, app: &App, lines: V
 /// `enabled` row's tier-aware toggle glyph is drawn here off the cached record.
 ///
 /// Descended, ↑↓ walks the card's actionable lines one at a time; the render
-/// reads the focused line from the key handler's state and re-settles it (the
-/// descend rule) when a resize or a card change pushed the held line out of
-/// view, or when focus is none while an actionable line is in view, drawing
-/// the caret + hover only while that stop is in view. It publishes the
-/// geometry the key handler walks over (each stop's rendered row, the pane
-/// height, `detail_max_scroll`).
-fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Check) {
+/// reads the focused block from the key handler's state, follows it with
+/// [`follow_scroll_offset`] and stores the result first — the follow site every
+/// draw, so a walk landing, a refusal growing the block, a page landing and a
+/// resize all keep `SCROLL_PAD` rows past the block — then re-settles the focus
+/// (the descend rule) at the followed offset: only a held stop that left the
+/// card (a recompute dropped it) or a none focus moves, never a block the follow
+/// just brought into view. It publishes the geometry the key handler walks over
+/// (each stop's rendered block, the pane height, `detail_max_scroll`).
+fn draw_shunt_detail(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    app: &App,
+    check: &Check,
+    toast_rects: &[Rect],
+) {
     let action_start = check.shunt_action_start.unwrap_or(check.detail.len());
     let width = inner.width as usize;
 
@@ -404,7 +428,13 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     // The rendered line each actionable stop lands on, in `check.shunt_focus`
     // order: a `refused`/`pool` sentence above a stop can wrap to several rows,
     // so the in-view test is the rendered index, never the detail index.
+    // `stop_ends` is the exclusive end of each stop's block (parallel to
+    // `stop_rendered`) — the walk pads past a stop's LAST line, so a multi-line
+    // stop (a wrapped cycle run, a dropped token trailer, a refusal `└`) needs
+    // its span, never the next stop's first row (blank lines and eyebrows sit
+    // between groups).
     let mut stop_rendered: Vec<usize> = Vec::with_capacity(check.shunt_focus.len());
+    let mut stop_ends: Vec<usize> = Vec::with_capacity(check.shunt_focus.len());
     let mut move_plan_line: Option<usize> = None;
     for (idx, text) in check.detail.iter().enumerate() {
         if idx < action_start {
@@ -415,6 +445,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
             let start = lines.len();
             lines.push(shunt_focus_line(focus, text, false, app));
             stop_rendered.push(start);
+            stop_ends.push(start + 1);
         } else {
             if text == "MOVE PLAN" {
                 move_plan_line = Some(lines.len());
@@ -438,6 +469,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
             render_shunt_config(
                 &mut lines,
                 &mut stop_rendered,
+                &mut stop_ends,
                 &mut eyebrows,
                 view,
                 &app.services.shunt_expanded,
@@ -461,27 +493,56 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     let viewport = inner.height as usize;
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
     app.services.detail_max_scroll.set(max_scroll);
-    let scroll = app.services.detail_scroll.min(max_scroll);
+    let prior = app.services.shunt_scroll.get().min(max_scroll as usize);
 
-    // The focused actionable line. The render re-settles the key handler's
-    // identity (the descend rule — the first actionable line in view, else
-    // none) here, where the geometry is published, when a resize or a card
-    // change pushed the held line out of view, or when focus is none while a
-    // stop is in view; the caret, the footer and every acting key then see the
-    // re-settled line the same frame. The caret and the bold promotion show
-    // only while the detail pane itself holds focus; blurred (the list focused)
-    // the card keeps the line's hover tint and drops both.
+    // The render is the follow site (the forms/Status precedent): follow the
+    // focused block and store the result FIRST, so a walk landing, a refusal
+    // growing the block, a page landing and a resize all keep `SCROLL_PAD` rows
+    // past the block while content remains. No focus means nothing to follow —
+    // the offset stays, so a text scroll is never pulled back.
+    let scroll = match app
+        .services
+        .shunt_focus_kind()
+        .and_then(|kind| check.shunt_focus.iter().position(|s| s.kind() == kind))
+        .and_then(|i| {
+            stop_rendered
+                .get(i)
+                .zip(stop_ends.get(i))
+                .map(|(&start, &end)| (start, end))
+        }) {
+        Some((start, end)) => {
+            follow_scroll_offset(total, viewport, (start, end), prior).min(max_scroll as usize)
+        }
+        None => prior,
+    };
+    app.services.shunt_scroll.set(scroll);
+
+    // Re-settle the key handler's identity at the followed offset (the descend
+    // rule — the first actionable block inside the padded band, else none):
+    // a focus the key just set out of view was brought in by the follow above,
+    // so only a focus whose stop left the card (a recompute) or a none focus
+    // re-settles here. The caret and the bold promotion show only while the
+    // detail pane itself holds focus; blurred (the list focused) the card keeps
+    // the line's hover tint and drops both.
     let detail_focused = app.services.focus == ServicesFocus::Detail;
-    app.services
-        .re_settle_shunt_focus(&check.shunt_focus, &stop_rendered, scroll, viewport);
+    app.services.re_settle_shunt_focus(
+        &check.shunt_focus,
+        &stop_rendered,
+        &stop_ends,
+        total,
+        scroll,
+        viewport,
+    );
+
     let focus_stop = app
         .services
         .shunt_focus_kind()
         .and_then(|kind| check.shunt_focus.iter().position(|s| s.kind() == kind))
         .filter(|&i| {
-            stop_rendered.get(i).is_some_and(|&rendered| {
-                rendered >= scroll as usize && rendered < scroll as usize + viewport
-            })
+            stop_rendered
+                .get(i)
+                .zip(stop_ends.get(i))
+                .is_some_and(|(&start, &end)| shunt_block_in_view(scroll, viewport, start, end))
         });
 
     // The MOVE PLAN eyebrow brightens to `TEXT + bold` while the focus rests
@@ -527,7 +588,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
 
     // The field whose typed editor is open, for the native cursor (published
     // only when its row is in view).
-    let mut edit_caret: Option<(usize, usize)> = None;
+    let mut edit_caret: Option<(usize, usize, usize)> = None;
     if let Some(idx) = focus_stop {
         let focus = &check.shunt_focus[idx];
         let rendered = stop_rendered.get(idx).copied();
@@ -548,7 +609,6 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                 let Some(view) = config_view(app) else {
                     unreachable!("a field stop renders only over a read config");
                 };
-                let caret = field_row_caret(app, key);
                 // Replace every rendered line of the focused field with its
                 // selected render, each tinted across the full width: a wrapped
                 // cycle run keeps the focus bracket and the `BG_HOVER` tint on
@@ -556,6 +616,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                 // the field's own row and stay untinted, like every other
                 // tooltip in the app.
                 let rows = field_row_lines(view, key, detail_focused, app, width);
+                let caret = field_row_caret(app, key, width);
                 let refusal = app
                     .services
                     .shunt_field_edit
@@ -563,8 +624,8 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                     .filter(|s| s.key == *key)
                     .is_some_and(|s| s.refusal.is_some());
                 if let Some(rendered) = rendered {
-                    if let Some(caret) = caret {
-                        edit_caret = Some((rendered, caret));
+                    if let Some((lead, caret)) = caret {
+                        edit_caret = Some((rendered, lead, caret));
                     }
                     for (i, row) in rows.into_iter().enumerate() {
                         if rendered + i < lines.len() {
@@ -646,25 +707,31 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     // borrows it), exactly like `detail_max_scroll`.
     app.services.shunt_viewport.set(inner.height);
     app.services.shunt_stop_rows.replace(stop_rendered);
+    app.services.shunt_stop_ends.replace(stop_ends);
+    app.services.shunt_total.set(total);
 
     frame.render_widget(
         Paragraph::new(lines)
             .style(theme::base())
-            .scroll((scroll, 0)),
+            .scroll((scroll as u16, 0)),
         inner,
     );
-    draw_scrollbar(frame, inner, total, scroll as usize, viewport);
+    draw_scrollbar(frame, inner, total, scroll, viewport);
 
     // The native terminal cursor at the typed editor's caret (the Setup
-    // editor's rule): the value column plus the caret's char column, on the
-    // row's visible line.
-    if let Some((row, caret)) = edit_caret
-        && let Some(visible) = row.checked_sub(scroll as usize).filter(|v| *v < viewport)
+    // editor's rule): the value column plus the caret's cell in the value
+    // window, on the row's visible line.
+    if let Some((row, lead, caret)) = edit_caret
+        && let Some(visible) = row.checked_sub(scroll).filter(|v| *v < viewport)
     {
-        frame.set_cursor_position((
-            inner.x.saturating_add((CONFIG_VALUE_COL + caret) as u16),
-            inner.y.saturating_add(visible as u16),
-        ));
+        place_caret(
+            frame,
+            toast_rects,
+            Position::new(
+                inner.x.saturating_add((lead + caret) as u16),
+                inner.y.saturating_add(visible as u16),
+            ),
+        );
     }
 }
 
@@ -702,11 +769,13 @@ fn eyebrow_name(group: usize) -> &'static str {
 }
 
 /// The config section's render state: the rows built so far, the published
-/// focus-stop rows (parallel to [`Check::shunt_focus`]), and the one-row-model
-/// field stops every focusable row's membership is checked against.
+/// focus-stop rows and their block ends (parallel to [`Check::shunt_focus`]),
+/// and the one-row-model field stops every focusable row's membership is
+/// checked against.
 struct ConfigRows<'a> {
     lines: &'a mut Vec<Line<'static>>,
     stop_rendered: &'a mut Vec<usize>,
+    stop_ends: &'a mut Vec<usize>,
     field_stops: &'a [ShuntFocus],
 }
 
@@ -720,9 +789,11 @@ struct ConfigRows<'a> {
 /// [`config_entry_keys`] / [`entry_field_keys`] / [`draft_field_keys`] /
 /// [`config_field_stops`] — the same row model the focus walk builds its stops
 /// from — so the two cannot disagree for any view.
+#[allow(clippy::too_many_arguments)]
 fn render_shunt_config(
     lines: &mut Vec<Line<'static>>,
     stop_rendered: &mut Vec<usize>,
+    stop_ends: &mut Vec<usize>,
     eyebrows: &mut [Option<usize>; 5],
     view: &ConfigView,
     expanded: &HashSet<ShuntEntryKey>,
@@ -738,6 +809,7 @@ fn render_shunt_config(
     let mut rows = ConfigRows {
         lines,
         stop_rendered,
+        stop_ends,
         field_stops: &field_stops,
     };
 
@@ -808,13 +880,17 @@ fn push_add(
     let start = rows.lines.len();
     rows.lines.push(add_line(kind, false, app));
     rows.stop_rendered.push(start);
+    rows.stop_ends.push(start + 1);
     if app.services.shunt_drafts.is_open(kind) {
         for field in draft_field_keys(view, kind, &app.services.shunt_drafts) {
             push_field(rows, view, &field, app, width);
         }
         let save_start = rows.lines.len();
-        rows.lines.extend(save_add_lines(kind, false, app, width));
+        let save_rows = save_add_lines(kind, false, app, width);
+        let save_len = save_rows.len();
+        rows.lines.extend(save_rows);
         rows.stop_rendered.push(save_start);
+        rows.stop_ends.push(save_start + save_len);
     }
 }
 
@@ -843,8 +919,11 @@ fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
     } else {
         for name in &tokens.stored {
             let start = rows.lines.len();
-            rows.lines.extend(token_row_lines(name, false, app, width));
+            let token_rows = token_row_lines(name, false, app, width);
+            let token_len = token_rows.len();
+            rows.lines.extend(token_rows);
             rows.stop_rendered.push(start);
+            rows.stop_ends.push(start + token_len);
         }
         if let Some(reason) = &tokens.unmanaged_error {
             // The store read fine, so its rows stay; only the unmanaged names
@@ -886,6 +965,7 @@ fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
     let add_start = rows.lines.len();
     rows.lines.push(add_token_line(false, app));
     rows.stop_rendered.push(add_start);
+    rows.stop_ends.push(add_start + 1);
 }
 
 /// One `name` + trailer row with the name budgeted in display cells so the
@@ -1023,6 +1103,7 @@ fn push_entry(
         width,
     ));
     rows.stop_rendered.push(start);
+    rows.stop_ends.push(start + 1);
     if expanded.contains(key) {
         for field in entry_field_keys(view, key) {
             push_field(rows, view, &field, app, width);
@@ -1031,8 +1112,11 @@ fn push_entry(
         // engine's `Remove*` cannot address the entry — a duplicated name/id).
         if removable(view, key) {
             let remove_start = rows.lines.len();
-            rows.lines.extend(remove_lines(key, false, app, width));
+            let remove_rows = remove_lines(key, false, app, width);
+            let remove_len = remove_rows.len();
+            rows.lines.extend(remove_rows);
             rows.stop_rendered.push(remove_start);
+            rows.stop_ends.push(remove_start + remove_len);
         }
     }
 }
@@ -1051,12 +1135,14 @@ fn push_field(
 ) {
     let start = rows.lines.len();
     let field_rows = field_row_lines(view, key, false, app, width);
+    let field_len = field_rows.len();
     rows.lines.extend(field_rows);
     if rows
         .field_stops
         .contains(&ShuntFocus::Field { key: key.clone() })
     {
         rows.stop_rendered.push(start);
+        rows.stop_ends.push(start + field_len);
     }
 }
 
@@ -1112,7 +1198,7 @@ fn entry_line(
 /// an absent side reading `—`. The position, the arrow and the provider stay
 /// whole; the model slug alone shrinks with a trailing `…`. A provider that
 /// leaves the model no room shrinks too, keeping one cell for the model.
-fn route_label(r: &RouteView, room: usize) -> String {
+pub(super) fn route_label(r: &RouteView, room: usize) -> String {
     let model = escape_control(
         r.model
             .as_ref()
@@ -1183,7 +1269,7 @@ fn action_lead(saving: bool, selected: bool, app: &App) -> Span<'static> {
 }
 
 /// The `+ add <kind>` row: a first-class `+ add` row — `ACCENT` label, bold
-/// while selected (the cloudy-tui Master-detail `+ new` rule), no disclosure
+/// while selected (the master-detail `+ new` rule), no disclosure
 /// glyph.
 fn add_line(kind: ShuntAddKind, selected: bool, app: &App) -> Line<'static> {
     let label = if selected {
@@ -1351,6 +1437,43 @@ const CONFIG_VALUE_COL: usize = 20;
 /// The fixed gap between a padded label and its value.
 const CONFIG_KEY_GUTTER: usize = 2;
 
+/// Where a typed field's value opens: [`CONFIG_VALUE_COL`], or, on a pane
+/// narrower than it plus the value floor, a clamped column (the Config tab's
+/// `edit_lead` clamp shape).
+fn typed_field_lead(width: usize) -> usize {
+    CONFIG_VALUE_COL.min(width.saturating_sub(MIN_VALUE_W))
+}
+
+/// The typed editor's label under the clamped [`typed_field_lead`]: the
+/// drawn text (leading pad + escaped label, truncated and padded to keep the
+/// `CONFIG_KEY_GUTTER` gap before the value) and its cell width — the one
+/// derivation the row and its caret both use.
+fn typed_field_label(label: &str, indent: usize, lead_w: usize) -> (String, usize) {
+    let (pad, budget) = if lead_w > indent + CONFIG_KEY_GUTTER + 1 {
+        (
+            indent.saturating_sub(CARET_GUTTER),
+            lead_w - indent - CONFIG_KEY_GUTTER,
+        )
+    } else {
+        (0, lead_w.saturating_sub(CARET_GUTTER + CONFIG_KEY_GUTTER))
+    };
+    let text = format!(
+        "{}{}",
+        " ".repeat(pad),
+        key_cell(
+            &truncate(&escape_control(label), budget),
+            budget,
+            CONFIG_KEY_GUTTER
+        )
+    );
+    let width = Span::raw(&text).width();
+    (text, width)
+}
+
+fn typed_field_label_width(label: &str, indent: usize, lead_w: usize) -> usize {
+    typed_field_label(label, indent, lead_w).1
+}
+
 /// A label padded so its value opens at [`CONFIG_VALUE_COL`], trailing `…` when
 /// it overruns its slot. `indent` is the column the label starts at.
 fn config_key(label: &str, indent: usize) -> String {
@@ -1362,7 +1485,7 @@ fn config_key(label: &str, indent: usize) -> String {
 }
 
 /// A field row's label word: the provider key for an `upstream_model` row.
-fn field_label(key: &ShuntFieldKey) -> String {
+pub(super) fn field_label(key: &ShuntFieldKey) -> String {
     match key {
         ShuntFieldKey::Bind => "bind".to_string(),
         ShuntFieldKey::DefaultProvider => "default_provider".to_string(),
@@ -1465,10 +1588,10 @@ fn field_lead(key: &ShuntFieldKey, selected: bool, app: &App) -> Span<'static> {
     }
 }
 
-/// The typed editor's caret char column in the value (the native cursor), when
-/// the field's typed editor is open; `None` for a pending pick, a saving field
-/// (the row shows the spinner, not `✎`), or no editor.
-fn field_row_caret(app: &App, key: &ShuntFieldKey) -> Option<usize> {
+/// The typed editor's lead and its caret cell within the value window
+/// ([`field_row_lines`] draws the field with the same [`typed_field_lead`]),
+/// for the native cursor.
+fn field_row_caret(app: &App, key: &ShuntFieldKey, width: usize) -> Option<(usize, usize)> {
     let state = app.services.shunt_field_edit.as_ref()?;
     if state.key != *key {
         return None;
@@ -1477,7 +1600,15 @@ fn field_row_caret(app: &App, key: &ShuntFieldKey) -> Option<usize> {
         return None;
     }
     match &state.edit {
-        ShuntFieldEdit::Typed { input, .. } => Some(head_cols(input)),
+        ShuntFieldEdit::Typed { input, .. } => Some((
+            CARET_GUTTER
+                + typed_field_label_width(
+                    &field_label(key),
+                    field_indent(key),
+                    typed_field_lead(width),
+                ),
+            head_cols(input),
+        )),
         ShuntFieldEdit::Pick { .. } => None,
     }
 }
@@ -1512,11 +1643,24 @@ fn field_row_lines(
         .filter(|s| s.key == *key);
     let saving = app.services.saving(&ShuntSaveKey::Field(key.clone()));
     let value = shunt_field_value(view, &app.services.shunt_drafts, key).flatten();
-    let room = width.saturating_sub(CONFIG_VALUE_COL);
+    let typed = matches!(
+        edit_state.map(|s| &s.edit),
+        Some(ShuntFieldEdit::Typed { .. })
+    );
+    // The saving row keeps the resting column: the checked value trails the
+    // full label, the editor's narrow-pane clamp never reaches it.
+    let field_lead_w = if typed && !saving {
+        typed_field_lead(width)
+    } else {
+        CONFIG_VALUE_COL
+    };
+    let room = width.saturating_sub(field_lead_w);
 
-    let lead = || {
-        vec![
-            field_lead(key, selected, app),
+    let label_span = || {
+        if typed && !saving {
+            let (text, _) = typed_field_label(&label, indent, field_lead_w);
+            Span::styled(text, label_style(selected))
+        } else {
             Span::styled(
                 // The caret slot already covers the gutter's first two cells:
                 // the label opens at `indent` (2 server, 4 entry).
@@ -1526,9 +1670,11 @@ fn field_row_lines(
                     config_key(&label, indent)
                 ),
                 label_style(selected),
-            ),
-        ]
+            )
+        }
     };
+
+    let lead = || vec![field_lead(key, selected, app), label_span()];
 
     // While a save runs the row shows the saving state — the spinner (already
     // in the caret slot), the value being saved under the shimmer crest and a
@@ -1556,7 +1702,7 @@ fn field_row_lines(
         match &edit.edit {
             ShuntFieldEdit::Typed { input, .. } => {
                 let mut spans = lead();
-                spans.extend(value_caret(input, edit.refusal.is_some()));
+                spans.extend(value_caret(input, edit.refusal.is_some(), room));
                 let mut rows = vec![Line::from(spans)];
                 if let Some(refusal) = &edit.refusal {
                     rows.extend(invalid_tooltip_lines(refusal, width));
@@ -1892,7 +2038,16 @@ fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
         return;
     }
     let descended = app.services.focus == ServicesFocus::Detail;
-    let cells = delegate_cells(&app.services.delegates, crate::usage::now_ms());
+    let mut cells = delegate_cells(&app.services.delegates, crate::usage::now_ms());
+    // The live/average speed fact rides each row once the producer answers:
+    // a running job's own session, a finished job's own transcript. Applied
+    // after the cell build so the row builder takes the figure as a fact and a
+    // render test can pass it in directly.
+    for (cell, job) in cells.iter_mut().zip(app.services.delegates.iter()) {
+        if let Some(fact) = delegate_speed_fact(job, app) {
+            cell.facts.push(fact);
+        }
+    }
     let mut body = inner;
     if let Some(line) = app
         .services
@@ -1980,6 +2135,7 @@ fn draw_herdr_detail(
     app: &App,
     mut lines: Vec<Line<'static>>,
     fix_focus: Option<usize>,
+    toast_rects: &[Rect],
 ) {
     let focused = app.services.focus == ServicesFocus::Detail;
 
@@ -1994,7 +2150,7 @@ fn draw_herdr_detail(
     lines.push(Line::from(Span::styled("OPTIONS", section_style)));
 
     let settings = app.config().state.herdr.clone();
-    let editing = app.services.herdr_tag_draft.as_ref();
+    let editing = app.services.herdr_tag_draft.as_ref().map(|d| &d.input);
     let writable = herdr_config_writable(app);
     // The focused row's block (row + its tooltip lines) for the scroll focus,
     // and the native-cursor slot for the tag editor.
@@ -2025,14 +2181,21 @@ fn draw_herdr_detail(
         );
         match row_editing {
             Some(input) => {
-                // The edit row renders plain (no highlight) with the edit
-                // gutter; the native terminal cursor owns the caret. x = "✎ "
-                // (2) + label + the 2-space value gap + pre-caret cols.
+                // The edit row keeps the selected row's tint; the native
+                // terminal cursor owns the caret, at the value column plus
+                // the caret's cell in the value window.
                 let cx = inner.x.saturating_add(
-                    (2 + row.label().chars().count() + 2 + head_cols(input)) as u16,
+                    (option_value_col(*row, inner.width as usize, option_unit(*row))
+                        + head_cols(input)) as u16,
                 );
                 caret = Some((cx, lines.len()));
-                lines.extend(row_lines);
+                for line in row_lines {
+                    lines.push(if selected {
+                        highlight_row(line, inner.width as usize)
+                    } else {
+                        line
+                    });
+                }
                 lines.extend(tag_refresh_range_tooltip(input, inner.width as usize));
             }
             None => {
@@ -2076,7 +2239,11 @@ fn draw_herdr_detail(
             .checked_sub(offset)
             .filter(|v| *v < inner.height as usize)
     {
-        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
+        place_caret(
+            frame,
+            toast_rects,
+            Position::new(cx, inner.y.saturating_add(visible as u16)),
+        );
     }
 }
 
@@ -2109,7 +2276,19 @@ fn option_row(
     } else {
         label_style(selected)
     };
-    let mut spans = vec![arrow, Span::styled(format!("{}  ", row.label()), key_style)];
+    let unit = if editing.is_some() {
+        option_unit(row)
+    } else {
+        ""
+    };
+    let col = option_value_col(row, width, unit);
+    let label = if col < 2 + Span::raw(row.label()).width() + 2 {
+        let budget = col.saturating_sub(2 + 2);
+        format!("{}  ", truncate(row.label(), budget))
+    } else {
+        format!("{}  ", row.label())
+    };
+    let mut spans = vec![arrow, Span::styled(label, key_style)];
     match row {
         HerdrOption::PopupWidth => {
             let popup = settings.popup_width;
@@ -2125,7 +2304,10 @@ fn option_row(
         HerdrOption::TagRefresh => match editing {
             Some(input) => {
                 let invalid = parse_herdr_tag_secs(input.trimmed()).is_none();
-                spans.extend(value_caret(input, invalid));
+                let room = width.saturating_sub(
+                    option_value_col(row, width, option_unit(row)) + option_unit(row).len(),
+                );
+                spans.extend(value_caret(input, invalid, room));
                 let unit_style = if invalid {
                     theme::danger()
                 } else {
@@ -2147,42 +2329,6 @@ fn option_row(
     vec![Line::from(spans)]
 }
 
-/// A toggle row's value: the tier's glyph from [`theme::toggle_on`] /
-/// [`theme::toggle_off`], painted per the contract — `full` `─●` (track
-/// `LINE`, knob `ACCENT`) / `○─` (knob `TEXT_DIM`, track `LINE`); `compatible`
-/// `[on]`/`[off]` (brackets `TEXT_DIM`, `on` `ACCENT`, `off` `TEXT_DIM`). An
-/// inert row paints the whole glyph faint whatever its state. One helper
-/// feeds the shunt `enabled` row and the herdr toggles, so both change
-/// together.
-fn toggle_value(on: bool, inert: bool) -> Vec<Span<'static>> {
-    let glyph = if on {
-        theme::toggle_on()
-    } else {
-        theme::toggle_off()
-    };
-    if inert {
-        return vec![Span::styled(glyph, theme::faint())];
-    }
-    let state = if on { theme::accent() } else { theme::dim() };
-    match theme::tier() {
-        theme::Tier::Full => glyph
-            .char_indices()
-            .map(|(at, c)| {
-                let part = &glyph[at..at + c.len_utf8()];
-                Span::styled(part, if c == '─' { theme::line() } else { state })
-            })
-            .collect(),
-        theme::Tier::Compatible => {
-            let word = glyph.trim_start_matches('[').trim_end_matches(']');
-            vec![
-                Span::styled("[", theme::dim()),
-                Span::styled(word, state),
-                Span::styled("]", theme::dim()),
-            ]
-        }
-    }
-}
-
 /// Sub-line under the tag-refresh field while typing: the floor, DANGER when
 /// the buffer parses under it, else faint — the Config-tab refresh editor's
 /// shape.
@@ -2192,6 +2338,31 @@ fn tag_refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'stat
         invalid_tooltip_lines(RANGE, width)
     } else {
         help_tooltip_lines(RANGE, width)
+    }
+}
+
+/// Where a herdr-options row's value opens: past the caret gutter, the label
+/// and its 2-space gap ([`option_row`]'s ragged layout), clamped on a pane
+/// narrower than it plus the value floor and the row's `unit` — ` s` for the
+/// tag refresh, the one herdr row whose value carries a unit (the label
+/// truncates there).
+fn option_value_col(row: HerdrOption, width: usize, unit: &str) -> usize {
+    let full = 2 + Span::raw(row.label()).width() + 2;
+    if unit.is_empty() {
+        full
+    } else {
+        full.min(width.saturating_sub(MIN_VALUE_W + unit.len()))
+    }
+}
+
+fn option_unit(row: HerdrOption) -> &'static str {
+    match row {
+        HerdrOption::TagRefresh => " s",
+        HerdrOption::PopupWidth
+        | HerdrOption::PaneTag
+        | HerdrOption::BorderLabel
+        | HerdrOption::DelegateDot
+        | HerdrOption::DelegateRowText => "",
     }
 }
 
@@ -2286,6 +2457,9 @@ fn value_tone(key: &str, value: &str) -> Style {
             theme::success()
         }
         ("installed", "no") | ("mcp entry", "not") => theme::warning(),
+        // A stale completion script is a problem; a missing one is an
+        // invitation and stays body text.
+        ("completions", "stale") => theme::warning(),
         ("mcp server", "won't") => theme::danger(),
         ("plugin", "linked") => theme::success(),
         ("plugin", "installed") => theme::success(),
@@ -2516,6 +2690,37 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
         // terminal only as visible escapes.
         cwd: record.cwd.as_deref().map(escape_control),
     }
+}
+
+/// The row's `S t/s` fact: a running job's live speed off its own Claude Code
+/// session, a finished job's average off the App's resolved cache. `None`
+/// renders nothing (a job with no fresh reading keeps its existing facts).
+fn delegate_speed_fact(job: &StoredJob, app: &App) -> Option<String> {
+    match job.phase() {
+        JobPhase::Running | JobPhase::Blocking => {
+            let sid = job.record.session_id.as_deref()?;
+            let speed = app.fresh_tps()?.sessions.get(sid)?.figures.live.speed?;
+            Some(speed_fact(speed))
+        }
+        JobPhase::Done => finished_speed_fact(job, app),
+        JobPhase::Orphaned => None,
+    }
+}
+
+/// A finished job's own average, read off the App cache the tick path fills
+/// ([`crate::tui::app`] resolves each finished transcript once, retrying until
+/// a figure lands). The render pass stays pure — no store walk, no transcript
+/// read here.
+fn finished_speed_fact(job: &StoredJob, app: &App) -> Option<String> {
+    app.delegate_speed_cache
+        .get(&job.record.job_id)
+        .copied()
+        .map(speed_fact)
+}
+
+/// `S t/s` for the row's facts, in `format_figure`'s grammar.
+fn speed_fact(speed: f64) -> String {
+    format!("{} t/s", crate::tps::format_figure(speed))
 }
 
 /// Which kill lands first and how far off it is. `monitor` reports both figures

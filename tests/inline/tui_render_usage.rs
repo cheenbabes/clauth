@@ -10,6 +10,18 @@ fn snap_with_usage(
     s.usage.insert(name.to_string(), u);
     s
 }
+/// The raw OAuth store entry, as the snapshot builder keeps it. An OAuth-typed
+/// name gets the same entry here and (through the picker) in `usage`; a hybrid
+/// keeps its provider reading in `usage`, and only this map says what its own
+/// plan is.
+fn snap_with_oauth_usage(
+    mut s: ReadingsSnapshot,
+    name: &str,
+    u: crate::usage::UsageInfo,
+) -> ReadingsSnapshot {
+    s.oauth.insert(name.to_string(), u);
+    s
+}
 fn snap_with_status(mut s: ReadingsSnapshot, name: &str, st: FetchStatus) -> ReadingsSnapshot {
     s.fetch_status.insert(name.to_string(), st);
     s
@@ -31,7 +43,7 @@ fn snap_with_stale(mut s: ReadingsSnapshot, name: &str) -> ReadingsSnapshot {
 fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
     let stat = Stat {
         label: "5h".to_string(),
-        pct: 1.0000000000000009,
+        pct: Some(1.0000000000000009),
         amount: String::new(),
         color: theme::body(),
         burn_rate: None,
@@ -39,13 +51,15 @@ fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
         pace_pct: None,
         reset_secs: None,
         trailing: String::new(),
+        note: None,
+        value: None,
     };
     let lines = stat.render(6, 20, 0, 0);
     assert_eq!(
         lines[0].spans.last().map(|s| s.content.as_ref()),
         Some("1%")
     );
-    assert_eq!(stat.pct, 1.0000000000000009);
+    assert_eq!(stat.pct, Some(1.0000000000000009));
 }
 
 /// `bar_spans` overlays the `│` pace marker at its cell without ever changing
@@ -146,8 +160,8 @@ fn stats_from_bars_does_not_rename_duplicate_labels() {
     let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].label, "tokens limit");
     assert_eq!(stats[1].label, "tokens limit");
-    assert_eq!(stats[0].pct, 0.0);
-    assert_eq!(stats[1].pct, 12.0);
+    assert_eq!(stats[0].pct, Some(0.0));
+    assert_eq!(stats[1].pct, Some(12.0));
 }
 
 /// A bar whose label decodes to a window (`5h`/`7d`/`30d`) gets the OAuth window
@@ -238,6 +252,7 @@ fn tp_bar(
         resets_at: Some(crate::usage::epoch_secs_to_iso(reset_secs)),
         used,
         total,
+        inference_quota: false,
     }
 }
 
@@ -253,6 +268,92 @@ fn empty_msg_credless_profile_is_terminal() {
     assert_eq!(
         oauth_empty_msg(&profile, None),
         "not logged in, use + login on the setup tab"
+    );
+}
+
+/// A setup token alone gives `/usage` nothing to read: the body names the
+/// probe as the way to a reading. The switch on, it loads until a probe lands,
+/// and a refused token is as terminal as a failed fetch. The switch without a
+/// token has nothing to probe with, so it still asks for a login.
+#[test]
+fn empty_msg_follows_the_usage_probe_on_a_setup_token_account() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.has_long_lived_sidecar = true;
+    assert_eq!(
+        oauth_empty_msg(&profile, None),
+        "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe"
+    );
+    profile.usage_probe = true;
+    assert_eq!(oauth_empty_msg(&profile, None), "loading");
+    for status in [FetchStatus::Failed, FetchStatus::AuthExpired] {
+        assert_eq!(
+            oauth_empty_msg(&profile, Some(status)),
+            "no usage available",
+            "{status:?}"
+        );
+    }
+    profile.has_long_lived_sidecar = false;
+    assert_eq!(
+        oauth_empty_msg(&profile, None),
+        "not logged in, use + login on the setup tab"
+    );
+}
+
+/// A session-token sidecar with no OAuth pair is a login clauth cannot read
+/// usage through: the empty state says what clauth cannot do and how the same
+/// account becomes readable, never "not logged in". Read off the profile a
+/// config load puts in memory, the way the tab reads it.
+#[test]
+fn empty_msg_sidecar_only_profile_names_the_unreadable_usage() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("s");
+    crate::profile::save_profile(&crate::testutil::blank_profile(&name)).expect("save profile");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("save app state");
+    crate::testutil::write_long_lived_sidecar(&name);
+    let config = crate::profile::load_config().expect("load config");
+    let profile = config.find(&name).expect("loaded profile");
+    assert_eq!(
+        oauth_empty_msg(profile, None),
+        "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe"
+    );
+}
+
+/// An Anthropic api key (stored, or an `[env]` token) with no OAuth pair is a
+/// login with no usage windows: nothing to fix, so no fix line.
+#[test]
+fn empty_msg_key_only_profile_has_no_usage_windows() {
+    let mut stored = crate::testutil::blank_profile(&crate::profile::ProfileName::from("k"));
+    stored.api_key = Some("sk-test".to_string());
+    let mut env_token = crate::testutil::blank_profile(&crate::profile::ProfileName::from("e"));
+    env_token
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string());
+    for profile in [&stored, &env_token] {
+        assert_eq!(
+            oauth_empty_msg(profile, None),
+            "can't read usage, an api key has no usage windows",
+            "{}",
+            profile.name
+        );
+    }
+}
+
+/// F3d: a profile holding BOTH a long-lived sidecar and an api key reads the
+/// sidecar line — the sidecar branch outranks the key branch, the order ruling
+/// 5's three arms spell. Swapping the two branches must red this.
+#[test]
+fn empty_msg_sidecar_outranks_an_api_key_when_both_hold_a_login() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    profile.api_key = Some("sk-test".to_string());
+    profile.has_long_lived_sidecar = true;
+    assert_eq!(
+        oauth_empty_msg(&profile, None),
+        "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe",
+        "the sidecar line outranks the api-key line"
     );
 }
 
@@ -364,21 +465,25 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
                     label: "USD balance".to_string(),
                     value: String::new(),
                     kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
                 },
                 crate::providers::StatRow {
                     label: "api balance".to_string(),
                     value: "0.00 USD".to_string(),
                     kind: crate::providers::StatRowKind::Body,
+                    raw: None,
                 },
                 crate::providers::StatRow {
                     label: "CNY balance".to_string(),
                     value: String::new(),
                     kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
                 },
                 crate::providers::StatRow {
                     label: "api balance".to_string(),
                     value: "63.34 CNY".to_string(),
                     kind: crate::providers::StatRowKind::Body,
+                    raw: None,
                 },
             ],
             bars: vec![],
@@ -433,6 +538,483 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
         bare.iter()
             .any(|l| l.contains("63.34 CNY") && !l.contains("/day")),
         "a cold series leaves the balance row bare: {bare:?}"
+    );
+}
+
+/// The value column of a third-party text row left-pads each figure to the
+/// column's widest value so the right edges align (ragged-left, no decimal
+/// point rule, no zero padding) — the contract's numeric-column alignment.
+#[test]
+fn tp_rows_left_pad_balance_values_to_the_widest_value() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "ds",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "CNY balance".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "50.00 CNY".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "granted".to_string(),
+                    value: "1132.60 CNY".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "topped up".to_string(),
+                    value: "13.34 CNY".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "CNY balance",
+            "  api balance    50.00 CNY",
+            "  granted      1132.60 CNY",
+            "  topped up      13.34 CNY",
+        ]
+    );
+}
+
+/// A figure is every labelled row whose value opens with a digit (or a `-` sign
+/// immediately followed by a digit), whether Body or Danger: a word (`valid`) or
+/// a no-data glyph (`-`, `—`) is not. The widest figure left-pads every figure,
+/// so the right edges align, and words start at the value column unpadded.
+#[test]
+fn tp_rows_align_figures_across_body_and_danger_and_leave_words_unpadded() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("or"));
+    profile.base_url = Some("https://openrouter.ai/api/v1".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://openrouter.ai/api/v1");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "or",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "credits".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "0.00 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Danger,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "used".to_string(),
+                    value: "12.34 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "purchased".to_string(),
+                    value: "100.00 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "status".to_string(),
+                    value: "valid".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "credits",
+            "  api balance    0.00 USD",
+            "  used          12.34 USD",
+            "  purchased    100.00 USD",
+            "  status       valid",
+        ]
+    );
+}
+
+/// A Danger figure joins the width measurement too: when the Danger value is
+/// the widest in its block (an overdrawn `-1234.56 USD`), every Body figure
+/// left-pads to it.
+#[test]
+fn tp_danger_rows_join_the_figure_measurement_when_widest() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("or"));
+    profile.base_url = Some("https://openrouter.ai/api/v1".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://openrouter.ai/api/v1");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "or",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "credits".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "-1234.56 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Danger,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "used".to_string(),
+                    value: "12.34 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "credits",
+            "  api balance  -1234.56 USD",
+            "  used            12.34 USD",
+        ]
+    );
+}
+
+/// Figure-ness rides on the value's own text: one number (optionally signed)
+/// with an optional unit/currency word is a figure; a word, a no-data glyph, or
+/// a `·`-joined / parenthesized composite is not. Two known residuals are named
+/// rather than fixed — `$5` reads as a word (leading currency) and an ISO date
+/// as a figure; no current producer emits either shape.
+#[test]
+fn is_figure_reads_off_the_values_own_text() {
+    for (value, want) in [
+        ("12 days", true),
+        ("52.2M  (451 calls)", false),
+        ("5h 40% · 7d 80%", false),
+        ("valid", false),
+        ("—", false),
+        ("-", false),
+        ("-3.50 USD", true),
+        ("44,456,531", true),
+        ("3", true),
+        ("$5", false),
+        ("2026-10-01", true),
+    ] {
+        assert_eq!(is_figure(value), want, "{value:?}");
+    }
+}
+
+/// z.ai's per-model token totals and the `total` row print full grouped integers
+/// in the Usage detail (`44,456,531`, not `44.5M`), while every other reader of
+/// those rows keeps the compact `value` string.
+#[test]
+fn zai_usage_detail_prints_full_grouped_counts() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "7d tokens".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "GLM-5.2".to_string(),
+                    value: "44.5M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 44_456_531 }),
+                },
+                crate::providers::StatRow {
+                    label: "GLM-4.7".to_string(),
+                    value: "7.8M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 7_788_526 }),
+                },
+                crate::providers::StatRow {
+                    label: "total".to_string(),
+                    value: "52.2M  (451 calls)".to_string(),
+                    kind: crate::providers::StatRowKind::Faint,
+                    raw: Some(crate::providers::StatRowRaw::Calls {
+                        value: 52_245_057,
+                        calls: 451,
+                    }),
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "7d tokens",
+            "  GLM-5.2      44,456,531",
+            "  GLM-4.7       7,788,526",
+            "  total        52,245,057  (451 calls)",
+        ]
+    );
+}
+
+/// The `total` row's leading number joins the figure column like any figure:
+/// when it is wider than every model figure, the model figures left-pad to it
+/// and the `(N calls)` suffix trails outside the column.
+#[test]
+fn zai_total_joins_the_figure_column_when_wider_than_models() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "7d tokens".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "GLM-5.2".to_string(),
+                    value: "9M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 9_000_000 }),
+                },
+                crate::providers::StatRow {
+                    label: "GLM-4.7".to_string(),
+                    value: "8M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 8_000_000 }),
+                },
+                crate::providers::StatRow {
+                    label: "total".to_string(),
+                    value: "11M  (451 calls)".to_string(),
+                    kind: crate::providers::StatRowKind::Faint,
+                    raw: Some(crate::providers::StatRowRaw::Calls {
+                        value: 11_000_000,
+                        calls: 451,
+                    }),
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "7d tokens",
+            "  GLM-5.2       9,000,000",
+            "  GLM-4.7       8,000,000",
+            "  total        11,000,000  (451 calls)",
+        ]
+    );
+}
+
+/// A z.ai cache written before this build carries no `raw`: its rows keep the
+/// compact `value` string (`44.5M`), never hidden and never refetched — the
+/// decided transitional behaviour until a successful refetch.
+#[test]
+fn zai_old_cache_row_renders_its_compact_value() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "7d tokens".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "GLM-5.2".to_string(),
+                    value: "44.5M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(rendered, ["7d tokens", "  GLM-5.2      44.5M"]);
+}
+
+/// A per-tool quota row (z.ai's `quota_stats` breakdown) drives through the
+/// Usage detail and renders its raw count full grouped, not the compact `1.2k`
+/// the `value` string carries.
+#[test]
+fn zai_per_tool_row_renders_its_full_grouped_count() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "mcp tools".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "search-prime".to_string(),
+                    value: "1.2k".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 1_234 }),
+                },
+                crate::providers::StatRow {
+                    label: "web-reader".to_string(),
+                    value: "3".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 3 }),
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        ["mcp tools", "  search-prime  1,234", "  web-reader       3",]
     );
 }
 
@@ -608,11 +1190,12 @@ fn tp_rows_auth_expired_copy_splits_by_credential() {
     assert!(!msg.contains("expired"), "nothing lapsed, got {msg}");
 }
 
-/// `TP_KEY_W` exists so every value in a stat block starts at one column.
-/// `key_cell` widens rather than truncates, so a label longer than the constant
-/// does not clip — it pushes that one row's value right of all its siblings, and
-/// the misalignment reads as a render bug rather than as a too-narrow constant.
-/// The block that catches it is the one with the longest label, DeepSeek's.
+/// `TP_KEY_W` exists so every key cell in a stat block has one width and the
+/// value column starts at one column. `key_cell` widens rather than truncates,
+/// so a label longer than the constant does not clip — it pushes that one row's
+/// value right of all its siblings, and the misalignment reads as a render bug
+/// rather than as a too-narrow constant. The block that catches it is the one
+/// with the longest label, DeepSeek's.
 #[test]
 fn tp_body_rows_share_one_value_column() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
@@ -626,8 +1209,9 @@ fn tp_body_rows_share_one_value_column() {
             .expect("the captured balance cache parses"),
     );
 
-    // A body row is `["  " + key_cell, value]`, so the value's start column is
-    // the width of everything before it.
+    // A body row is `["  " + key_cell, pad?, value]`: the value is left-padded
+    // to the column's widest figure, so its key cell is still the fixed-width
+    // span before it and every key still starts at one column.
     let starts: Vec<(String, usize)> = build_tp_rows(
         &profile,
         52,
@@ -638,7 +1222,7 @@ fn tp_body_rows_share_one_value_column() {
         None,
     )
     .iter()
-    .filter(|l| l.spans.len() == 2)
+    .filter(|l| l.spans.len() >= 2)
     .map(|l| {
         (
             l.spans[0].content.trim().to_string(),
@@ -651,7 +1235,7 @@ fn tp_body_rows_share_one_value_column() {
     let first = starts[0].1;
     assert!(
         starts.iter().all(|(_, w)| *w == first),
-        "every value starts at the same column: {starts:?}",
+        "every key cell has one width: {starts:?}",
     );
 }
 
@@ -706,6 +1290,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
     });
     // No `usage`, no `third_party_usage` → the plan-label fallback is exercised.
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -767,6 +1352,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         crate::usage::UsageInfo {
             plan: Some(crate::usage::PlanInfo {
                 tier: crate::usage::PlanTier::Max(Some(20)),
+                plan_display_name: None,
                 subscription_status: None,
                 codex_plan: None,
                 email: None,
@@ -779,6 +1365,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         "fixture must be the hybrid shape, or this pins nothing"
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -794,12 +1381,61 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
     assert!(
-        plan_row.contains("Claude Max 20x"),
+        plan_row.contains("Claude Ultra"),
         "hybrid plan row shows its fetched tier, got {plan_row:?}"
     );
     assert!(
         !plan_row.contains("api"),
         "hybrid plan row must not fall through to the bare 'api' literal, got {plan_row:?}"
+    );
+}
+
+/// The Usage plan row reads the server's own plan name like every other plan
+/// surface; the token stamp and the local map would both say `Claude Max`.
+#[test]
+fn header_lines_plan_shows_the_server_plan_name() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("named"));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "named",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(5)),
+                plan_display_name: Some("Ultra Lite".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let plan_row: String = header_lines(&profile, &header, 52, &readings)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    assert!(
+        plan_row.contains("Claude Ultra Lite"),
+        "the plan row shows the server's name, got {plan_row:?}"
     );
 }
 
@@ -823,6 +1459,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         }),
     });
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -866,9 +1503,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
         let readings = match reset_in.map(|secs| crate::usage::UsageInfo {
             five_hour: Some(crate::usage::UsageWindow {
                 utilization: 0.0,
-                resets_at: Some(crate::usage::epoch_secs_to_iso(
-                    crate::usage::now_epoch_secs() + secs,
-                )),
+                resets_at: Some(crate::testutil::countdown_reset_in(secs)),
             }),
             ..Default::default()
         }) {
@@ -876,6 +1511,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             None => ReadingsSnapshot::default(),
         };
         let header = HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
@@ -915,7 +1551,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
 
     // Gate and own reset tie: either estimate reads the same value.
     assert_eq!(
-        lines_of(true, Some(8880), slot(Some(8880)))[0],
+        lines_of(true, Some(8880), slot(Some(8910)))[0],
         row("usage auto-start in 2h 28m")
     );
 
@@ -994,6 +1630,7 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
         },
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1046,6 +1683,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
     );
 
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1086,13 +1724,15 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
     .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
     .collect();
     assert!(
-        body.contains("not logged in"),
+        body.contains("can't read usage, an api key has no usage windows"),
         "the body takes the OAuth arm's empty message, got {body:?}"
     );
     // Notes close the pane (cloudy's placement): after the usage blocks, never
     // between header and body.
     let at_notes = body.find("notes:").expect("notes row present");
-    let at_empty = body.find("not logged in").expect("empty message present");
+    let at_empty = body
+        .find("can't read usage, an api key has no usage windows")
+        .expect("empty message present");
     assert!(
         at_notes > at_empty,
         "notes render below the usage blocks, got {body:?}"
@@ -1111,6 +1751,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         Some("sk-fixture".to_string()),
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1151,6 +1792,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,
@@ -1159,6 +1801,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         },
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1200,6 +1843,55 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
     );
 }
 
+/// The organization's refusal names itself apart from a canceled plan on the
+/// Usage card, its pill and its fix both, pinned whole: swapping either for
+/// the canceled pair turns this red. The control: a canceled plan reads its own
+/// pair.
+#[test]
+fn status_lines_name_an_organizations_refusal_apart_from_a_canceled_plan() {
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let rendered = |status: &str| {
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            UsageInfo {
+                plan: Some(PlanInfo {
+                    tier: PlanTier::Free,
+                    plan_display_name: None,
+                    subscription_status: Some(status.to_string()),
+                    codex_plan: None,
+                    email: None,
+                }),
+                ..Default::default()
+            },
+        );
+        status_text(&status_lines(&profile, &header, 120, &readings))
+    };
+    assert_eq!(
+        rendered(crate::usage::ORG_REFUSED_STATUS),
+        "status    [ org refused ]\n└ its organization refuses this account, no login fixes that"
+    );
+    assert_eq!(
+        rendered("canceled"),
+        "status    [ canceled ]\n└ this subscription has been canceled",
+        "control: a canceled plan reads its own pill and fix"
+    );
+}
+
 /// Regression guard the other direction: an un-canceled cached plan never
 /// paints the canceled pill.
 #[test]
@@ -1213,6 +1905,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: None,
                 codex_plan: None,
                 email: None,
@@ -1221,6 +1914,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         },
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1253,6 +1947,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
 fn disabled_rung_header(kick: bool) -> HeaderState {
     use crate::usage::KickBlock;
     HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1289,6 +1984,7 @@ fn status_text(ls: &[Line<'_>]) -> String {
 #[test]
 fn status_lines_renders_stale_cue_from_age_alone() {
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1329,6 +2025,7 @@ fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let readings = snap_with_stale(readings, "a");
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1352,6 +2049,7 @@ fn status_lines_stale_prepends_the_fetch_row() {
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let readings = snap_with_stale(readings, "a");
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1413,6 +2111,7 @@ fn status_lines_keyless_third_party_renders_no_key_pill() {
         "a",
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1462,6 +2161,7 @@ fn status_lines_keyless_third_party_renders_no_key_pill() {
 #[test]
 fn status_lines_no_key_gate_is_the_work_lists_membership() {
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1532,6 +2232,7 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
 fn status_lines_oauth_profile_never_renders_no_key() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1670,6 +2371,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1757,6 +2459,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
@@ -1839,6 +2542,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 45_000),
             tick: 0,
@@ -1910,6 +2614,7 @@ fn status_lines_single_hint_has_no_rail() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Failed);
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 20_000),
         tick: 0,
@@ -1955,6 +2660,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 30_000),
             tick: 0,
@@ -2009,6 +2715,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
@@ -2052,6 +2759,7 @@ fn rate_limited_suffix_counts_the_retry() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -2096,6 +2804,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -2158,6 +2867,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             .expect("a streak pill")
     };
     let header = |streaks: StreakCounts| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -2229,6 +2939,7 @@ fn spent_skipped_account_pill_is_bare() {
             .join("\n")
     };
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -2278,6 +2989,47 @@ fn spent_skipped_account_pill_is_bare() {
     );
 }
 
+/// The Usage tab's spent teach names a monthly quota (`monthly quota is
+/// spent`), never "weekly limit is spent": the teach producer reads the long
+/// window's label, so a monthly-only account at the hard cap gets the monthly
+/// arm of the diagnostic.
+#[test]
+fn the_usage_teach_names_a_monthly_quota() {
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags {
+            weekly_hard: true,
+            ..DiagFlags::default()
+        },
+        peak: None,
+    };
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("qwen"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "qwen",
+        crate::usage::UsageInfo {
+            monthly: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    let rendered = status_text(&status_lines(&profile, &header, 120, &readings));
+    let hint_line = rendered
+        .lines()
+        .find(|l| l.contains("is spent"))
+        .expect("a spent account renders its hint");
+    assert_eq!(hint_line, "└ monthly quota is spent");
+}
+
 /// The retry ordinal survives English's teen exceptions (`11th`–`13th` beat
 /// the `1`/`2`/`3` last-digit rules).
 #[test]
@@ -2317,6 +3069,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
                 plan: None,
                 five_hour: None,
                 seven_day: None,
+                monthly: None,
                 weekly_scoped: Vec::new(),
                 window_dollars: Vec::new(),
                 extra_usage: extra,
@@ -2325,6 +3078,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
                 codex_reset_credits: None,
                 open_at: None,
                 fetched_at: None,
+                no_five_hour_limit: false,
             },
         );
         collect_stats(
@@ -2364,6 +3118,705 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     assert!(bar.amount.is_empty());
 }
 
+fn credit_stats(
+    extra: Option<crate::usage::ExtraUsage>,
+    spend: Option<crate::usage::SpendInfo>,
+) -> Vec<Stat> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo {
+            plan: None,
+            five_hour: None,
+            seven_day: None,
+            monthly: None,
+            weekly_scoped: Vec::new(),
+            window_dollars: Vec::new(),
+            extra_usage: extra,
+            spend,
+            codex_limit_reached: None,
+            codex_reset_credits: None,
+            open_at: None,
+            fetched_at: None,
+            no_five_hour_limit: false,
+        },
+    );
+    collect_stats(
+        readings.usage_of(&profile.name).expect("usage"),
+        ResetFmt::default(),
+    )
+}
+
+/// The billing-off shape observed live on 2026-07-17: a stale limit and spend
+/// left behind on an account whose billing is switched off. That cap binds
+/// nothing, so none of its figures may render as if it were live.
+fn billing_off_spend() -> crate::usage::SpendInfo {
+    crate::usage::SpendInfo {
+        enabled: false,
+        used: Some(31.07),
+        limit: Some(50.0),
+        percent: Some(62.0),
+        currency: Some("USD".to_string()),
+    }
+}
+
+#[test]
+fn a_billing_off_spend_block_shows_none_of_its_stale_figures() {
+    let stats = credit_stats(None, Some(billing_off_spend()));
+    for stat in &stats {
+        for text in [&stat.trailing, &stat.amount] {
+            assert!(
+                !text.contains("31.07") && !text.contains("50.00"),
+                "a billing-off cap's stale figures must not render: {:?} -> {text:?}",
+                stat.label
+            );
+        }
+    }
+    assert!(
+        !stats
+            .iter()
+            .any(|s| s.label == "spend" && s.pct.is_some_and(|p| p > 0.0)),
+        "a billing-off cap draws no filled bar"
+    );
+}
+
+#[test]
+fn a_billing_off_spend_block_leaves_the_live_legacy_extra_bar_up() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        monthly_limit: Some(5000.0),
+        used_credits: Some(487.0),
+        utilization: Some(9.74),
+        currency: Some("USD".to_string()),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(extra), Some(billing_off_spend()));
+    let bar = stats
+        .iter()
+        .find(|s| s.label == "extra")
+        .expect("the live extra bar renders while spend's billing is off");
+    assert_eq!(bar.trailing, "$4.87 / $50.00");
+}
+
+#[test]
+fn an_unread_spend_figure_renders_a_dash_never_zero() {
+    let spend = crate::usage::SpendInfo {
+        enabled: true,
+        used: None,
+        limit: Some(50.0),
+        percent: Some(10.0),
+        currency: Some("USD".to_string()),
+    };
+    let stats = credit_stats(None, Some(spend));
+    let bar = stats
+        .iter()
+        .find(|s| s.label == "spend")
+        .expect("spend renders");
+    assert_eq!(bar.trailing, "— / $50.00");
+}
+
+#[test]
+fn an_unread_legacy_extra_figure_renders_a_dash_never_zero() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        monthly_limit: None,
+        used_credits: Some(487.0),
+        utilization: Some(9.74),
+        currency: Some("USD".to_string()),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(extra), None);
+    let bar = stats
+        .iter()
+        .find(|s| s.label == "extra")
+        .expect("extra renders");
+    assert_eq!(bar.trailing, "$4.87 / —");
+}
+
+/// Render the usage pane (90×24) for one OAuth profile seeded with `u`, as
+/// plain per-row strings. The credit rows live in the right-hand detail pane.
+fn render_usage_rows(u: crate::usage::UsageInfo) -> Vec<String> {
+    render_usage_rows_with_auto_start(u, false)
+}
+
+/// [`render_usage_rows`] with the account's `auto_start` opt-in set, so the
+/// header's kick countdown is judged both ways.
+fn render_usage_rows_with_auto_start(u: crate::usage::UsageInfo, auto_start: bool) -> Vec<String> {
+    crate::testutil::buffer_rows(&render_usage_buffer(u, auto_start))
+}
+
+/// [`render_usage_rows_with_auto_start`]'s frame kept as a buffer, so a test can
+/// read a cell's style as well as its glyph.
+fn render_usage_buffer(u: crate::usage::UsageInfo, auto_start: bool) -> ratatui::buffer::Buffer {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from("a"));
+    profile.auto_start = auto_start;
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    // Both maps hold the reading, as the snapshot builder fills them for an
+    // OAuth account: the picked entry IS the raw store entry.
+    let readings = snap_with_usage(
+        snap_with_oauth_usage(ReadingsSnapshot::default(), "a", u.clone()),
+        "a",
+        u,
+    );
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+        .expect("draw");
+    term.backend().buffer().clone()
+}
+
+/// A plan with no 5h limit keeps its 5h row — the value names the plan in the
+/// figure's place, in `TEXT_DIM`, with no bar — and carries no auto-start
+/// countdown, since there is no window the kick could open. An unmarked
+/// account (a body that merely lost this reading's window) still shows it.
+#[test]
+fn a_plan_with_no_five_hour_limit_names_the_plan_and_drops_the_auto_start_line() {
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let seven_day = Some(UsageWindow {
+        utilization: 0.0,
+        resets_at: None,
+    });
+    let buf = render_usage_buffer(
+        UsageInfo {
+            seven_day: seven_day.clone(),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let rows = crate::testutil::buffer_rows(&buf);
+    // The bordered pane's 90 cells less its two borders and one padding cell on
+    // each side.
+    const INNER_W: usize = 86;
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with("│ 5h"))
+        .unwrap_or_else(|| panic!("the 5h row stays: {rows:?}"));
+    assert_eq!(
+        rows[at],
+        format!(
+            "│ 5h{}no limit on this plan │",
+            " ".repeat(INNER_W - "5h".chars().count() - "no limit on this plan".chars().count())
+        ),
+        "the whole 5h row, value right-aligned in the figure's column: {rows:?}"
+    );
+    assert!(
+        !rows[at].contains('█') && !rows[at].contains('░'),
+        "no bar in the value row: {rows:?}"
+    );
+    assert_eq!(
+        rows[at + 1],
+        format!("│{}│", " ".repeat(88)),
+        "and no bar line under it: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("usage auto-start")),
+        "no countdown for a window the plan does not have: {rows:?}"
+    );
+    // The value's cells carry the secondary text tone: a phrase standing in the
+    // figure's place, not the faint dash of a figure clauth failed to read.
+    let value: Vec<char> = "no limit on this plan".chars().collect();
+    let value_x = rows[at]
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(value.len())
+        .position(|w| w == value.as_slice())
+        .unwrap_or_else(|| panic!("the value's own cells: {rows:?}"));
+    for (dx, ch) in value.iter().enumerate() {
+        let cell = buf
+            .cell((value_x as u16 + dx as u16, at as u16))
+            .expect("a value cell");
+        assert_eq!(
+            Some(cell.fg),
+            theme::dim().fg,
+            "the value's cell {ch:?} at {} is TEXT_DIM: {rows:?}",
+            value_x + dx
+        );
+    }
+
+    // Control: the same account unmarked, opted in — the countdown renders.
+    let rows = render_usage_rows_with_auto_start(
+        UsageInfo {
+            seven_day,
+            ..Default::default()
+        },
+        true,
+    );
+    let expected = format!(
+        "│ plan      —{}usage auto-start due now │",
+        " ".repeat(
+            INNER_W - "plan      —".chars().count() - "usage auto-start due now".chars().count()
+        )
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.contains("usage auto-start"))
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "an unmarked windowless account still names its next kick: {rows:?}"
+    );
+}
+
+/// A plan with no 5h limit takes no burn figure, even when a stored body still
+/// carries a 5h window (a header reading's window survives the verdict) and the
+/// history series has a slope for it: `· X %/h` beside `no limit on this plan`
+/// would name a window the plan does not have.
+#[test]
+fn a_plan_with_no_five_hour_limit_takes_no_burn_rate() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("a"))],
+    });
+    app.profile_cursor.set(0);
+    let now_ms = crate::usage::now_ms();
+    let sample = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    // Three distinct samples inside the 1h lookback: enough for a %/h slope.
+    app.history_cache.insert(
+        "a".to_string(),
+        vec![
+            (now_ms - 8 * 60_000, sample(1.0)),
+            (now_ms - 4 * 60_000, sample(2.0)),
+        ],
+    );
+    let marked = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 3.0,
+            resets_at: None,
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: None,
+        }),
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let readings = snap_with_usage(
+        snap_with_oauth_usage(ReadingsSnapshot::default(), "a", marked.clone()),
+        "a",
+        marked,
+    );
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with("│ 5h"))
+        .unwrap_or_else(|| panic!("the 5h row stays: {rows:?}"));
+    assert_eq!(
+        rows[at],
+        format!(
+            "│ 5h{}no limit on this plan │",
+            " ".repeat(86 - "5h".chars().count() - "no limit on this plan".chars().count())
+        ),
+        "no rate attaches to the plan phrase: {rows:?}"
+    );
+}
+
+/// The Usage tab's queue countdown for an unmarked opted-in member of a roster
+/// that holds a plan with no 5h limit: the render pass builds the roster from
+/// the per-frame usage snapshot, so the marked member takes no slot and does not
+/// size `N`. A call site handing the roster a constant closure would render the
+/// three-member gap here.
+#[test]
+fn the_usage_tab_sizes_the_queue_without_a_plan_that_has_no_five_hour_limit() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b", "m"]);
+    let queued = |name: &str| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.auto_start = true;
+        p.credentials = Some(crate::testutil::oauth_pair(name));
+        p
+    };
+    let names = || {
+        vec![
+            ProfileName::from("a"),
+            ProfileName::from("b"),
+            ProfileName::from("m"),
+        ]
+    };
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names(),
+            fallback_chain: names(),
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("m")],
+    });
+    // Row `b`: an unmarked member behind the marked one in queue order.
+    app.profile_cursor.set(1);
+    let anchor = crate::usage::now_epoch_secs() - 60;
+    app.auto_start_queue.lock().unwrap().last_open_at = Some(anchor);
+    let rows_of = |readings: &ReadingsSnapshot| -> Vec<String> {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, readings, &[]))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    // The plan row: `plan` column, no tier known, the countdown flush right in
+    // the 86-cell content. Two members that can open a window: 5h/2 less the
+    // 90 s interval tolerance (8910 s), minus the 60 s since the anchor.
+    let plan_row = |kick: &str| {
+        format!(
+            "│ plan      —{}{} │",
+            " ".repeat(86 - "plan      —".chars().count() - kick.chars().count()),
+            kick
+        )
+    };
+    let marked = crate::usage::UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let marked_rows = rows_of(&snap_with_usage(
+        snap_with_oauth_usage(ReadingsSnapshot::default(), "m", marked.clone()),
+        "m",
+        marked,
+    ));
+    let at = marked_rows
+        .iter()
+        .position(|row| row.starts_with("│ plan"))
+        .unwrap_or_else(|| panic!("the plan row renders: {marked_rows:?}"));
+    assert_eq!(
+        marked_rows[at],
+        plan_row("usage auto-start in 2h 27m"),
+        "the marked member sizes no part of the gap: {marked_rows:?}"
+    );
+
+    // Control: the same roster with nothing marked is a three-member queue, and
+    // the countdown names its shorter gap.
+    let unmarked_rows = rows_of(&ReadingsSnapshot::default());
+    let at = unmarked_rows
+        .iter()
+        .position(|row| row.starts_with("│ plan"))
+        .unwrap_or_else(|| panic!("the plan row renders: {unmarked_rows:?}"));
+    assert_eq!(
+        unmarked_rows[at],
+        plan_row("usage auto-start in 1h 37m"),
+        "unmarked control: three members size the gap: {unmarked_rows:?}"
+    );
+}
+
+/// A hybrid (an OAuth login plus a provider endpoint) keeps its own plan's
+/// verdict in the raw OAuth store while its picked reading is the provider's:
+/// the countdown gate and the queue chip read that store, the same one the
+/// scheduler's election reads, so the marked account shows no countdown and
+/// sizes no part of the next member's gap.
+#[test]
+fn a_hybrid_plan_with_no_five_hour_limit_is_judged_off_its_oauth_entry() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b", "m"]);
+    let queued = |name: &str| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.auto_start = true;
+        p.credentials = Some(crate::testutil::oauth_pair(name));
+        p
+    };
+    let names = || {
+        vec![
+            ProfileName::from("a"),
+            ProfileName::from("b"),
+            ProfileName::from("m"),
+        ]
+    };
+    let mut hybrid = queued("m");
+    hybrid.provider = Some(crate::providers::Provider::Zai);
+    assert!(
+        hybrid.usage_cache_is_third_party(),
+        "the picker routes a hybrid to its provider"
+    );
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names(),
+            fallback_chain: names(),
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), hybrid],
+    });
+    let anchor = crate::usage::now_epoch_secs() - 60;
+    app.auto_start_queue.lock().unwrap().last_open_at = Some(anchor);
+    // What the snapshot builder produces for a hybrid: the picked map holds the
+    // provider reading, the OAuth map the raw store entry that carries the plan
+    // verdict.
+    let readings = snap_with_oauth_usage(
+        ReadingsSnapshot::default(),
+        "m",
+        crate::usage::UsageInfo {
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 1.0,
+                resets_at: None,
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    let readings = snap_with_usage(
+        readings,
+        "m",
+        crate::usage::UsageInfo {
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 3.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let mut rows_of = |cursor: usize| -> Vec<String> {
+        app.profile_cursor.set(cursor);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    // Row `b`: the marked hybrid takes no slot, so the two live members size the
+    // gap — 5h/2 less the 90 s interval tolerance, minus the 60 s since the
+    // anchor.
+    let rows = rows_of(1);
+    let expected = format!(
+        "│ plan      —{}usage auto-start in 2h 27m │",
+        " ".repeat(
+            86 - "plan      —".chars().count() - "usage auto-start in 2h 27m".chars().count()
+        )
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.starts_with("│ plan"))
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "the marked hybrid sizes no part of the gap: {rows:?}"
+    );
+    // Row `m` itself: no countdown for a kick that never fires.
+    let rows = rows_of(2);
+    assert!(
+        !rows.iter().any(|row| row.contains("usage auto-start")),
+        "the marked hybrid shows no countdown: {rows:?}"
+    );
+}
+
+/// A spend block whose billing is off must not dress its stale cap as a live
+/// bar: exactly one `spend` note names the state, and no pane row carries a bar
+/// glyph or a dollar figure.
+#[test]
+fn a_billing_off_spend_block_renders_one_note_row_without_bar_or_figures() {
+    let rows = render_usage_rows(crate::usage::UsageInfo {
+        spend: Some(billing_off_spend()),
+        ..Default::default()
+    });
+    let note_rows: Vec<_> = rows.iter().filter(|r| r.contains("billing off")).collect();
+    assert_eq!(note_rows.len(), 1, "exactly one note row: {rows:?}");
+    // The whole note row: the label, the note, and nothing else — no bar, no
+    // stale figures, no `$`. Padded to the 90-cell pane.
+    let expected = format!(
+        "│ spend  billing off{}│",
+        " ".repeat(90 - "│ spend  billing off│".chars().count())
+    );
+    assert_eq!(note_rows[0], &expected, "the whole note row: {rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains('█') || r.contains('░')),
+        "no bar glyph may render: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains('$')),
+        "no dollar figure: {rows:?}"
+    );
+}
+
+/// An unread `spend.percent` renders `—` faint where the `%` prints and no bar
+/// track (figures only) — never `0%`, never a `░`/`█` track.
+#[test]
+fn an_unread_spend_percent_renders_a_dash_and_no_track() {
+    let spend = crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(31.07),
+        limit: Some(50.0),
+        percent: None,
+        currency: Some("USD".to_string()),
+    };
+    let lines = render_stat_block(&credit_stats(None, Some(spend)), 36);
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        text,
+        vec![
+            format!("spend{}—", " ".repeat(30)),
+            format!("{}{}", " ".repeat(21), "$31.07 / $50.00"),
+        ],
+        "the whole eyebrow and bar rows, figures only: {text:?}"
+    );
+}
+
+/// An unread `extra` or per-period utilization renders `—` and no track, the
+/// same as an unread spend percent — never `0%`, never a bar graphic.
+#[test]
+fn an_unread_extra_or_period_utilization_draws_a_dash_and_no_track() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        used_credits: Some(487.0),
+        monthly_limit: Some(5000.0),
+        utilization: None,
+        daily: Some(serde_json::json!({"used_credits": 200.0})),
+        ..Default::default()
+    };
+    let lines = render_stat_block(&credit_stats(Some(extra), None), 60);
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    let eyebrows: Vec<&str> = text
+        .iter()
+        .filter(|l| l.contains("extra"))
+        .map(|l| l.as_str())
+        .collect();
+    assert_eq!(
+        eyebrows.len(),
+        2,
+        "the extra bar and the period row both render: {text:?}"
+    );
+    assert_eq!(
+        eyebrows,
+        vec![
+            format!("extra{}—", " ".repeat(54)),
+            format!("extra usage (24h){}—", " ".repeat(42)),
+        ],
+        "each unread utilization renders — where the % prints: {text:?}"
+    );
+    assert!(
+        !text.iter().any(|l| l.contains('░') || l.contains('█')),
+        "an unread utilization draws no track: {text:?}"
+    );
+}
+
+/// A billing-on spend whose money objects are both unread renders `—` for the
+/// figures — never an empty trailing, never `$0.00`.
+#[test]
+fn a_spend_with_both_amounts_unread_renders_a_dash() {
+    let spend = crate::usage::SpendInfo {
+        enabled: true,
+        used: None,
+        limit: None,
+        percent: Some(40.0),
+        currency: Some("USD".to_string()),
+    };
+    let stats = credit_stats(None, Some(spend));
+    let bar = stats.iter().find(|s| s.label == "spend").expect("spend");
+    assert_eq!(bar.trailing, "—");
+}
+
+/// A per-period row with a read `monthly_limit` and unread `used_credits`
+/// renders `— / $limit` — the read limit is kept, the unread used is marked.
+#[test]
+fn a_period_with_read_limit_and_unread_used_renders_a_dash() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        used_credits: Some(487.0),
+        monthly_limit: Some(5000.0),
+        utilization: Some(9.74),
+        daily: Some(serde_json::json!({"utilization": 5.0, "monthly_limit": 100.0})),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(extra), None);
+    let period = stats
+        .iter()
+        .find(|s| s.label == "extra usage (24h)")
+        .expect("period renders");
+    assert_eq!(period.trailing, "— / $100.00");
+}
+
+/// Per-period rows key on `extra.is_enabled` alone, never on spend billing: a
+/// disabled extra block hides them, but a billing-on or billing-off spend both
+/// keep them — only the legacy `extra` bar dedups against a billing-on spend.
+#[test]
+fn period_rows_gate_on_extra_enabled_alone() {
+    let enabled = || crate::usage::ExtraUsage {
+        is_enabled: true,
+        daily: Some(serde_json::json!({"utilization": 5.0, "used_credits": 200.0})),
+        ..Default::default()
+    };
+    let spend = || crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(1.0),
+        limit: Some(50.0),
+        percent: Some(2.0),
+        currency: Some("USD".to_string()),
+    };
+
+    // A disabled extra block renders no period rows.
+    let disabled = crate::usage::ExtraUsage {
+        is_enabled: false,
+        daily: Some(serde_json::json!({"utilization": 5.0, "used_credits": 200.0})),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(disabled), None);
+    assert!(
+        !stats.iter().any(|s| s.label.starts_with("extra usage")),
+        "a disabled extra block renders no period rows"
+    );
+
+    // A billing-on spend with an enabled extra hides only the legacy extra bar;
+    // the period rows still render.
+    let stats = credit_stats(Some(enabled()), Some(spend()));
+    let labels: Vec<_> = stats.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec!["extra usage (24h)", "spend"],
+        "a billing-on spend hides the extra bar, not the period rows"
+    );
+
+    // A billing-off spend with an enabled extra keeps the extra bar and the
+    // period rows.
+    let stats = credit_stats(Some(enabled()), Some(billing_off_spend()));
+    let labels: Vec<_> = stats.iter().map(|s| s.label.as_str()).collect();
+    assert!(
+        labels.contains(&"extra"),
+        "the extra bar renders: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"extra usage (24h)"),
+        "the period row renders beside a billing-off spend: {labels:?}"
+    );
+}
+
 // ── diagnostic hints ──────────────────────────────────────────────────────────
 //
 // Each degraded/misconfigured state maps to a `└` fix line naming WHAT is wrong
@@ -2401,6 +3854,222 @@ fn auth_broken_hint_names_the_profile() {
     );
 }
 
+/// A block on an account the usage probe reads has its own fix line: no kick
+/// runs without a pair, so `enable auto-start` would send the operator to a
+/// switch that cannot help, and the probe's next good answer lifts the block.
+#[test]
+fn a_probed_accounts_kick_block_names_the_probe_as_its_way_out() {
+    use crate::usage::KickBlock;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    crate::testutil::make_probed_account(&mut profile);
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
+    let now = now_epoch_secs();
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let hint = lines
+        .iter()
+        .find(|l| l.starts_with('└'))
+        .unwrap_or_else(|| panic!("a fix line: {lines:?}"));
+    assert_eq!(hint, "└ lifts on the usage probe's next good answer");
+}
+
+/// The same block once the probe is switched off: nothing re-tests it, since
+/// no kick runs without a pair and no probe runs either, so the fix line names
+/// the ceiling the block sits out instead of the auto-start switch.
+#[test]
+fn a_kick_block_with_no_pair_and_the_probe_off_names_its_ceiling() {
+    use crate::usage::KickBlock;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    crate::testutil::make_probed_account(&mut profile);
+    profile.usage_probe = false;
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
+    let now = now_epoch_secs();
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let hint = lines
+        .iter()
+        .find(|l| l.starts_with('└'))
+        .unwrap_or_else(|| panic!("a fix line: {lines:?}"));
+    assert_eq!(hint, "└ expires at its ceiling, since no probe reads it");
+}
+
+/// The switch alone does not make the probe read an account: with it on, a
+/// block on an account with no setup token to send, a disabled one, or one
+/// whose token was refused and rests names its ceiling as well. The control, a
+/// probed account, names the probe.
+#[test]
+fn a_kick_block_the_probe_does_not_read_names_its_ceiling_with_the_switch_on() {
+    use crate::usage::KickBlock;
+    let _home = crate::testutil::HomeSandbox::new();
+    let kick_hint = |profile: &crate::profile::Profile, status: FetchStatus| -> String {
+        let readings = snap_with_status(ReadingsSnapshot::default(), "a", status);
+        let now = now_epoch_secs();
+        let lines: Vec<String> = status_lines(
+            profile,
+            &HeaderState {
+                fetches_here: true,
+                activity: ProfileActivity::Idle,
+                next_refresh_ms: Some(now_ms() + 90_000),
+                tick: 0,
+                rate_limit_source: super::RateLimitSource::OAuth,
+                streaks: StreakCounts::default(),
+                kick_block: Some(KickBlock {
+                    streak: 2,
+                    rejected: true,
+                    until: Some(now + 4 * 60 * 60),
+                    next_retry: now + 30,
+                }),
+                queue_slot: None,
+                diag: DiagFlags::default(),
+                peak: None,
+            },
+            120,
+            &readings,
+        )
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+        // Other pills carry fix lines of their own, so read the block's: the
+        // line under its pill, led by `├` when another fix line follows.
+        let pill = lines
+            .iter()
+            .position(|l| l.contains(crate::format::DIAG_KICK))
+            .unwrap_or_else(|| panic!("the block's pill: {lines:?}"));
+        let hint = lines
+            .get(pill + 1)
+            .unwrap_or_else(|| panic!("the block's fix line: {lines:?}"));
+        hint.strip_prefix("└ ")
+            .or_else(|| hint.strip_prefix("├ "))
+            .unwrap_or_else(|| panic!("a fix line under the block's pill: {lines:?}"))
+            .to_string()
+    };
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    crate::testutil::make_probed_account(&mut probed);
+    assert_eq!(
+        kick_hint(&probed, FetchStatus::Fresh),
+        "lifts on the usage probe's next good answer",
+        "the control: an account the probe reads"
+    );
+    let mut no_token = probed.clone();
+    no_token.has_long_lived_sidecar = false;
+    let mut disabled = probed.clone();
+    disabled.disabled = true;
+    for (case, profile, status) in [
+        ("no setup token", &no_token, FetchStatus::Fresh),
+        ("disabled", &disabled, FetchStatus::Fresh),
+        (
+            "token refused and resting",
+            &probed,
+            FetchStatus::AuthExpired,
+        ),
+    ] {
+        assert!(profile.usage_probe, "{case}: the switch stays on");
+        assert_eq!(
+            kick_hint(profile, status),
+            "expires at its ceiling, since no probe reads it",
+            "{case}"
+        );
+    }
+}
+
+/// A credit refusal on record names itself on the card, aged, with what keeps
+/// the account skipped for credit-billed work: its reading reads clear while
+/// the walks pass it over for that work.
+/// Pinned row for row at the narrowest pane (52 cells), the countdown row by
+/// its layout.
+#[test]
+fn the_usage_card_names_a_members_credit_refusal() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                credit_refused_at: Some(now_ms() - 12 * 60 * 1000),
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        52,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    // The card floors its countdown at render, a moment after the stamp above,
+    // so the seconds on the fetch row are the clock's, not this test's.
+    let (fetch_row, rows) = lines.split_last().expect("a fetch row");
+    assert_eq!(
+        rows,
+        [
+            "status    [ credits refused ]  12m ago",
+            "└ skipped for work that may need credits until a",
+            "  request on it succeeds, a window reset leaves it",
+            "  headroom, or it logs in as another account",
+        ]
+    );
+    assert!(
+        fetch_row.starts_with("          ◌ refresh in ") && fetch_row.ends_with('s'),
+        "the fetch row keeps its layout: {fetch_row:?}"
+    );
+}
+
 /// The divergence must reach the rendered row, not just the pure formatter: drive
 /// the real `status_lines` dispatch (a kick pill + its `└`) with `auto_start`
 /// flipped and read the copy back — a fix that hard-coded one arm reds here too.
@@ -2415,11 +4084,14 @@ fn status_lines_renders_the_auto_start_divergence() {
             .join("")
     };
     let render = |auto_start: bool| {
-        let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        // A pair stored, the one shape the kick runs on.
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        profile.credentials = Some(crate::testutil::oauth_pair("sk-ant-oat01-TEST"));
         let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
         joined(status_lines(
             &profile,
             &HeaderState {
+                fetches_here: true,
                 activity: ProfileActivity::Idle,
                 next_refresh_ms: Some(now_ms() + 90_000),
                 tick: 0,
@@ -2462,6 +4134,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
@@ -2486,6 +4159,148 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
     );
 }
 
+/// A refused setup token reads as such on the OAuth row and says how to get a
+/// new one, never as a rejected api key the account does not have.
+#[test]
+fn a_refused_setup_token_names_itself_and_the_mint() {
+    let rows = |ls: Vec<Line<'_>>| -> Vec<String> {
+        ls.iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect()
+    };
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.usage_probe = true;
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::AuthExpired);
+    let out = rows(status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            fetches_here: true,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    ));
+    assert_eq!(
+        out,
+        vec![
+            "status    [ token rejected ]",
+            "└ re-mint with clauth login a --setup-token",
+        ]
+    );
+}
+
+/// The status rows the Usage card draws for account `a`, its setup token
+/// refused on record, off the TUI's own merge (`App::readings_snapshot`):
+/// `pair` stores an OAuth pair beside the token, `status` is what the live
+/// store holds, and `next_refresh_ms` the countdown the frame carries.
+fn card_rows_of_a_refused_token(
+    pair: bool,
+    status: Option<FetchStatus>,
+    next_refresh_ms: Option<u64>,
+) -> Vec<String> {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let name = ProfileName::from("a");
+    let mut profile = crate::testutil::blank_profile(&name);
+    if pair {
+        profile.credentials = Some(crate::testutil::oauth_pair("a"));
+    }
+    crate::testutil::refuse_setup_token(&mut profile);
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    });
+    if let Some(status) = status {
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), status);
+    }
+    let header = HeaderState {
+        next_refresh_ms,
+        ..idle_header()
+    };
+    status_lines(&profile, &header, 120, &app.readings_snapshot())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+        .collect()
+}
+
+/// A refused setup token beside a stored pair: the pair's `/usage` poll keeps
+/// the live store `Fresh` with a refresh lined up, and the card still names
+/// the refusal and the mint, as the `⊘` beside the name does.
+#[test]
+fn the_usage_card_names_a_refused_setup_token_beside_a_fresh_pair() {
+    assert_eq!(
+        card_rows_of_a_refused_token(true, Some(FetchStatus::Fresh), Some(now_ms() + 90_000)),
+        vec![
+            "status    [ token rejected ]",
+            "└ re-mint with clauth login a --setup-token",
+        ]
+    );
+}
+
+/// A refused setup token with no pair and the probe off: switching the probe
+/// off took its status, the record keeps the verdict, and the card says so.
+#[test]
+fn the_usage_card_names_a_refused_setup_token_with_the_probe_off() {
+    assert_eq!(
+        card_rows_of_a_refused_token(false, None, None),
+        vec![
+            "status    [ token rejected ]",
+            "└ re-mint with clauth login a --setup-token",
+        ]
+    );
+}
+
+fn idle_header() -> HeaderState {
+    HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        fetches_here: true,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    }
+}
+
+fn status_text_of(profile: &crate::profile::Profile, status: FetchStatus) -> String {
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", status);
+    status_lines(profile, &idle_header(), 120, &readings)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+        .collect()
+}
+
+/// A dead api key reads as one and gets no setup-token mint for a fix.
+#[test]
+fn a_rejected_key_is_not_told_to_mint_a_setup_token() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    profile.api_key = Some("key".to_string());
+    profile.provider = Some(crate::providers::Provider::Zai);
+    let out = status_text_of(&profile, FetchStatus::AuthExpired);
+    assert_eq!(out, "status    [ key rejected ]");
+}
+
 /// Dead-first: an auth-broken account can't serve regardless of a standing kick
 /// block or spend state, so only the `[ auth broken ]` pill + its re-login hint
 /// render — the lesser pills are suppressed (mirrors `blocked_reason`'s ranking).
@@ -2504,6 +4319,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
@@ -2563,6 +4379,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
@@ -2670,6 +4487,7 @@ fn header_lines_pricing_row_only_with_windows() {
     let _home = crate::testutil::HomeSandbox::new();
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
     let base = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -2720,6 +4538,7 @@ fn windowed_table_fixture() -> crate::pricing::PriceTable {
                     cache_read: 0.0,
                     cache_write: 0.0,
                     constraint: None,
+                    mode: None,
                     window_only: false,
                 },
                 crate::pricing::PriceEntry {
@@ -2731,6 +4550,7 @@ fn windowed_table_fixture() -> crate::pricing::PriceTable {
                         start: "00:00".to_owned(),
                         end: "24:00".to_owned(),
                     }),
+                    mode: None,
                     window_only: false,
                 },
             ],
@@ -2780,6 +4600,7 @@ fn peak_state_for_is_provider_bound() {
                 cache_read: 0.0,
                 cache_write: 0.0,
                 constraint: None,
+                mode: None,
                 window_only: false,
             }],
             effective_at: None,
@@ -3002,7 +4823,7 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
         },
         profiles: vec![zai],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.third_party_streaks
         .lock()
         .unwrap()
@@ -3021,7 +4842,7 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3071,11 +4892,11 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
         .lock()
         .unwrap()
         .insert("zai".into(), FetchStatus::AuthExpired);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3116,11 +4937,11 @@ fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
         },
         profiles: vec![oau],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3179,17 +5000,18 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
                 resets_at: None,
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,
             best_effort: true,
         },
     );
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3250,7 +5072,7 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     app.tab = Tab::Usage;
     app.note_text = Some("last visible note".to_string());
     let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let first = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -3261,7 +5083,7 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     for _ in 0..70 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let last = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -3269,7 +5091,8 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
         "scroll reaches the final note"
     );
     assert_eq!(
-        app.profile_cursor, 0,
+        app.profile_cursor.read(),
+        0,
         "detail scrolling keeps the account selected"
     );
     let (selector, detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 80, 14), 1);
@@ -3300,11 +5123,11 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     );
     term.backend_mut().resize(80, 40);
     term.autoresize().unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     assert_eq!(
         app.usage_detail_max_scroll.get(),
-        8,
+        11,
         "resized viewport publishes the smaller bound"
     );
     let at = app.usage_detail_scroll;
@@ -3335,13 +5158,13 @@ fn usage_detail_reaches_note_after_more_than_u16_rows() {
     assert_eq!(notes_lines(app.note_text.as_deref(), 50).len(), 66_001);
     app.usage_detail_focus = StatusFocus::Detail;
     let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     app.usage_detail_scroll = usize::from(u16::MAX);
     for _ in 0..80 {
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     }
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     assert!(
         crate::testutil::buffer_rows(term.backend().buffer())
@@ -3366,7 +5189,7 @@ fn fitting_usage_detail_has_no_scrollbar() {
     });
     app.tab = crate::tui::app::Tab::Usage;
     let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let (_, detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 80, 40), 1);
     assert_eq!(
@@ -3426,7 +5249,8 @@ fn the_note_slot_renders_the_draft_and_parks_the_caret_on_it() {
     use ratatui::backend::TestBackend;
     let buf = NoteBuffer::new("ab\ncd");
     let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
-    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf, &[]))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let screen = rows.concat();
     assert!(screen.contains("✎"), "the edit mark rides the title break");
@@ -3435,6 +5259,49 @@ fn the_note_slot_renders_the_draft_and_parks_the_caret_on_it() {
     let caret = term.get_cursor_position().unwrap();
     assert_eq!(caret.x, 4, "border + padding + caret display col 2");
     assert_eq!(caret.y, 2, "border + draft row one");
+}
+
+/// S10: a draft line wider than the slot scrolls sideways with the caret: End
+/// sits inside the slot with the line's two-cell rocket whole before it, and
+/// one ← lands on the rocket without moving a drawn cell of the row.
+#[test]
+fn a_note_line_wider_than_the_slot_scrolls_with_its_caret() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut buf = NoteBuffer::new(&format!("{}🚀", "m".repeat(60)));
+    let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
+
+    let (end, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf, &[]));
+    let border = right_border(&screen, end.y);
+    assert!(
+        end.x + 2 <= border,
+        "End stays inside the slot ({end:?}, border {border})"
+    );
+    assert_eq!(
+        symbol_at(&screen, end.x - 2, end.y),
+        "🚀",
+        "the rocket draws whole before End"
+    );
+    let end_row = crate::testutil::buffer_rows(&screen)[end.y as usize].clone();
+
+    buf.left();
+    let (left, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf, &[]));
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 2, end.y),
+        "one left steps over the rocket's two cells"
+    );
+    assert_eq!(
+        symbol_at(&screen, left.x, left.y),
+        "🚀",
+        "the caret sits on it"
+    );
+    assert_eq!(
+        crate::testutil::buffer_rows(&screen)[left.y as usize],
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
 }
 
 /// Past 8 draft rows (or a short slot) the draft scrolls cursor-first.
@@ -3448,7 +5315,8 @@ fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {
         .join("\n");
     let buf = NoteBuffer::new(&draft);
     let mut term = Terminal::new(TestBackend::new(30, 6)).unwrap();
-    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf, &[]))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let screen = rows.concat();
     assert!(
@@ -3459,7 +5327,7 @@ fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {
     assert_eq!(caret.y, 4, "the caret parks on the inner bottom row");
 }
 
-/// cloudy-tui "Keys and commands inside prose" on the Usage tab: the auth-broken
+/// Keys and commands inside prose on the Usage tab: the auth-broken
 /// fix's `clauth login <name>`, the console-login messages' `clauth login` and
 /// the empty notes row's `n`, each in its prose's own line.
 #[test]
@@ -3538,7 +5406,7 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
 fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
     let stat = Stat {
         label: "7d".to_string(),
-        pct: 24.5,
+        pct: Some(24.5),
         amount: "12.2".to_string(),
         color: theme::body(),
         burn_rate: Some(12.2),
@@ -3546,6 +5414,8 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
         pace_pct: None,
         reset_secs: None,
         trailing: String::new(),
+        note: None,
+        value: None,
     };
     let max_rate_w = stat.rate_section_width();
     let lines = stat.render(8, 20, max_rate_w, 5);
@@ -3582,4 +5452,701 @@ fn kick_spans_pads_by_cells() {
     let spans = super::kick_spans("日本語の上流", 0, 30);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(ratatui::text::Span::raw(&joined).width(), 30);
+}
+
+// ── tps: the `speed` and `rate` rows ─────────────────────────────────────
+
+fn tps_line_text(line: &Line<'static>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// A fresh snapshot for `uwuclxdy` with live/m5/h1 figures and no day sums.
+fn tps_full_snapshot(age_ms: u64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let fig = |rate: f64, speed: Option<f64>| crate::tps::Figure { rate, speed };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(
+        "uwuclxdy".into(),
+        crate::tps::Figures {
+            live: fig(67.2, Some(92.4)),
+            m5: fig(61.0, Some(88.0)),
+            h1: fig(58.0, Some(84.0)),
+        },
+    );
+    snap
+}
+
+/// The `speed` and `rate` rows carry all four windows, `—` faint where absent,
+/// and shed whole windows from the right when the pane cannot hold them.
+#[test]
+fn the_tps_rows_render_four_windows_and_a_dash_where_absent() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("uwuclxdy".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+    app.set_tps(Some(tps_full_snapshot(1_000)));
+
+    // No day sums: the speed row's `today` reads `—`, but a fresh account's
+    // today RATE is a real zero, never an absence.
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today — · peak —"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 0 tok/s"
+    );
+
+    // A day sum of 900 tokens over 10 s: the speed row's `today` is the
+    // deterministic 900 ÷ 10 = 90 t/s.
+    let mut snap = tps_full_snapshot(1_000);
+    snap.days.insert(
+        crate::tokens::today_date(),
+        std::collections::BTreeMap::from([(
+            "uwuclxdy".to_string(),
+            std::collections::BTreeMap::from([(
+                "sonnet".to_string(),
+                crate::tps::DaySum {
+                    output: 900,
+                    gen_ms: 10_000,
+                    ..Default::default()
+                },
+            )]),
+        )]),
+    );
+    // Pin the clock to 900 s after 00:00 UTC today, and stamp the snapshot 1 s
+    // before it, so it reads fresh under the pinned clock and the today rate
+    // divides by exactly 900.
+    let now = crate::usage::now_ms();
+    let fixed = now - (now % 86_400_000) + 900_000;
+    snap.generated_at =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(fixed - 1_000).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    app.set_tps(Some(snap));
+    app.tps_now_override = Some(fixed);
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today 90 t/s · peak —"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 1.0 tok/s"
+    );
+
+    // A pane too narrow sheds whole windows from the right, never a partial
+    // figure; both rows shed to the same (rate row's) window set.
+    let rows = tps_rows(&profile, &app, 50);
+    assert_eq!(tps_line_text(&rows[0]), "speed     live 92 t/s · 5m 88 t/s");
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s"
+    );
+}
+
+/// Under a fresh producer, an account ABSENT from the cache (`accounts` names
+/// only accounts with finished responses) still has a real zero rate on every
+/// window — rate is never absent under a fresh producer, `which --json` already
+/// says `rate: 0` — while its speed windows stay `—` (no response touched
+/// them). With no fresh producer behind the cache every figure reads `—`.
+#[test]
+fn tps_rows_reads_zero_rate_for_a_fresh_producers_absent_account() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("absent".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+
+    // The cache names only `uwuclxdy`; `absent` is missing from it.
+    app.set_tps(Some(tps_full_snapshot(1_000)));
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live — · 5m — · 1h — · today — · peak —",
+        "speed stays absent while no response touches its windows"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 0 tok/s · 5m 0 tok/s · 1h 0 tok/s · today 0 tok/s",
+        "a fresh producer's absent account still reads a zero rate"
+    );
+
+    // No fresh producer: every figure reads `—`.
+    app.set_tps(None);
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live — · 5m — · 1h — · today — · peak —"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live — · 5m — · 1h — · today —"
+    );
+}
+
+/// The note editor's caret that lands inside a drawn toast hides the native
+/// cursor this frame, and it hides under an open modal too. Three stacked
+/// DANGER toasts cover the note slot's caret column at 45x14.
+#[test]
+fn a_toast_over_the_note_editor_caret_hides_the_native_cursor() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::{Modal, NoteEditor, Tab, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let name = ProfileName::from("a");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&name)],
+    });
+    app.tab = Tab::Usage;
+    app.note_editor = Some(NoteEditor {
+        profile: name.clone(),
+        seed: "ab".to_string(),
+        buf: NoteBuffer::new("ab"),
+    });
+    app.usage_detail_focus = StatusFocus::Detail;
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the note caret shows with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for label in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{label}\n{wide}\n{label} tail"));
+    }
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the note caret hides under a toast"
+    );
+
+    app.toasts.clear();
+    app.open_modal(Modal::Help);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "the note caret hides under an open modal"
+    );
+}
+
+// ── codex and pool accounts on the Usage tab (design record "Settled: usage") ──
+
+/// A pool account with every flag clear and no readings.
+fn t6_pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
+    crate::gateway_admin::PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
+        plan: None,
+        status: None,
+    }
+}
+
+/// One claude account `cl1`, one codex account `cx1` (plus, 5h 42%, 7d 12%,
+/// two banked resets, polled 2 h ago) and one pool provider `claude-main`
+/// serving `alpha` (max, 5h 73%, 7d 41%, 7d fable 18%) and `beta` (cooling
+/// down 240 s), the pool listing read 2 min ago; the Usage tab shown.
+fn t6_app() -> App {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    crate::testutil::register_names(&["cl1"]);
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let now = crate::usage::now_epoch_secs();
+    let mut info = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":7230},"secondary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_after_seconds":360000}},"rate_limit_reset_credits":{"available_count":2}}"#,
+        now,
+    )
+    .expect("maps");
+    info.fetched_at = Some(crate::usage::now_ms() - 7_200_000);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("cx1"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &info,
+    );
+
+    let name = ProfileName::from("cl1");
+    let profile = crate::testutil::blank_profile(&name);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    let now = now as u64;
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![
+            PoolAccount {
+                plan: Some("max".to_string()),
+                utilization_5h: Some(0.73),
+                reset_5h: Some(now + 2 * 3600 + 13 * 60),
+                utilization_7d: Some(0.41),
+                reset_7d: Some(now + 4 * 86_400 + 2 * 3600),
+                utilization_7d_oi: Some(0.18),
+                reset_7d_oi: Some(now + 4 * 86_400 + 2 * 3600),
+                ..t6_pool_account("alpha")
+            },
+            PoolAccount {
+                available: false,
+                cooldown_secs_remaining: Some(240),
+                ..t6_pool_account("beta")
+            },
+        ],
+    }]);
+    app.shunt_pool_read_at_ms = Some(crate::usage::now_ms() - 120_000);
+    app.tab = crate::tui::app::Tab::Usage;
+    app
+}
+
+/// The Usage body drawn at 100x24, split into its two panes' inner text rows
+/// (the detail pane opens at the second `╭` of the top border), each row
+/// stripped of border and scrollbar cells and trimmed, trailing blank rows
+/// dropped.
+fn t6_panes(app: &App) -> (Vec<String>, Vec<String>) {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| draw(f, f.area(), app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let top: Vec<char> = rows[0].chars().collect();
+    let split = top
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '╭')
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a selector and a detail pane");
+    let strip = |cells: &[char]| -> String {
+        cells
+            .iter()
+            .collect::<String>()
+            .trim_matches(|c: char| c == '│' || c == '┊' || c == '┃' || c.is_whitespace())
+            .to_string()
+    };
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for row in &rows[1..rows.len() - 1] {
+        let cells: Vec<char> = row.chars().collect();
+        left.push(strip(&cells[..split]));
+        right.push(strip(&cells[split..]));
+    }
+    for pane in [&mut left, &mut right] {
+        while pane.last().is_some_and(|r| r.is_empty()) {
+            pane.pop();
+        }
+    }
+    (left, right)
+}
+
+fn t6_down(app: &mut App) {
+    crate::tui::app::handle_key(
+        app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Down),
+    );
+}
+
+/// The Usage selector is Setup's band list, unfiltered: the claude rows, then
+/// the `codex` band, then one `shunt (<provider>)` band per pool provider, and
+/// no `+ new` row.
+#[test]
+fn the_usage_selector_lists_codex_and_pool_rows_in_their_bands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = t6_app();
+    let (selector, _) = t6_panes(&app);
+    assert_eq!(
+        selector,
+        [
+            "❯ cl1",
+            "",
+            "codex",
+            "cx1",
+            "",
+            "shunt (claude-main)",
+            "alpha",
+            "beta",
+        ],
+        "one band walk, headings never selectable, no + new"
+    );
+}
+
+/// ↓ walks the item rows only (headings and spacers skipped), and wraps from
+/// the last pool row back to the first claude row, whose pane is the claude
+/// one it always was.
+#[test]
+fn the_usage_cursor_walks_every_band_and_wraps() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    let selected = |app: &App| {
+        let (selector, _) = t6_panes(app);
+        selector
+            .into_iter()
+            .find(|row| row.starts_with('❯'))
+            .unwrap_or_else(|| panic!("no caret row"))
+    };
+    assert_eq!(selected(&app), "❯ cl1");
+    t6_down(&mut app);
+    assert_eq!(selected(&app), "❯ cx1");
+    t6_down(&mut app);
+    assert_eq!(selected(&app), "❯ alpha");
+    t6_down(&mut app);
+    assert_eq!(selected(&app), "❯ beta");
+    t6_down(&mut app);
+    assert_eq!(
+        selected(&app),
+        "❯ cl1",
+        "↓ on the last row wraps to the first"
+    );
+    assert_eq!(app.profile_cursor.read(), 0);
+    let (_, detail) = t6_panes(&app);
+    assert!(
+        detail.iter().any(|row| row.starts_with("plan"))
+            && !detail.iter().any(|row| row.starts_with("type")),
+        "a claude row keeps the claude pane: {detail:?}"
+    );
+}
+
+/// A codex account's pane: its facts, the read age off the codex poll's own
+/// cache, then the 5h and 7d bars; none of the claude-only rows.
+#[test]
+fn the_usage_codex_pane_shows_its_facts_and_two_windows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    t6_down(&mut app);
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        detail[..5],
+        [
+            "type      codex",
+            "plan      plus",
+            "resets    ↺ 2 banked",
+            "status    ◌ read 2h ago",
+            "",
+        ],
+        "facts, then a blank row before the bars: {detail:?}"
+    );
+    assert!(
+        detail[5].starts_with("5h") && detail[5].ends_with("42%"),
+        "the 5h eyebrow: {detail:?}"
+    );
+    assert!(
+        detail[6].contains('█') || detail[6].contains('░'),
+        "the 5h bar: {detail:?}"
+    );
+    assert_eq!(detail[7], "", "a blank between the two windows: {detail:?}");
+    assert!(
+        detail[8].starts_with("7d") && detail[8].ends_with("12%"),
+        "the 7d eyebrow: {detail:?}"
+    );
+    assert!(
+        detail[9].contains('█') || detail[9].contains('░'),
+        "the 7d bar: {detail:?}"
+    );
+    assert_eq!(detail.len(), 10, "nothing after the 7d bar: {detail:?}");
+}
+
+/// A quarantined codex account names it on a `login` row between `plan` and
+/// `resets`; without the quarantine the row is gone (the pane pin above).
+#[test]
+fn a_quarantined_codex_account_shows_its_login_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_store(
+        "cx1",
+        &crate::testutil::codex_auth_body("acc.1", "refresh.cx1"),
+    );
+    crate::codex_auth::quarantine_for_test("cx1", "reused", "refresh.cx1");
+    let mut app = t6_app();
+    t6_down(&mut app);
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        detail[..4],
+        [
+            "type      codex",
+            "plan      plus",
+            "login     [ needs re-login ]",
+            "resets    ↺ 2 banked",
+        ],
+        "{detail:?}"
+    );
+}
+
+/// A pool account's pane: type, family, provider, plan, the listing's read
+/// age, then the 5h, 7d and `7d fable` bars from its own admin row.
+#[test]
+fn the_usage_pool_pane_shows_its_facts_and_three_windows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    t6_down(&mut app);
+    t6_down(&mut app);
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        detail[..6],
+        [
+            "type      shunt",
+            "family    claude",
+            "provider  claude-main",
+            "plan      max",
+            "read      2m ago",
+            "",
+        ],
+        "an available account has no status row: {detail:?}"
+    );
+    for (row, label, pct) in [(6, "5h", "73%"), (9, "7d", "41%"), (12, "7d fable", "18%")] {
+        assert!(
+            detail[row].starts_with(label) && detail[row].ends_with(pct),
+            "the {label} eyebrow at row {row}: {detail:?}"
+        );
+        assert!(
+            detail[row + 1].contains('█') || detail[row + 1].contains('░'),
+            "the {label} bar: {detail:?}"
+        );
+    }
+    assert_eq!(detail.len(), 14, "nothing after the fable bar: {detail:?}");
+}
+
+/// A cooling-down pool account carries one `status` pill before its read age.
+#[test]
+fn a_cooling_down_pool_account_shows_its_status_pill() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    for _ in 0..3 {
+        t6_down(&mut app);
+    }
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(detail[3], "plan      —", "{detail:?}");
+    assert_eq!(
+        detail[4], "status    [ cooldown ]  4m",
+        "the cooldown pill and its 240 s countdown: {detail:?}"
+    );
+    assert_eq!(detail[5], "read      2m ago", "{detail:?}");
+}
+
+/// The footer offers `n note` on a claude row only: codex and pool accounts
+/// keep no notes.
+#[test]
+fn the_usage_footer_offers_notes_on_claude_rows_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    let footer = |app: &App| {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .pop()
+            .expect("a footer row")
+    };
+    assert!(
+        footer(&app).contains("n note"),
+        "claude row: {}",
+        footer(&app)
+    );
+    t6_down(&mut app);
+    assert!(
+        !footer(&app).contains("note"),
+        "codex row: {}",
+        footer(&app)
+    );
+    t6_down(&mut app);
+    assert!(!footer(&app).contains("note"), "pool row: {}", footer(&app));
+}
+
+#[test]
+fn the_pace_marker_turns_danger_once_the_fill_covers_its_column() {
+    let fill = Style::default().fg(theme::warning_color());
+    let marker = |spans: &[Span<'_>]| {
+        spans
+            .iter()
+            .find(|s| s.content == "│")
+            .map(|s| s.style.fg)
+            .expect("the marker renders")
+    };
+    // 6 of 10 cells filled, marker in column 3: covered, so DANGER over the fill.
+    assert_eq!(
+        marker(&bar_spans(6, 10, fill, Some(3))),
+        Some(theme::danger_color())
+    );
+    // marker in column 6, the first empty cell: not reached, so it stays dim.
+    assert_eq!(
+        marker(&bar_spans(6, 10, fill, Some(6))),
+        Some(theme::text_dim_color())
+    );
+}
+
+#[test]
+fn a_switching_rows_usage_spinner_turns_orange() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let header = HeaderState {
+        activity: ProfileActivity::Switching,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+        fetches_here: true,
+    };
+    let lines = status_lines(&profile, &header, 120, &ReadingsSnapshot::default());
+    let spinner = lines[0]
+        .spans
+        .iter()
+        .find(|s| {
+            crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|f| s.content.contains(f))
+        })
+        .unwrap_or_else(|| {
+            let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+            panic!("a switching row spins: {text}")
+        });
+    assert_eq!(spinner.style.fg, Some(theme::accent_2_color()));
+}
+
+/// The `speed` row's fifth window is the account's peak speed today (the feed's
+/// `peaks.today.accounts.<name>.speed`); the `rate` row carries no peak. The
+/// peak window sheds first: at 68 columns the rate row's four windows fit (67
+/// cells) but the speed row with its peak (70 cells) does not, so the speed row
+/// keeps `today` and drops `peak` whole.
+#[test]
+fn the_speed_row_ends_in_the_accounts_peak_speed_today() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("uwuclxdy".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+    let mut snap = tps_full_snapshot(1_000);
+    snap.peaks = serde_json::from_value(serde_json::json!({
+        "today": {
+            "speed": {"value": 612.0, "at": "2026-09-22T21:14:00.000+00:00", "account": "kerry", "model": "claude-opus-4-8"},
+            "rate": {"value": 1803.4, "at": "2026-09-22T21:02:00.000+00:00"},
+            "accounts": {
+                "uwuclxdy": {
+                    "speed": {"value": 412.3, "at": "2026-09-22T21:10:00.000+00:00", "account": "uwuclxdy", "model": "claude-opus-4-8"},
+                    "rate": {"value": 950.0, "at": "2026-09-22T21:02:00.000+00:00"}
+                }
+            }
+        }
+    }))
+    .unwrap();
+    app.set_tps(Some(snap));
+
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today — · peak 412 t/s"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 0 tok/s"
+    );
+
+    let rows = tps_rows(&profile, &app, 68);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today —"
+    );
+    // The speed row with its peak is exactly 70 cells: it fits 70, not 69.
+    assert_eq!(
+        tps_line_text(&tps_rows(&profile, &app, 70)[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today — · peak 412 t/s"
+    );
+    assert_eq!(
+        tps_line_text(&tps_rows(&profile, &app, 69)[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today —"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 0 tok/s"
+    );
+}
+
+/// A cache past its freshness window shows no peak, even when it carries one:
+/// the speed row's `peak` window reads `—` like every other window.
+#[test]
+fn a_stale_snapshot_shows_no_usage_peak() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("uwuclxdy".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+    let mut snap = tps_full_snapshot(10 * 60 * 1000);
+    snap.peaks = serde_json::from_value(serde_json::json!({
+        "today": {"accounts": {"uwuclxdy": {
+            "speed": {"value": 412.3, "at": "2026-09-22T21:10:00.000+00:00", "account": "uwuclxdy", "model": "claude-opus-4-8"}
+        }}}
+    }))
+    .unwrap();
+    app.set_tps(Some(snap));
+    assert!(app.fresh_tps().is_none(), "a 10-minute-old cache is stale");
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live — · 5m — · 1h — · today — · peak —"
+    );
 }

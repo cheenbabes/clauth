@@ -99,6 +99,19 @@ fn middle_truncate_budgets_display_cells_for_cjk() {
     );
 }
 
+// ── trailing-ellipsis grapheme trim ──────────────────────────────────────
+
+/// `trim_trailing_ellipsis_graphemes` re-concatenates the graphemes the render
+/// walk keeps, so a control grapheme the walk drops never shifts a byte cut:
+/// `"a\u{1}b…"` keeps `b`, `"\u{1}é…"` keeps `é`, and a plain name only loses
+/// its trailing `…`.
+#[test]
+fn trim_trailing_ellipsis_keeps_control_free_graphemes_whole() {
+    assert_eq!(trim_trailing_ellipsis_graphemes("a\u{1}b…"), "ab");
+    assert_eq!(trim_trailing_ellipsis_graphemes("\u{1}é…"), "é");
+    assert_eq!(trim_trailing_ellipsis_graphemes("abc…"), "abc");
+}
+
 /// A 2-cell glyph that does not fit the content budget leaves the `…` inside
 /// the column and the pad absorbs the straddle, so `fixed` renders exactly
 /// `width` cells.
@@ -131,8 +144,8 @@ fn helpers_budget_lam_alef_per_grapheme() {
 
 // ── fetch-state cue ──────────────────────────────────────────────────────
 //
-// `fetch_cue_color`: amber = serving last-known numbers, red = failed, none =
-// live. The overview countdown carries this cue; brackets stay plain dim.
+// `fetch_cue_color`: amber = serving last-known numbers, red = failed or
+// refused, none = live. The overview countdown carries this cue; brackets stay plain dim.
 
 fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
     (
@@ -141,6 +154,8 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: std::collections::BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -152,10 +167,14 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
         },
         status,
@@ -185,6 +204,15 @@ fn cue_red_on_failed() {
     assert_eq!(fetch_cue_color(&p, s), Some(theme::danger_color()));
 }
 
+/// A refused setup token freezes the figures as a failed fetch does, so the
+/// row says so the same way.
+#[test]
+fn cue_red_on_a_refused_setup_token() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (p, s) = cue_profile(Some(FetchStatus::AuthExpired));
+    assert_eq!(fetch_cue_color(&p, s), Some(theme::danger_color()));
+}
+
 #[test]
 fn cue_absent_when_live_or_never_fetched() {
     let (p, s) = cue_profile(Some(FetchStatus::Fresh));
@@ -207,7 +235,7 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = cue_window(50.0);
     let spans =
-        window_summary_spans_bracketed(Some(&w), 17, true, None, ResetFmt::default(), false);
+        window_summary_spans_bracketed(Some(&w), 17, 0, true, None, ResetFmt::default(), false, 0);
     assert_eq!(spans[0].content, "[");
     assert_eq!(spans[0].style.fg, theme::dim().fg);
     assert_eq!(spans[2].content, "]");
@@ -219,8 +247,10 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
 #[test]
 fn no_data_dash_stays_faint() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let spans = window_summary_spans_bracketed(None, 17, true, None, ResetFmt::default(), false);
-    assert_eq!(spans[0].content, "—");
+    let spans =
+        window_summary_spans_bracketed(None, 17, 0, true, None, ResetFmt::default(), false, 0);
+    // 17 wide: the 10-cell bar + 2 brackets + 1 gap leave the 13-cell dash span.
+    assert_eq!(spans[0].content, "            —");
     assert_eq!(spans[0].style.fg, theme::faint().fg);
 }
 
@@ -255,6 +285,17 @@ fn account_type_label_dashes_an_unfetched_plan() {
     assert_eq!(account_type_label(&unclassified, None), NO_DATA);
 }
 
+/// A server plan name is an answer on its own: an unclassified tier beside it
+/// still shows the name, never the no-data dash.
+#[test]
+fn account_type_label_shows_the_server_name_of_an_unclassified_tier() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("u"));
+    let mut usage = serde_json::to_value(crate::usage::UsageInfo::default()).expect("serializes");
+    usage["plan"] = serde_json::json!({"tier": "Unknown", "plan_display_name": "Ultra Lite"});
+    let usage: crate::usage::UsageInfo = serde_json::from_value(usage).expect("reads");
+    assert_eq!(account_type_label(&profile, Some(&usage)), "Ultra Lite");
+}
+
 /// The other direction: a fetched tier still loses only its `Claude ` prefix,
 /// `Free` is untouched, and an api-key profile still reads `API`.
 #[test]
@@ -262,6 +303,7 @@ fn account_type_label_keeps_every_known_tier() {
     let plan = |tier| crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -271,7 +313,19 @@ fn account_type_label_keeps_every_known_tier() {
 
     let max = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let max_usage = plan(crate::usage::PlanTier::Max(Some(20)));
-    assert_eq!(account_type_label(&max, Some(&max_usage)), "Max 20x");
+    assert_eq!(account_type_label(&max, Some(&max_usage)), "Ultra");
+
+    let named = crate::testutil::blank_profile(&crate::profile::ProfileName::from("n"));
+    let mut named_usage =
+        serde_json::to_value(plan(crate::usage::PlanTier::Max(Some(5)))).expect("serializes");
+    named_usage["plan"]["plan_display_name"] = serde_json::json!("Ultra Lite");
+    let named_usage: crate::usage::UsageInfo =
+        serde_json::from_value(named_usage).expect("reads back");
+    assert_eq!(
+        account_type_label(&named, Some(&named_usage)),
+        "Ultra Lite",
+        "the server's plan name outranks the local map"
+    );
 
     let free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     let free_usage = plan(crate::usage::PlanTier::Free);
@@ -419,9 +473,10 @@ fn clock_reset_suffix_degrades_when_the_column_is_too_narrow() {
         "a wide column carries both halves, got {roomy}"
     );
     assert_eq!(
-        reset_suffix(2400, fmt, 26),
+        reset_suffix(2400, fmt, 9),
         " (40m)",
-        "26 cells can't fit a stamp: fall back to the countdown"
+        "the 9 cells a 26-wide column leaves its bar block can't fit a stamp: \
+         fall back to the countdown"
     );
 }
 
@@ -549,7 +604,7 @@ fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
             clock: ClockFormat::H24,
         },
     ] {
-        let single = window_summary_spans_bracketed(Some(&w), 160, true, None, no_dot, false);
+        let single = window_summary_spans_bracketed(Some(&w), 160, 0, true, None, no_dot, false, 0);
         assert!(
             !single.iter().any(|s| s.content == " · "),
             "no separator without a countdown+stamp pair"
@@ -610,9 +665,9 @@ fn stale_window_fades_only_fill_and_percent() {
     // a mutation that leaked `stale` into the reset color.
     let reset = Some(theme::warning());
     let live =
-        window_summary_spans_bracketed(Some(&w), 26, true, reset, ResetFmt::default(), false);
+        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), false, 0);
     let stale =
-        window_summary_spans_bracketed(Some(&w), 26, true, reset, ResetFmt::default(), true);
+        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), true, 0);
 
     // spans[0] = `[`, [1] = fill, [2] = `]`, [3] = ` XX%`, [4..] = reset suffix.
     assert_eq!(live[1].content, "█████░░░░░");
@@ -642,20 +697,19 @@ fn stale_window_fades_only_fill_and_percent() {
 ///
 /// Both fixtures sit HALF A DAY off the boundary, so the wall clock cannot walk
 /// either across it between building the fixture and rendering it. The date
-/// arm renders the 2026-08-22 ruling's local prose stamp through
-/// `crate::format::local_stamp`; the expected string derives through chrono's own
-/// `format` rather than the crate's formatter, so the pin is a second
-/// derivation of the same claim, not a copy of the code's arithmetic — it
-/// holds in any zone, UTC included (local equals UTC there, and the contract
-/// is satisfied by either). The literal stamp is also pinned against a fixed
-/// epoch through the chain surface by
-/// `the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days`; what this
-/// owns is the branch.
+/// arm renders the contract's absolute ISO date (`YYYY-MM-DD`, no time) in the
+/// local wall clock; the expected string derives through chrono's own `format`
+/// rather than the crate's formatter, so the pin is a second derivation of the
+/// same claim, not a copy of the code's arithmetic — it holds in any zone, UTC
+/// included (local equals UTC there, and the contract is satisfied by either).
+/// The literal date is also pinned against a fixed epoch through the chain
+/// surface by `the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days`;
+/// what this owns is the branch.
 ///
 /// `relative_age` also feeds the status tab's incident ages (the list row and
 /// the detail header), so the arm protects three surfaces, not one.
 #[test]
-fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
+fn relative_age_switches_to_an_iso_date_at_thirty_days() {
     const DAY_MS: u64 = 86_400_000;
     const HALF_DAY_MS: u64 = 43_200_000;
     let ago = |ms: u64| crate::usage::now_ms().saturating_sub(ms);
@@ -669,26 +723,61 @@ fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
     let local = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
         .unwrap()
         .with_timezone(&chrono::Local)
-        .format("%Y-%m-%d %H:%M:%S")
+        .format("%Y-%m-%d")
         .to_string();
-    assert_eq!(dated, local, "30d12h must take the local stamp arm");
+    assert_eq!(dated, local, "30d12h must take the ISO date arm");
 
-    // Where the fixture instant's local spelling differs from its UTC one,
-    // the UTC spelling must NOT be the answer: a stamp that regressed to UTC
-    // digits in the 19-char shape would still equal the local one on a UTC
-    // box, and where the two spellings coincide there is no second spelling
-    // to ban. The condition compares spellings, never the run-instant offset:
-    // a DST zone can read +00 at the fixture instant and nonzero now (the
-    // trap `sessions_cli`'s stamp pin records), and the offset read would
-    // fire the guard over two identical spellings.
+    // Where the fixture instant's local date differs from its UTC one, the UTC
+    // date must NOT be the answer: a date that regressed to UTC digits would
+    // still equal the local one on a UTC box, and where the two spellings
+    // coincide there is no second spelling to ban. The condition compares
+    // spellings, never the run-instant offset: a DST zone can read +00 at the
+    // fixture instant and nonzero now (the trap `sessions_cli`'s stamp pin
+    // records), and the offset read would fire the guard over two identical
+    // spellings.
     let utc = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
         .unwrap()
-        .format("%Y-%m-%d %H:%M:%S")
+        .format("%Y-%m-%d")
         .to_string();
     if local != utc {
         assert_ne!(
             dated, utc,
-            "the arm rendered UTC digits, not local wall clock: {dated:?}"
+            "the arm rendered the UTC date, not local wall clock: {dated:?}"
         );
+    }
+}
+
+/// P1: the bracketed window bar labels its reading with at most two
+/// nearest-rounded decimals at every width branch: 73.42 never prints a
+/// fabricated `73%`, float residue never leaks, 99.999 rounds to `100%`.
+#[test]
+fn the_bracketed_bar_label_keeps_two_rounded_decimals() {
+    let cases = [
+        (73.42, "73.42%"),
+        (1.000_000_000_000_000_9, "1%"),
+        (99.999, "100%"),
+    ];
+    for width in [30, 20, 14, 8] {
+        for (utilization, want) in cases {
+            let window = UsageWindow {
+                utilization,
+                resets_at: None,
+            };
+            let spans = window_summary_spans_bracketed_at(
+                Some(&window),
+                width,
+                true,
+                None,
+                ResetFmt::default(),
+                false,
+                0,
+            );
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(
+                text.split_whitespace().last(),
+                Some(want),
+                "{utilization} at width {width}: {text:?}"
+            );
+        }
     }
 }

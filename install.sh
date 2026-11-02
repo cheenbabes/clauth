@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="found-ai/clauth"
-VERSION="v0.17.0-found.2"
+VERSION="v0.18.0-found.1"
 BINARY="clauth"
 
 for arg in "$@"; do

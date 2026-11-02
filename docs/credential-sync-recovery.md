@@ -78,7 +78,7 @@ exists, retaining legacy serialized output in that case.
 `which` can attribute an older managed global file with source
 `managed_predecessor`; that attribution does not claim freshness. Recognized
 stale files no longer raise the unsaved-login prompt. Unrecognized files are
-still protected, and the CLI no longer calls every mismatch a "newer login."
+still protected by the unsaved-login prompt.
 Switching to the already-selected profile runs guarded reconciliation, making
 it useful for retrying a failed publication.
 
@@ -140,3 +140,28 @@ profile credentials and session-token files: restoring an old credential
 backup can restore a refresh token that has already been consumed. The older
 binary ignores the additional journal, but does not provide its recovery
 behavior. Installing or restarting Eugene's live setup is outside this patch.
+
+## Upstream merge (0.18.0)
+
+Merged upstream `cbc9e127` (0.18.0). Upstream kept its inline live-file
+follower and Keychain mirror in `land_pair_with` and `restamp_rolling_token`;
+this fork keeps reconciliation in their place, because the fork's
+`repro_sync_missed_follow_survives_two_rotations` still fails on plain upstream
+(`at-old` left in the live file after two rotations). Two upstream behaviors
+carry over onto the reconciler: a landing deletes its stage only after
+reconciliation returns (so a cut publication is redone from the stage), and
+upstream's bare-item settlement (GH #106) still saves a login a Claude Code
+outside clauth rotated into the Keychain into its owning profile before an
+explicit switch or login replaces it.
+
+The Keychain sync writer does not run upstream's spent-record guard
+(`claude::bare_item_may_be_replaced`). Its protection is the journal: it
+replaces only a login whose access-token fingerprint it recorded clauth
+publishing, and Claude Code mints a new access token on every refresh, so an
+outside rotation is never recognized. The guard checks the refresh token
+against a bounded spent record instead, and after enough private rotations
+would refuse to repair a predecessor the journal still recognizes.
+
+A profile store whose content is torn loads as logged out and publishes
+nothing. A store that cannot be read is an error: reconciliation and linking
+report it rather than treating the account as logged out.

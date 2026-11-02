@@ -1,7 +1,7 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - Overview: selectable Claude and Codex rows; `overview_cursor` maps onto
+//!   - Overview: selectable Claude, Codex and pool rows; `overview_cursor` maps onto
 //!     the visible filter, while Claude selections sync `profile_cursor` with Usage and Setup.
 //!   - Config: master-detail — account list + `+ new` row + inline editor
 //!     (`config_draft`). No popups for create / edit / rename / delete.
@@ -13,29 +13,31 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Weekday;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::style::Style;
+use ratatui::text::Span;
 
 use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
-    capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
-    create_blank_profile, create_profile_from_login, delete_profile, duplicate_profile,
-    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
-    find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
-    rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
-    snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
-    validate_name_chars, validate_profile_name,
+    capture_live_file_snapshot, capture_snapshot, classify_env_key, clear_profile_api_key,
+    clear_profile_credentials, create_blank_profile, create_profile_from_login,
+    delete_profile_taking_config, duplicate_profile, edit_profile_endpoint, edit_profile_env,
+    edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
+    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
+    set_chain_order, set_member_threshold, set_wrap_off, snapshot_is_empty, switch_off,
+    switch_profile_gated, validate_foreign_harness_free, validate_name_chars,
+    validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
-    detach_credentials_link, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, live_credentials_are_shell, read_claude_credentials,
-    snapshot_active_credentials,
+    creds_fingerprint, detach_credentials_link, force_link_profile_credentials, is_first_login,
+    link_profile_credentials, live_credentials_are_shell, live_creds_fingerprint,
+    read_claude_credentials, snapshot_active_credentials,
 };
 use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
@@ -44,33 +46,37 @@ use crate::fallback::{
 };
 use crate::format::format_threshold_tokens;
 use crate::harness::Harness;
-use crate::lock::with_state_lock;
+use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
+use crate::plugin_host::ExeChange;
 use crate::profile::{
-    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings, HomeTab,
-    MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
+    AppConfig, AppState, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
+    HomeTab, MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
     MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
-    PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, WalkOrder,
-    load_config, reload_fingerprint, save_app_state, save_profile_config,
+    PopupWidth, Profile, ProfileId, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
+    WalkOrder, claim_profile_id, load_config, reload_fingerprint, require_profile_id,
+    update_app_state, update_profile_config,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
+use crate::tui::clawd;
 use crate::tui::render::prose::{self, cmd_lit};
 use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
-    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff,
-    PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, StartupReceiver,
-    StartupSender, StartupSignal, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
-    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
-    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
+    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, MemoryStores,
+    NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
+    PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue,
+    SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
+    any_busy, apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
     collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher, switch_gate_in_flight,
-    windows_maxed,
+    token_spend_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -78,8 +84,12 @@ use crate::usage::{
 #[derive(Debug, Clone)]
 pub(crate) struct InputState {
     pub(crate) value: String,
-    /// Caret position in UTF-8 byte offset. Always falls on a char boundary.
+    /// Caret position in UTF-8 byte offset. Always falls on a grapheme boundary.
     pub(crate) cursor: usize,
+    /// The horizontal window's persisted cell offset (a grapheme boundary),
+    /// read and written at draw like the pane scroll offsets — see
+    /// `render::panes::field_window`.
+    pub(crate) offset: std::cell::Cell<usize>,
 }
 
 impl InputState {
@@ -87,59 +97,50 @@ impl InputState {
         Self {
             value: initial.to_string(),
             cursor: initial.len(),
+            offset: std::cell::Cell::new(0),
         }
     }
 
+    /// Insert `ch` at the caret. A char that joins the grapheme after it (a
+    /// base char typed before a combining mark) carries the caret past the
+    /// whole joined grapheme.
     pub(crate) fn insert(&mut self, ch: char) {
         self.value.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.cursor = snap_to_grapheme(&self.value, self.cursor + ch.len_utf8());
     }
 
     pub(crate) fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.value[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let prev = self.prev_grapheme();
         self.value.replace_range(prev..self.cursor, "");
-        self.cursor = prev;
+        self.cursor = snap_to_grapheme(&self.value, prev);
     }
 
     pub(crate) fn delete(&mut self) {
-        if self.cursor >= self.value.len() {
-            return;
-        }
-        let next = self.value[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.cursor + i)
-            .unwrap_or(self.value.len());
+        let next = self.next_grapheme();
         self.value.replace_range(self.cursor..next, "");
+        self.cursor = snap_to_grapheme(&self.value, self.cursor);
     }
 
     pub(crate) fn left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor = self.value[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        self.cursor = self.prev_grapheme();
     }
 
     pub(crate) fn right(&mut self) {
-        if self.cursor >= self.value.len() {
-            return;
-        }
-        self.cursor = self.value[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.cursor + i)
-            .unwrap_or(self.value.len());
+        self.cursor = self.next_grapheme();
+    }
+
+    fn prev_grapheme(&self) -> usize {
+        grapheme_bounds(&self.value)
+            .into_iter()
+            .rfind(|b| *b < self.cursor)
+            .unwrap_or_default()
+    }
+
+    fn next_grapheme(&self) -> usize {
+        grapheme_bounds(&self.value)
+            .into_iter()
+            .find(|b| *b > self.cursor)
+            .unwrap_or(self.value.len())
     }
 
     /// Delete the word (run of non-spaces, plus any trailing spaces) left of the
@@ -150,7 +151,7 @@ impl InputState {
         }
         let head = &self.value[..self.cursor];
         let trimmed = head.trim_end_matches(' ');
-        let start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let start = snap_to_grapheme(head, trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0));
         self.value.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
@@ -173,16 +174,89 @@ impl InputState {
     }
 }
 
+/// A typed editor's buffer beside the value it opened from. Changed work is
+/// `input.value != seed`; a clean edit re-seeds both from a newer stored value
+/// (caret at the end) while a dirty edit keeps its text whatever the store
+/// does. This is the one shape every editor that opens from a stored value
+/// uses, so a later editor can never compare against the live store by
+/// accident (the stale-but-clean false dirty).
+#[derive(Debug, Clone)]
+pub(crate) struct SeededInput {
+    pub(crate) input: InputState,
+    pub(crate) seed: String,
+}
+
+impl SeededInput {
+    pub(crate) fn new(initial: &str) -> Self {
+        Self {
+            input: InputState::new(initial),
+            seed: initial.to_string(),
+        }
+    }
+
+    /// Whether the buffer differs from the value it opened from.
+    pub(crate) fn dirty(&self) -> bool {
+        self.input.value != self.seed
+    }
+
+    /// Re-seed a clean edit (buffer == seed) from a NEWER stored value; an
+    /// unchanged value is a no-op and keeps the caret, and a dirty edit is left
+    /// alone. Returns whether the buffer changed.
+    pub(crate) fn reseed(&mut self, new_seed: &str) -> bool {
+        if self.input.value == self.seed && new_seed != self.seed {
+            self.input = InputState::new(new_seed);
+            self.seed = new_seed.to_string();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The byte offsets of `s`'s grapheme boundaries, ascending, `0` through
+/// `s.len()`: the steps an editor's caret takes. The segmenter is ratatui's
+/// (`styled_graphemes`, the one the buffer draws with), which drops control
+/// graphemes; a control char always stands alone as a grapheme, so each one
+/// is a step of its own here and only the runs between them are segmented. A
+/// CR LF pair, one grapheme to the segmenter, steps as two.
+pub(crate) fn grapheme_bounds(s: &str) -> Vec<usize> {
+    let mut bounds = vec![0];
+    let mut at = 0;
+    for run in s.split_inclusive(char::is_control) {
+        let text = run.strip_suffix(char::is_control).unwrap_or(run);
+        for g in Span::raw(text).styled_graphemes(Style::default()) {
+            at += g.symbol.len();
+            bounds.push(at);
+        }
+        if text.len() < run.len() {
+            at += run.len() - text.len();
+            bounds.push(at);
+        }
+    }
+    bounds
+}
+
+/// The first grapheme boundary of `s` at or after byte `at`.
+fn snap_to_grapheme(s: &str, at: usize) -> usize {
+    grapheme_bounds(s)
+        .into_iter()
+        .find(|b| *b >= at)
+        .unwrap_or(s.len())
+}
+
 // ── Note editor ───────────────────────────────────────────────────────────────
 
 /// The note editor's multi-line draft. The stored text is `lines` joined by
-/// `\n`; the caret is `(row, col)` in char columns, converted to display cells
-/// at render (a wide char takes two cells).
+/// `\n`; the caret is `(row, col)`, `col` counting the graphemes before it, so
+/// it always sits on a grapheme boundary.
 #[derive(Debug, Clone)]
 pub(crate) struct NoteBuffer {
     lines: Vec<String>,
     row: usize,
     col: usize,
+    /// The slot's horizontal window start in cells, read and written at draw
+    /// like the panes' scroll offsets.
+    pub(crate) offset: std::cell::Cell<usize>,
 }
 
 impl NoteBuffer {
@@ -193,8 +267,13 @@ impl NoteBuffer {
             text.split('\n').map(str::to_string).collect()
         };
         let row = lines.len() - 1;
-        let col = lines[row].chars().count();
-        Self { lines, row, col }
+        let col = grapheme_bounds(&lines[row]).len() - 1;
+        Self {
+            lines,
+            row,
+            col,
+            offset: std::cell::Cell::new(0),
+        }
     }
 
     pub(crate) fn text(&self) -> String {
@@ -209,14 +288,14 @@ impl NoteBuffer {
         &self.lines[index]
     }
 
-    /// Caret row and DISPLAY column (wide chars count two cells), for the
-    /// native cursor position.
-    pub(crate) fn cursor_pos(&self) -> (usize, usize) {
-        (self.row, display_col(&self.lines[self.row], self.col))
+    /// The caret's row and its byte offset in that row's line, for the native
+    /// cursor position.
+    pub(crate) fn caret(&self) -> (usize, usize) {
+        (self.row, self.cursor_byte())
     }
 
     fn line_len(&self) -> usize {
-        self.lines[self.row].chars().count()
+        grapheme_bounds(&self.lines[self.row]).len() - 1
     }
 
     fn clamp_col(&mut self) {
@@ -225,16 +304,26 @@ impl NoteBuffer {
 
     fn cursor_byte(&self) -> usize {
         let line = &self.lines[self.row];
-        line.char_indices()
-            .nth(self.col)
-            .map(|(i, _)| i)
+        grapheme_bounds(line)
+            .get(self.col)
+            .copied()
             .unwrap_or(line.len())
+    }
+
+    /// Put the caret on the first grapheme boundary of its line at or after
+    /// byte `at`.
+    fn set_cursor_byte(&mut self, at: usize) {
+        let bounds = grapheme_bounds(&self.lines[self.row]);
+        self.col = bounds
+            .iter()
+            .position(|b| *b >= at)
+            .unwrap_or(bounds.len() - 1);
     }
 
     pub(crate) fn insert_char(&mut self, ch: char) {
         let at = self.cursor_byte();
         self.lines[self.row].insert(at, ch);
-        self.col += 1;
+        self.set_cursor_byte(at + ch.len_utf8());
     }
 
     pub(crate) fn insert_newline(&mut self) {
@@ -247,36 +336,35 @@ impl NoteBuffer {
 
     pub(crate) fn backspace(&mut self) {
         if self.col > 0 {
-            let prev = self.lines[self.row]
-                .char_indices()
-                .nth(self.col - 1)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
             let at = self.cursor_byte();
+            let prev = grapheme_bounds(&self.lines[self.row])
+                .into_iter()
+                .rfind(|b| *b < at)
+                .unwrap_or_default();
             self.lines[self.row].replace_range(prev..at, "");
-            self.col -= 1;
+            self.set_cursor_byte(prev);
         } else if self.row > 0 {
             let line = self.lines.remove(self.row);
             self.row -= 1;
-            self.col = self.line_len();
+            let seam = self.lines[self.row].len();
             self.lines[self.row].push_str(&line);
+            self.set_cursor_byte(seam);
         }
     }
 
     pub(crate) fn delete(&mut self) {
+        let at = self.cursor_byte();
         if self.col < self.line_len() {
-            let at = self.cursor_byte();
-            let line = &self.lines[self.row];
-            let next = line[at..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| at + i)
-                .unwrap_or(line.len());
+            let next = grapheme_bounds(&self.lines[self.row])
+                .into_iter()
+                .find(|b| *b > at)
+                .unwrap_or(self.lines[self.row].len());
             self.lines[self.row].replace_range(at..next, "");
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].push_str(&next);
         }
+        self.set_cursor_byte(at);
     }
 
     pub(crate) fn left(&mut self) {
@@ -326,51 +414,15 @@ impl NoteBuffer {
             self.backspace();
             return;
         }
-        let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let mut start = self.col;
-        while start > 0 && chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        let from_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
         let at = self.cursor_byte();
-        self.lines[self.row].replace_range(from_byte..at, "");
-        self.col = start;
-    }
-}
-
-/// Display width of the first `cols` chars of a line: wide (CJK/fullwidth/
-/// emoji-range) chars take two cells, everything else one. The usage pane's
-/// rows are ASCII-bound; the editor's caret is what must land right on the
-/// lines that are not.
-fn display_col(line: &str, cols: usize) -> usize {
-    line.chars().take(cols).map(char_display_width).sum()
-}
-
-fn char_display_width(c: char) -> usize {
-    let u = c as u32;
-    if matches!(u,
-        0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3041..=0x33FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA000..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE10..=0xFE19
-            | 0xFE30..=0xFE6F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F300..=0x1F64F
-            | 0x1F900..=0x1F9FF
-            | 0x20000..=0x3FFFD,
-    ) {
-        2
-    } else {
-        1
+        let head = self.lines[self.row][..at].trim_end();
+        let start = head
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let start = snap_to_grapheme(&self.lines[self.row], start);
+        self.lines[self.row].replace_range(start..at, "");
+        self.set_cursor_byte(start);
     }
 }
 
@@ -380,14 +432,17 @@ fn char_display_width(c: char) -> usize {
 pub(crate) struct NoteEditor {
     pub(crate) profile: crate::profile::ProfileName,
     pub(crate) buf: NoteBuffer,
+    /// The note text the editor opened from; the changed-work derivation and
+    /// re-seed compare against this, never a fresh disk read.
+    pub(crate) seed: String,
 }
 
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
 /// `Threshold` is a stepper (±5 on `+`/`-`); `CheckWeekly`/`CheckScoped`/
-/// `LastResort`/`Preferred` are boolean toggles (space/⏎, per the
-/// enumerated-row grammar);
+/// `CheckCreditCap`/`LastResort`/`Preferred` are boolean toggles (space/⏎,
+/// per the enumerated-row grammar);
 /// `Remove` arms then confirms. The chain-global wrap-off setting lives on the
 /// program-wide Config tab, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +462,10 @@ pub(crate) enum FallbackRow {
     /// e.g. "7d fable" (`Profile::check_scoped`, on by default). Off, the
     /// account stays in rotation for use with other models.
     CheckScoped,
+    /// Whether auto-switching checks this account's usage-credit cap
+    /// (`Profile::check_credit_cap`, on by default). Off, the account stays in
+    /// rotation even with its cap spent.
+    CheckCreditCap,
     LastResort,
     /// Whether this member is the chain's preferred (home) account
     /// (`Profile::preferred`, off by default). A pure on/off toggle, exclusive
@@ -428,6 +487,26 @@ pub(crate) enum FallbackRow {
     Remove,
 }
 
+impl FallbackRow {
+    /// `space` acts only on state controls: a stepper, continuous or typed-only
+    /// row (whose typed editor `space` opens), a toggle, or the `preferred days`
+    /// cycle. The `remove` action row acts on `↵` alone.
+    pub(crate) fn is_state_control(self) -> bool {
+        match self {
+            FallbackRow::Threshold
+            | FallbackRow::WeeklyAt
+            | FallbackRow::CheckWeekly
+            | FallbackRow::CheckScoped
+            | FallbackRow::CheckCreditCap
+            | FallbackRow::LastResort
+            | FallbackRow::Preferred
+            | FallbackRow::PreferredDays
+            | FallbackRow::MaxSpend => true,
+            FallbackRow::Remove => false,
+        }
+    }
+}
+
 /// One editable line in the Setup tab's detail pane. Built per selection by
 /// [`config_rows`]: auto-start only for OAuth; trailing row is `delete` or
 /// `create`. `Name`/`BaseUrl`/`ApiKey` are text rows; the rest are toggles/actions.
@@ -435,10 +514,24 @@ pub(crate) enum FallbackRow {
 /// trailing `+ add env` row. Both appear only for existing accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigRow {
+    /// The `+ new` form's account-type cycle (`claude` / `codex` / `shunt`).
+    /// Only on a fresh form; an existing account keeps its read-only
+    /// `type  oauth|api` line instead.
+    Type,
+    /// The shunt form's `family` cycle (`claude` / `codex` / `antigravity`).
+    Family,
     Name,
     /// OAuth-only auto-start toggle. `config_rows` renders it in the second
     /// slot (right below `Name`); declared here so the enum tracks that order.
     AutoStart,
+    /// `Profile::usage_probe`, for an OAuth account with no pair stored (the
+    /// setup-token shape `/usage` cannot read): a toggle like `AutoStart`,
+    /// space/⏎ flip it.
+    UsageProbe,
+    /// `Profile::usage_probe_interval_ms`, labelled `probe every`, listed only
+    /// while the probe is on: the `alert at` grammar, ⏎ types the seconds and
+    /// `+`/`-` step them by 30.
+    UsageProbeInterval,
     /// `Profile::bell_threshold`, labelled `alert at`: the 5h % the bell rings
     /// at. ⏎ types a value (empty turns it off), `+`/`-` step it by 5.
     BellThreshold,
@@ -482,14 +575,14 @@ pub(crate) enum ConfigRow {
     /// one gets the row too — that state needs an exit as much as a live mint),
     /// and dimmed + inert when the account stores no other login, since
     /// clearing would leave it with no credentials at all. Arms on the first
-    /// Space/⏎ and confirms on the second, like `Disabled`'s disable direction:
+    /// ⏎ and confirms on the second, like `Disabled`'s disable direction:
     /// it changes what every future switch installs and, on the active account,
     /// moves a running session's credentials.
     ClearSessionToken,
     /// User-disabled account-action row (`Profile::disabled`), same class as
     /// `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
-    /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
+    /// first ⏎ and confirms on the second, via `actions::disable_profile`.
     /// Dimmed and inert while the account is active or holds a live `clauth
     /// start` session — the same gate the CLI enforces.
     Disabled,
@@ -515,13 +608,147 @@ impl ConfigRow {
                 | ConfigRow::FableModel
                 | ConfigRow::SubagentModel
                 | ConfigRow::BellThreshold
+                | ConfigRow::UsageProbeInterval
         )
+    }
+
+    /// `space` acts only on state controls: a cycle, a toggle, or a stepper /
+    /// continuous row whose typed editor `space` opens. Action rows and text
+    /// fields act on `↵` alone.
+    pub(crate) fn is_state_control(self) -> bool {
+        match self {
+            ConfigRow::Type
+            | ConfigRow::Family
+            | ConfigRow::Model
+            | ConfigRow::AutoStart
+            | ConfigRow::UsageProbe
+            | ConfigRow::UsageProbeInterval
+            | ConfigRow::BellThreshold => true,
+            ConfigRow::Name
+            | ConfigRow::BaseUrl
+            | ConfigRow::ApiKey
+            | ConfigRow::FableModel
+            | ConfigRow::OpusModel
+            | ConfigRow::SonnetModel
+            | ConfigRow::HaikuModel
+            | ConfigRow::SubagentModel
+            | ConfigRow::ModelOverrideAdd
+            | ConfigRow::EnvEntry(_)
+            | ConfigRow::EnvAdd
+            | ConfigRow::Login
+            | ConfigRow::CaptureLogin
+            | ConfigRow::DeleteCreds
+            | ConfigRow::ClearSessionToken
+            | ConfigRow::Disabled
+            | ConfigRow::Delete
+            | ConfigRow::Create => false,
+        }
     }
 }
 
 /// The `model` row alias cycle (space advances it). `None` renders as `default`
 /// (no `model` key); a custom id set via ⏎ is outside this list.
 pub(crate) const MODEL_PRESETS: [&str; 5] = ["fable", "opus", "sonnet", "haiku", "opusplan"];
+
+/// The `+ new` form's account type: which harness the form creates for, picked
+/// on the `type` cycle row (`claude` / `codex` / `shunt`). `n` presets it from
+/// the Overview cursor's section; any other tab opens on claude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum NewAccountType {
+    #[default]
+    Claude,
+    Codex,
+    Shunt,
+}
+
+impl NewAccountType {
+    /// The cycle-row label.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            NewAccountType::Claude => "claude",
+            NewAccountType::Codex => "codex",
+            NewAccountType::Shunt => "shunt",
+        }
+    }
+
+    /// The next value `space` cycles to, wrapping.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            NewAccountType::Claude => NewAccountType::Codex,
+            NewAccountType::Codex => NewAccountType::Shunt,
+            NewAccountType::Shunt => NewAccountType::Claude,
+        }
+    }
+
+    /// The Overview cursor's section, as `n` presets it: a claude row → claude,
+    /// a codex row → codex, a pool row → shunt. No item (an empty harness) and
+    /// any other context fall back to claude.
+    pub(crate) fn from_main_item(item: Option<MainItemKind>) -> Self {
+        match item {
+            Some(MainItemKind::Profile(_)) => NewAccountType::Claude,
+            Some(MainItemKind::Codex(_)) => NewAccountType::Codex,
+            Some(MainItemKind::Shunt(..)) => NewAccountType::Shunt,
+            None => NewAccountType::Claude,
+        }
+    }
+}
+
+/// The codex detail pane's focusable action rows, in render order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexDetailRow {
+    ReLogin,
+    Delete,
+}
+
+impl CodexDetailRow {
+    pub(crate) const ALL: [CodexDetailRow; 2] = [CodexDetailRow::ReLogin, CodexDetailRow::Delete];
+}
+
+/// The pool detail pane's focusable action rows. A kimi or unknown auth mode
+/// lists none (facts only); codex has no refresh route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolDetailRow {
+    Refresh,
+    Remove,
+}
+
+/// Which pool job is in flight, beside [`App::pool_mutation_row`]'s identity
+/// marker. The detail pane spins the action row whose job this is — a running
+/// `remove` never lights the `refresh` row, and a codex-family remove (whose
+/// rows are `[remove]` only) still shows its spinner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolMutationKind {
+    Remove,
+    Refresh,
+}
+
+impl App {
+    /// The pool detail's action rows for the selected pool account: `refresh`
+    /// for claude and antigravity (shunt has no codex refresh route), `remove`
+    /// for every family with an admin route. kimi and unknown auth modes get
+    /// neither.
+    pub(crate) fn pool_detail_rows(&self) -> Vec<PoolDetailRow> {
+        let Some((pi, ai)) = self.setup_pool_pair() else {
+            return Vec::new();
+        };
+        let Some((account, auth)) = self.shunt_pool_row(pi, ai) else {
+            return Vec::new();
+        };
+        // A name outside shunt's grammar has no mutation route (pool_row_at
+        // refuses it): the row still shows its facts, but no action rows.
+        if crate::gateway_admin::ShuntAccountName::new(&account.name).is_none() {
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        if auth.clone().refresh_family().is_some() {
+            rows.push(PoolDetailRow::Refresh);
+        }
+        if auth.clone().family().is_some() {
+            rows.push(PoolDetailRow::Remove);
+        }
+        rows
+    }
+}
 
 /// The alias-override rows, in the order Setup lists them.
 const OVERRIDE_ROWS: [ConfigRow; 5] = [
@@ -724,6 +951,9 @@ pub(crate) struct ConfigDraft {
     pub(crate) fable_model: InputState,
     pub(crate) subagent_model: InputState,
     pub(crate) bell_threshold: InputState,
+    /// `Profile::usage_probe_interval_ms` in seconds, as the `probe every`
+    /// buffer spells it.
+    pub(crate) usage_probe_interval: InputState,
     /// Value buffer for the env entry currently being edited (seeded on entry).
     /// Shared across `EnvEntry` rows since only one is active at a time.
     pub(crate) env_value: InputState,
@@ -736,6 +966,10 @@ pub(crate) struct ConfigDraft {
     pub(crate) env_just_added: Option<String>,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
+    /// The value the open field's buffer held when it opened — the seed the
+    /// changed-work derivation and the re-seed compare against (an out-of-band
+    /// store change under a clean suspended edit re-seeds, never warns).
+    pub(crate) field_seed: Option<String>,
     /// The account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
     /// the disable direction only — enabling is immediate, never armed)
     /// currently armed by a first ⏎; a second ⏎ on that same row confirms. Any
@@ -765,6 +999,16 @@ pub(crate) struct ConfigDraft {
     /// client token on `create account` (only while the base url still names
     /// the gateway). Dropped with the draft, so a cancelled form mints nothing.
     pub(crate) mint_for: Option<TokenMint>,
+    /// The `+ new` form's account type (the `type` cycle row).
+    pub(crate) account_type: NewAccountType,
+    /// The shunt form's `family` cycle row's pick.
+    pub(crate) family: crate::gateway_admin::PoolFamily,
+    /// A refusal shown on the name row's `└` line (a codex name held by either
+    /// roster). Set at press time; cleared when the name or the type changes.
+    pub(crate) name_refusal: Option<String>,
+    /// A refusal shown on the create row's `└` line (a codex create with
+    /// nothing staged).
+    pub(crate) create_refusal: Option<String>,
 }
 
 impl ConfigDraft {
@@ -804,9 +1048,13 @@ impl ConfigDraft {
             ConfigRow::FableModel => &self.fable_model,
             ConfigRow::SubagentModel => &self.subagent_model,
             ConfigRow::BellThreshold => &self.bell_threshold,
+            ConfigRow::UsageProbeInterval => &self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::UsageProbe
+            | ConfigRow::Type
+            | ConfigRow::Family
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
@@ -832,9 +1080,13 @@ impl ConfigDraft {
             ConfigRow::FableModel => &mut self.fable_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
             ConfigRow::BellThreshold => &mut self.bell_threshold,
+            ConfigRow::UsageProbeInterval => &mut self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::UsageProbe
+            | ConfigRow::Type
+            | ConfigRow::Family
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
@@ -848,6 +1100,14 @@ impl ConfigDraft {
         })
     }
 
+    /// Whether `apply preset` may act on this `+ new` draft: the form's
+    /// `type` is `claude`. The codex and shunt forms carry no endpoint or
+    /// model rows, so a preset stamped there edits fields the form never
+    /// shows. The one predicate the action-menu offer and the apply share.
+    pub(crate) fn apply_preset_armed(&self) -> bool {
+        self.account_type == NewAccountType::Claude
+    }
+
     /// Whether this draft will mint a client token on `create account`: the
     /// `+ new profile` picker seeded a gateway marker, the base-url buffer
     /// still names that gateway's bind ([`crate::gateway::url_names_bind`]),
@@ -856,21 +1116,54 @@ impl ConfigDraft {
     /// instead. The one predicate the render's read-only key row, the footer
     /// and the save share, so they can never disagree.
     pub(crate) fn mint_armed(&self) -> bool {
-        !matches!(self.captured_login, Some(DraftLogin::LiveLogin(_)))
+        self.account_type == NewAccountType::Claude
+            && !matches!(self.captured_login, Some(DraftLogin::LiveLogin(_)))
             && self.mint_for.as_ref().is_some_and(|mint| {
                 crate::gateway::url_names_bind(self.base_url.value.trim(), &mint.bind)
             })
+    }
+
+    /// Whether this `+ new` draft holds anything a fresh [`build_draft_new`]
+    /// does not — a typed field value, a captured login, or a mint marker. The
+    /// `+ new` form never edits env rows or an existing account, so the env
+    /// buffers are always empty here; every input is checked anyway so a
+    /// future field is covered.
+    fn holds_typed_work(&self) -> bool {
+        let inputs = [
+            &self.name,
+            &self.base_url,
+            &self.api_key,
+            &self.model,
+            &self.opus_model,
+            &self.sonnet_model,
+            &self.haiku_model,
+            &self.fable_model,
+            &self.subagent_model,
+            &self.bell_threshold,
+            &self.usage_probe_interval,
+            &self.env_value,
+            &self.env_new_key,
+        ];
+        inputs.iter().any(|i| !i.value.is_empty())
+            || self.captured_login.is_some()
+            || self.mint_for.is_some()
     }
 }
 
 /// What a `+ new` draft's stash holds: the browser mint `+ login` finished
 /// with, or the live login `+ capture current login` snapshotted off
-/// `~/.claude/.credentials.json`. One slot — the second stash source replaces
-/// the first, gated on a confirm.
+/// `~/.claude/.credentials.json`, or the codex form's mint / capture. One slot
+/// — a second stash source replaces the first, gated on a confirm.
 #[derive(Debug, Clone)]
 pub(crate) enum DraftLogin {
     Mint(Box<crate::oauth_login::LoginOutcome>),
     LiveLogin(Box<CaptureSnapshot>),
+    /// The codex `+ login` browser flow's minted chain, staged until
+    /// `create account` lands it through [`crate::actions::land_codex_login`].
+    CodexMint(Box<crate::codex_login::CodexLoginOutcome>),
+    /// The codex `+ capture current login` marker: `create account` moves the
+    /// operator's own login through [`crate::actions::codex_login_capture`].
+    CodexCapture,
 }
 
 #[derive(Debug, Clone)]
@@ -886,6 +1179,183 @@ pub(crate) struct ConfirmState {
     pub(crate) on_confirm: ConfirmAction,
 }
 
+/// The loss warning a switch or quit opens over changed work. `save` is the
+/// default focus on the three-button form; `go back` is on the two-button form
+/// (changed work with nothing to save, the `+ new` form). `discard` drops the
+/// work, `save` commits it, and whichever lands then performs the target fixed
+/// at that keypress.
+#[derive(Debug, Clone)]
+pub(crate) struct LossWarningState {
+    pub(crate) focus: LossWarningButton,
+    /// The landing the warning resolves into.
+    pub(crate) target: LossWarningTarget,
+    /// The changed work `discard` drops and `save` commits, in screen order.
+    pub(crate) drop: LossWarningDrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LossWarningButton {
+    GoBack,
+    Discard,
+    Save,
+}
+
+/// What the warning's buttons resolve into: the switch or quit a key asked
+/// for, or a cross-screen jump's own landing (one variant per jump).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LossWarningTarget {
+    Switch(Tab),
+    Quit,
+    /// `jump_to_shunt_card`'s landing on the shunt card.
+    ShuntCard(ShuntFocusLine),
+    /// `start_new_account`'s landing on Setup's `+ new` row.
+    NewAccount,
+    /// `start_edit_selected`'s landing on the Overview row's Setup editor.
+    EditAccount(EditTarget),
+    /// The Services `+ new profile` mint form.
+    MintForm(bool),
+}
+
+/// The account `e` opens, held by identity: a landing held on a running shunt
+/// save resolves after a reorder or reload may have moved every index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EditTarget {
+    Profile(ProfileName),
+    Item(SetupItem),
+}
+
+/// The changed work set. `dirty` is non-empty by construction: the warning is
+/// never opened over unchanged work.
+#[derive(Debug, Clone)]
+pub(crate) struct LossWarningDrop {
+    pub(crate) dirty: Vec<Dirty>,
+}
+
+impl LossWarningDrop {
+    /// The screens holding changed work, in `Tab::ALL` order (the order the
+    /// derivation produced), each once.
+    pub(crate) fn screens(&self) -> Vec<Tab> {
+        let mut out = Vec::new();
+        for dirty in &self.dirty {
+            let screen = dirty.screen();
+            if !out.contains(&screen) {
+                out.push(screen);
+            }
+        }
+        out
+    }
+
+    /// Whether any changed item has a `save` (only a `+ new` form has none).
+    pub(crate) fn saveable(&self) -> bool {
+        self.dirty.iter().any(|d| d.saveable())
+    }
+}
+
+/// One changed edit or staged pick. The derivation is the single source every
+/// trigger (switch, quit, retarget, `save` validation, the body's screen list)
+/// reads, so a new editor can never warn on a switch and not on a quit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dirty {
+    /// A Setup existing-account field (an open typed field).
+    SetupField,
+    /// The `+ new` form holding typed work, a field open or not, at rest or
+    /// suspended.
+    NewAccountForm,
+    /// A Fallback member-card typed field (`rotate at`, `weekly at`, `max
+    /// spend`).
+    FallbackField,
+    /// The Config tab's refresh-interval custom field.
+    RefreshInterval,
+    /// The Config tab's context-nudge custom field.
+    ContextNudge,
+    /// The Config tab's weekly-threshold custom field.
+    WeeklyThreshold,
+    /// The Services tab's herdr tag-refresh field.
+    HerdrTag,
+    /// The shunt card's open field editor (a typed field or a pending pick),
+    /// keyed so a different field opened later does not match the warned one.
+    ShuntField(ShuntFieldKey),
+    /// A shunt `+ add <kind>` draft holding typed values (in memory until its
+    /// `save <kind>` row writes it).
+    ShuntAdd(ShuntAddKind),
+    /// The Usage tab's note editor.
+    Note,
+}
+
+impl Dirty {
+    pub(crate) fn screen(&self) -> Tab {
+        match self {
+            Self::SetupField | Self::NewAccountForm => Tab::Setup,
+            Self::FallbackField => Tab::Fallback,
+            Self::RefreshInterval | Self::ContextNudge | Self::WeeklyThreshold => Tab::Config,
+            Self::HerdrTag | Self::ShuntField(_) | Self::ShuntAdd(_) => Tab::Services,
+            Self::Note => Tab::Usage,
+        }
+    }
+
+    pub(crate) fn saveable(&self) -> bool {
+        !matches!(self, Self::NewAccountForm)
+    }
+}
+
+/// What a held switch/quit waits for beyond the save outcome itself.
+#[derive(Debug)]
+pub(crate) enum LossPendingSync {
+    /// A field or `+ add` save already owned the worker when the trigger ran,
+    /// so nothing committed: the whole save re-runs over what is still changed
+    /// on its landing, and the warned items are the only ones it may commit (a
+    /// new item re-opens the warning). A refusal re-runs the gate.
+    RerunSave(Vec<Dirty>),
+    /// A lone async field or `+ add` save the trigger started: the gate re-runs
+    /// on landing, a refusal cancels the trigger, the item staying open with
+    /// its own `└` sentence.
+    CancelOnRefusal,
+}
+
+/// The lowercase tab label the tab bar shows, for the body's screen list.
+fn tab_label(tab: Tab) -> String {
+    tab.title().to_lowercase()
+}
+
+/// `the a, b and c tabs.` — one screen singular, the rest plural, no Oxford
+/// comma.
+fn join_screens(screens: &[Tab]) -> String {
+    let labels: Vec<String> = screens.iter().copied().map(tab_label).collect();
+    match labels.as_slice() {
+        [] => String::new(),
+        [one] => format!("the {one} tab."),
+        [first, second] => format!("the {first} and {second} tabs."),
+        [rest @ .., last] => format!("the {} and {last} tabs.", rest.join(", ")),
+    }
+}
+
+impl LossWarningState {
+    /// The body as ONE paragraph: the screen-list sentence, a space, then the
+    /// question the buttons answer. The renderer wraps it at the modal's
+    /// width, never one line per sentence.
+    pub(crate) fn body_lines(&self) -> Vec<String> {
+        let screens = join_screens(&self.drop.screens());
+        let question = match (self.target.clone(), self.drop.saveable()) {
+            (LossWarningTarget::Quit, true) => "save them before quitting?",
+            (LossWarningTarget::Quit, false) => "discard them and quit?",
+            (_, true) => "save them before switching?",
+            (_, false) => "discard them and switch?",
+        };
+        vec![format!("there are unsaved edits on {screens} {question}")]
+    }
+}
+
+/// What a published scroll bound was computed for: the frame's width and height
+/// and the modal-open generation. The footer trusts a bound only while both
+/// still match the current frame, so a bound left over from a resize or a
+/// closed-and-reopened modal never shows a dead `↑↓ scroll`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScrollStamp {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) generation: u64,
+}
+
 /// The scroll a confirm modal's body carries. `offset` is the key handler's
 /// own state; `max_scroll` and `viewport` are what the last render drew, so a
 /// resize changes the page step on the next press. `Default` keeps the many
@@ -895,6 +1365,7 @@ pub(crate) struct ConfirmScroll {
     pub(crate) offset: u16,
     pub(crate) max_scroll: std::cell::Cell<u16>,
     pub(crate) viewport: std::cell::Cell<u16>,
+    pub(crate) stamp: std::cell::Cell<ScrollStamp>,
 }
 
 /// The three buttons of the apply-preset confirm, left to right.
@@ -940,7 +1411,10 @@ impl std::fmt::Display for PresetTarget {
 #[derive(Debug, Clone)]
 pub(crate) struct PresetApplyForm {
     pub(crate) target: PresetTarget,
-    pub(crate) preset: String,
+    /// The picked row, `builtin` included, so the apply re-reads the store the
+    /// row came from — the saved `qwen` beside the built-in `Qwen` stays the
+    /// file, never the binary's copy.
+    pub(crate) preset: crate::presets::Preset,
     /// The confirm's first line, naming the preset and its target.
     pub(crate) message: String,
     /// Fields whose value the preset's own replaces, in Setup row order.
@@ -953,22 +1427,29 @@ pub(crate) struct PresetApplyForm {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
-    /// `bool` = `from_divergence`, carried through for deferred-detach semantics.
-    CaptureConflict(Box<CaptureSnapshot>, bool),
+    /// `Option<String>` = `from_divergence`, carried through for
+    /// deferred-detach semantics.
+    CaptureConflict(Box<CaptureSnapshot>, Option<String>),
     /// Capture-name collision (issue #7): the typed name already belongs to
     /// another profile. `String` = that profile's existing (canonical-cased)
-    /// name, `bool` = `from_divergence`, both carried through to
+    /// name, `ProfileId` = the account it named when the confirm opened,
+    /// `Option<String>` = `from_divergence`, all carried through to
     /// `overwrite_captured_profile` the same way `CaptureConflict` carries them
     /// to `capture_into_profile`.
-    CaptureOverwrite(Box<CaptureSnapshot>, String, bool),
-    /// Divergence "save elsewhere" → a chosen (non-active) profile. `String` =
-    /// that profile. Saves the live login into it and force-links it active —
-    /// the guarded relink can't resolve a CC-written divergence (the on-disk
-    /// byte formats differ), so this path forces the live link onto the target.
-    AdoptDivergence(Box<CaptureSnapshot>, String),
+    CaptureOverwrite(Box<CaptureSnapshot>, String, ProfileId, Option<String>),
+    /// Divergence "save elsewhere" → a chosen (non-active) profile. The first
+    /// `String` = that profile, `ProfileId` = the account it named when the
+    /// confirm opened, the last `String` = the active account whose divergence
+    /// the prompt showed. Saves the live login into the target and force-links
+    /// it active — the guarded relink can't resolve a CC-written divergence
+    /// (the on-disk byte formats differ), so this path forces the live link
+    /// onto the target.
+    AdoptDivergence(Box<CaptureSnapshot>, String, ProfileId, String),
     Switch(String),
     /// Confirm before discarding CC's freshly-written credentials and relinking.
-    DiscardDivergence(String),
+    /// `Option<u64>` = the live login's fingerprint when the confirm opened
+    /// ([`live_creds_fingerprint`]): the discard drops only that login.
+    DiscardDivergence(String, Option<u64>),
     /// Force-rotate all refresh tokens; active sessions may be logged out.
     RotateAll,
     /// Force-rotate one account's refresh token (action-menu "rotate access
@@ -989,8 +1470,11 @@ pub(crate) enum ConfirmAction {
     /// Setup `+ new` draft: `+ capture current login` pressed while a browser
     /// mint is already stashed. Confirm, then stash the snapshot in its place.
     CaptureOverMintStash(Box<CaptureSnapshot>),
+    /// Setup `+ new` draft: `space` on the `type` cycle while a staged login is
+    /// held. Confirm, then change the type (dropping the staged login).
+    CycleAccountType(NewAccountType),
     /// Delete row on a profile with a live `clauth start` session: the unforced
-    /// guard in `delete_profile` refuses this, so confirm the deauth risk here
+    /// guard in `delete_profile_taking_config` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
     /// Fallback tab `+ add`: the candidate would mix api-key and oauth accounts
@@ -1001,11 +1485,13 @@ pub(crate) enum ConfirmAction {
     /// name. `(preset name, source account)` — confirming re-saves over it.
     OverwritePreset(String, String),
     /// Setup menu `apply preset`: the target already carries values the preset
-    /// would replace. `(target, preset name, the fields the confirm names)` —
-    /// the preset is re-read at apply, and a diff that moved since asks again.
-    ApplyPresetOver(PresetTarget, String, Vec<&'static str>),
-    /// Preset picker `d`: drop a custom preset from disk.
-    DeletePreset(String),
+    /// would replace. `(target, the picked preset, the fields the confirm
+    /// names)` — the preset is re-read at apply, and a diff that moved since
+    /// asks again.
+    ApplyPresetOver(PresetTarget, crate::presets::Preset, Vec<&'static str>),
+    /// Preset picker `d`: drop a custom preset from disk. Carries the picked
+    /// row's whole preset so the confirm re-reads the store that row came from.
+    DeletePreset(crate::presets::Preset),
     /// Info-only modal: an action the user asked for is refused for a reason
     /// they should read (rotating a macOS profile whose running session holds
     /// its login in a Keychain entry clauth cannot write). Confirming just
@@ -1021,6 +1507,14 @@ pub(crate) enum ConfirmAction {
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
     InstallPlugin,
+    /// Services tab: rewrite the shell's completion script through
+    /// `completions::install`, the `clauth completions install` writer, which
+    /// also keeps the shell rc's `source` line current. `stale` picks the verb
+    /// the confirm and a failure toast say.
+    Completions {
+        shell: String,
+        stale: bool,
+    },
     /// Services tab: adopt a found standalone shunt config (TOML only), running
     /// the probe and store plan off the UI thread.
     AdoptConfig(std::path::PathBuf),
@@ -1068,6 +1562,16 @@ pub(crate) enum ConfirmAction {
         record: crate::gateway::GatewayRecord,
         profile: String,
     },
+    /// `remove <name>?` on a pool row: run the pool account's remove on a
+    /// worker. Everything is read when the confirm opened, so confirming runs
+    /// that exact account, never a lookup by position.
+    RemovePoolAccount {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::PoolFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        /// The account's display name, escaped, for the toast.
+        display: String,
+    },
     /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
     /// client token, then point the profile at the gateway (`url`). `replace`
     /// is the confirm's third body line (`None` = nothing to replace), built
@@ -1090,6 +1594,64 @@ pub(crate) enum ConfirmAction {
     },
 }
 
+/// The startup re-bind confirm: move accounts whose endpoint matches a
+/// built-in preset onto that preset's current model ids. Accounts sharing one
+/// change set sit in one block (the rows once, then a toggle line per account).
+#[derive(Debug, Clone)]
+pub(crate) struct RebindForm {
+    /// Blocks in first-seen order; each holds its shared rows + account names.
+    pub(crate) blocks: Vec<crate::presets::RebindBlock>,
+    /// Per-block per-account checked state, parallel to `blocks`.
+    pub(crate) checked: Vec<Vec<bool>>,
+    /// Flat toggle-line index the cursor sits on, across blocks in render order.
+    pub(crate) cursor: usize,
+    /// Highlighted button: false = `not now`, true = `apply`.
+    pub(crate) choice: bool,
+    /// Followable body scroll offset, published and followed by the render.
+    pub(crate) scroll: std::cell::Cell<usize>,
+    /// Published by the last render: the chunked start line of each account
+    /// toggle (flat order), its one-line block end, the total line count and the
+    /// viewport, so the page keys move the cursor the way the other choice
+    /// menus do.
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    /// The digest this offer stands for; stored on either exit.
+    pub(crate) digest: String,
+}
+
+impl RebindForm {
+    pub(crate) fn account_count(&self) -> usize {
+        self.blocks.iter().map(|b| b.accounts.len()).sum()
+    }
+
+    /// Map a flat toggle-line index to `(block, account)`.
+    pub(crate) fn account_at(&self, idx: usize) -> Option<(usize, usize)> {
+        let mut remaining = idx;
+        for (bi, block) in self.blocks.iter().enumerate() {
+            if remaining < block.accounts.len() {
+                return Some((bi, remaining));
+            }
+            remaining -= block.accounts.len();
+        }
+        None
+    }
+
+    /// The `(name, rows)` moves for every checked account, in render order.
+    pub(crate) fn checked_moves(&self) -> Vec<(String, Vec<crate::presets::RowMove>)> {
+        let mut out = Vec::new();
+        for (block, checked) in self.blocks.iter().zip(&self.checked) {
+            for (account, &on) in block.accounts.iter().zip(checked) {
+                if on {
+                    out.push((account.clone(), block.rows.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
 /// One-field name prompt shared by the Setup menu's two naming actions. The
 /// variant carries what the typed name is FOR, so the modal itself stays a plain
 /// input and every validation rule lives in the handler that consumes it.
@@ -1105,6 +1667,10 @@ pub(crate) enum NamePromptAction {
     DuplicateProfile(String),
     /// Save this account's base url + models as a preset under the typed name.
     SavePreset(String),
+    /// [`Modal::BareItem`]'s `save` with no profile cached with the login's
+    /// account: a new profile takes the login ([`App::bare_item_naming`]),
+    /// then the held write resumes.
+    SaveBareItem,
 }
 
 impl NamePromptAction {
@@ -1114,6 +1680,7 @@ impl NamePromptAction {
         match self {
             Self::DuplicateProfile(_) => "DUPLICATE",
             Self::SavePreset(_) => "SAVE PRESET",
+            Self::SaveBareItem => "CAPTURE",
         }
     }
 
@@ -1125,6 +1692,7 @@ impl NamePromptAction {
             Self::SavePreset(source) => {
                 format!("stores '{source}'s base url and model settings under this name.")
             }
+            Self::SaveBareItem => "name for the new profile:".to_string(),
         }
     }
 }
@@ -1149,9 +1717,11 @@ pub(crate) struct PresetPickerForm {
 pub(crate) struct CaptureNameForm {
     pub(crate) snapshot: Box<CaptureSnapshot>,
     pub(crate) input: InputState,
-    /// Set when initiated by `NewProfile` divergence. Detach + deactivate of
-    /// the prior profile is deferred to the success arm so cancel leaves it intact.
-    pub(crate) from_divergence: bool,
+    /// The active account whose divergence the prompt showed, when initiated
+    /// by `NewProfile` divergence. Detach + deactivate of the prior profile is
+    /// deferred to the success arm so cancel leaves it intact, and runs only
+    /// while disk still names this account active.
+    pub(crate) from_divergence: Option<String>,
 }
 
 /// Credential-divergence prompt. Raised on demand (the <kbd>d</kbd> key from
@@ -1168,12 +1738,278 @@ pub(crate) struct DivergenceForm {
     /// it" action — the near-always-right resolution for a CC re-login into a
     /// known account, which the generic three options all get wrong.
     pub(crate) sibling: Option<ProfileName>,
+    /// The active account runs on a long-lived token
+    /// ([`crate::claude::has_session_token`]): its store cannot hold an OAuth
+    /// login, so the prompt does not offer to overwrite it with one.
+    pub(crate) long_lived: bool,
+    /// The live login's fingerprint when the prompt opened
+    /// ([`live_creds_fingerprint`]): every answer acts only on that login.
+    pub(crate) seen: Option<u64>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
     pub(crate) viewport: std::cell::Cell<usize>,
     pub(crate) starts: std::cell::RefCell<Vec<usize>>,
     pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
     pub(crate) total: std::cell::Cell<usize>,
+}
+
+/// The bare macOS Keychain item as a TUI writer reads it, always on a worker:
+/// the settle before the write ([`crate::claude::settle_bare_keychain_item`]),
+/// the item as the user's answer finds it
+/// ([`crate::claude::read_bare_keychain_item`]), and where a `save` puts its
+/// login ([`crate::claude::bare_item_save`], off the settle's remembered
+/// lookup). `None` on [`App`] where no such item exists.
+#[derive(Clone, Copy)]
+pub(crate) struct BareItemSource {
+    pub(crate) settle: fn(crate::claude::BareItemWriter) -> Result<crate::claude::BareItemSettle>,
+    pub(crate) read: fn() -> Option<serde_json::Value>,
+    pub(crate) save: fn(&serde_json::Value) -> crate::claude::BareItemSave,
+}
+
+impl std::fmt::Debug for BareItemSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BareItemSource")
+    }
+}
+
+/// The source this build reads: the real Keychain on macOS.
+#[cfg(all(target_os = "macos", not(test)))]
+fn default_bare_item_source() -> Option<BareItemSource> {
+    Some(BareItemSource {
+        settle: crate::claude::settle_bare_keychain_item,
+        read: crate::claude::read_bare_keychain_item,
+        save: crate::claude::bare_item_save,
+    })
+}
+
+/// No bare item exists off macOS; a test installs its own source.
+#[cfg(not(all(target_os = "macos", not(test))))]
+fn default_bare_item_source() -> Option<BareItemSource> {
+    None
+}
+
+/// A TUI write that replaces the bare item, held while its settle runs on a
+/// worker or the user answers [`Modal::BareItem`], then run again once it may
+/// write ([`resume_bare_item_write`]).
+#[derive(Debug, Clone)]
+pub(crate) enum BareItemWrite {
+    /// The bootstrap's relink of the active profile.
+    BootRelink(ProfileName),
+    Switch(ProfileName),
+    SwitchOff,
+    ClearSessionToken(ProfileName),
+    /// Renaming the active profile in the open Setup draft.
+    Rename,
+    /// The `+ new` form's create, whose fresh login becomes the active one.
+    NewAccount,
+    Delete {
+        name: ProfileName,
+        force: bool,
+    },
+    CaptureOverwrite {
+        snapshot: Box<CaptureSnapshot>,
+        name: String,
+        account: ProfileId,
+        from_divergence: Option<String>,
+    },
+    AdoptDivergence {
+        snapshot: Box<CaptureSnapshot>,
+        name: String,
+        account: ProfileId,
+        from: String,
+    },
+    BlankCredentials(String),
+    DiscardDivergence(String, Option<u64>),
+    /// The divergence prompt's `overwrite` of the active profile, with the
+    /// live login's fingerprint the prompt read.
+    DivergenceOverwrite(String, Option<u64>),
+    CaptureName {
+        name: String,
+        snapshot: Box<CaptureSnapshot>,
+        from_divergence: Option<String>,
+    },
+    /// A finished browser login applied without a confirm.
+    Login {
+        name: String,
+        account: ProfileId,
+        snapshot: Box<CaptureSnapshot>,
+    },
+}
+
+impl BareItemWrite {
+    pub(crate) fn writer(&self) -> crate::claude::BareItemWriter {
+        match self {
+            Self::SwitchOff | Self::Delete { .. } | Self::BlankCredentials(_) => {
+                crate::claude::BareItemWriter::SignOut
+            }
+            Self::BootRelink(_) => crate::claude::BareItemWriter::Relink,
+            Self::Switch(_)
+            | Self::ClearSessionToken(_)
+            | Self::Rename
+            | Self::NewAccount
+            | Self::CaptureOverwrite { .. }
+            | Self::AdoptDivergence { .. }
+            | Self::DiscardDivergence(..)
+            | Self::DivergenceOverwrite(..)
+            | Self::CaptureName { .. }
+            | Self::Login { .. } => crate::claude::BareItemWriter::Switch,
+        }
+    }
+
+    /// The first line of the toast a failed settle raises, the write's own.
+    fn failed(&self) -> &'static str {
+        match self {
+            Self::BootRelink(_) | Self::ClearSessionToken(_) => "relink failed",
+            Self::Switch(_) => "switch failed",
+            Self::SwitchOff => "switch-off failed",
+            Self::Rename => "rename failed",
+            Self::NewAccount => "create failed",
+            Self::Delete { .. } => "delete failed",
+            Self::CaptureOverwrite { .. } | Self::DivergenceOverwrite(..) => "overwrite failed",
+            Self::AdoptDivergence { .. } => "save failed",
+            Self::BlankCredentials(_) => "log out failed",
+            Self::DiscardDivergence(..) => "discard failed",
+            Self::CaptureName { .. } => "capture failed",
+            Self::Login { .. } => "login failed",
+        }
+    }
+}
+
+/// An answer to [`Modal::BareItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BareItemChoice {
+    Save,
+    Replace,
+    Cancel,
+}
+
+impl BareItemChoice {
+    pub(crate) const ALL: [Self; 3] = [Self::Save, Self::Replace, Self::Cancel];
+
+    pub(crate) fn key(self) -> char {
+        match self {
+            Self::Save => 's',
+            Self::Replace => 'p',
+            Self::Cancel => 'c',
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Save => "save",
+            Self::Replace => "replace",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// What the choice does, naming the held write's operation.
+    pub(crate) fn description(self, writer: crate::claude::BareItemWriter) -> String {
+        let action = writer.action();
+        match self {
+            Self::Save => {
+                format!("save it as an account (asks for a name if none matches), then {action}")
+            }
+            Self::Replace => {
+                format!("{action} anyway; that account will need a browser login again")
+            }
+            Self::Cancel => "leave everything as it is".to_string(),
+        }
+    }
+}
+
+/// The bare item holds a login no clauth account saved and the settle cannot
+/// place it: the held write waits on the user's choice.
+#[derive(Debug, Clone)]
+pub(crate) struct BareItemForm {
+    pub(crate) unplaced: crate::claude::BareItemUnplaced,
+    pub(crate) write: BareItemWrite,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+}
+
+impl BareItemForm {
+    pub(crate) fn new(unplaced: crate::claude::BareItemUnplaced, write: BareItemWrite) -> Self {
+        Self {
+            unplaced,
+            write,
+            cursor: 0,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// `save` found two profiles cached with the login's account: the held write
+/// waits on which one takes it.
+#[derive(Debug, Clone)]
+pub(crate) struct BareItemOwnerForm {
+    pub(crate) owners: [ProfileName; 2],
+    /// The account each of `owners` held when the question opened: the pick
+    /// lands only while its name still holds it.
+    pub(crate) accounts: [ProfileId; 2],
+    /// The login the question is about ([`crate::claude::bare_item_login_key`]):
+    /// the pick saves the item only while it still holds that login.
+    pub(crate) login: Option<[u8; 32]>,
+    pub(crate) write: BareItemWrite,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+}
+
+impl BareItemOwnerForm {
+    pub(crate) fn new(
+        owners: [ProfileName; 2],
+        accounts: [ProfileId; 2],
+        login: Option<[u8; 32]>,
+        write: BareItemWrite,
+    ) -> Self {
+        Self {
+            owners,
+            accounts,
+            login,
+            write,
+            cursor: 0,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// What a bare-item worker posts back to the UI thread for a held write.
+pub(crate) struct BareItemAnswer {
+    write: BareItemWrite,
+    outcome: BareItemOutcome,
+}
+
+enum BareItemOutcome {
+    /// A settle answered, the first or one after a save.
+    Settled(Result<crate::claude::BareItemSettle>),
+    /// `replace`: the key the writer guards take to replace the item as the
+    /// answer found it.
+    Replace(Option<[u8; 32]>),
+    /// `save` found no profile cached with the login's account: a new one
+    /// takes it, under a name the user types.
+    NameNeeded {
+        login: crate::profile::ClaudeCredentials,
+        account: Option<crate::profile::AccountId>,
+    },
+    /// `save` found two profiles cached with the login's account: the user
+    /// picks which one takes it. Carries the account each name held when
+    /// the save named it, and the login's key.
+    OwnerNeeded([ProfileName; 2], [ProfileId; 2], Option<[u8; 32]>),
 }
 
 /// The non-blocking divergence signal behind the accounts-pane banner: set by
@@ -1227,8 +2063,10 @@ impl DivergenceForm {
         if let Some(owner) = &self.sibling {
             v.push(DivergenceAction::SwitchToOwner(owner.to_string()));
         }
+        if !self.long_lived {
+            v.push(DivergenceAction::Choice(DivergenceChoice::Overwrite));
+        }
         v.extend([
-            DivergenceAction::Choice(DivergenceChoice::Overwrite),
             DivergenceAction::Choice(DivergenceChoice::NewProfile),
             DivergenceAction::Choice(DivergenceChoice::Discard),
         ]);
@@ -1242,6 +2080,10 @@ impl DivergenceForm {
 /// pre-selected so re-logging an account you already hold is one keypress.
 #[derive(Debug, Clone)]
 pub(crate) struct DivergenceTargetForm {
+    /// The active account whose divergence the prompt showed.
+    pub(crate) from: String,
+    /// The live login's fingerprint when the divergence prompt opened.
+    pub(crate) seen: Option<u64>,
     pub(crate) targets: Vec<String>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
@@ -1297,6 +2139,7 @@ pub(crate) struct EnvCollisionForm {
     pub(crate) reviewing_overwrite: bool,
     pub(crate) confirm_overwrite: bool,
     pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) max_scroll_stamp: std::cell::Cell<ScrollStamp>,
     pub(crate) viewport: std::cell::Cell<usize>,
     pub(crate) overwrite_needs_review: std::cell::Cell<bool>,
 }
@@ -1352,6 +2195,10 @@ pub(crate) enum ActionMenuAction {
     /// The `stop shunt` verb: a transient hold while a fresh daemon runs the
     /// gateway.
     StopShunt,
+    /// Refresh the focused pool account's login (claude and antigravity only).
+    RefreshPoolAccount,
+    /// Remove the focused pool account (behind a `remove <name>?` confirm).
+    RemovePoolAccount,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -1387,6 +2234,47 @@ pub(crate) enum DaemonControlResult {
     Stop(std::result::Result<crate::daemon::DaemonStop, String>),
 }
 
+/// What a pool remove/refresh worker reports, once. `error` is the failure's
+/// `Display` (clauth's own sentence); `removed` is shunt's `removed: bool`
+/// (false = "it did not exist", never "gone"); `needs_relogin` is a refresh
+/// whose answer still asks for a re-login.
+#[derive(Debug)]
+pub(crate) enum PoolMutationResult {
+    Removed {
+        name: String,
+        removed: bool,
+        error: Option<String>,
+    },
+    Refreshed {
+        name: String,
+        needs_relogin: bool,
+        error: Option<String>,
+    },
+    /// The worker panicked: the busy marker must still clear, and the toast
+    /// says which operation never ran. The pool is re-read after it like
+    /// after every other outcome.
+    Panicked { operation: &'static str },
+}
+
+/// The pool account identity a menu is built for: the same `(family, name)`
+/// key [`App::pool_mutation_row`] uses, never a row index, so a reorder under
+/// an open menu cannot move the pick onto another account.
+type PoolRowIdentity = (
+    crate::gateway_admin::PoolFamily,
+    crate::gateway_admin::ShuntAccountName,
+);
+
+/// The row identity a menu is built for, whatever its kind: a claude row's
+/// [`ProfileName`] or a pool row's [`PoolRowIdentity`]. The menu stores this
+/// instead of the cursor's index, so a roster or listing change between open
+/// and pick resolves the row the menu named — or none at all — never a
+/// neighbour the cursor re-homed onto.
+#[derive(Debug, Clone)]
+pub(crate) enum RowIdentity {
+    Profile(ProfileName),
+    Pool(PoolRowIdentity),
+}
+
 /// State for the action-menu modal.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionMenuState {
@@ -1400,6 +2288,11 @@ pub(crate) struct ActionMenuState {
     /// each need a suffix. `None` whenever the scoped group is empty — a name
     /// on a menu of tab-global actions would claim a scope that isn't there.
     pub(crate) context: Option<String>,
+    /// The row the scoped actions were built for; `None` when the menu has no
+    /// scoped actions. Every per-row pick resolves this identity at dispatch,
+    /// so a roster or listing change that drops the row between open and pick
+    /// acts on nothing, never on a neighbour the cursor re-homed onto.
+    pub(crate) row_identity: Option<RowIdentity>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
     /// Visible menu rows from the last render (the page step).
@@ -1418,6 +2311,7 @@ impl ActionMenuState {
         scoped: Vec<ActionMenuAction>,
         global: Vec<ActionMenuAction>,
         context: Option<String>,
+        row_identity: Option<RowIdentity>,
     ) -> Self {
         const RESERVED: &[char] = &['a', 'x', '?', 'q'];
         let scoped_len = scoped.len();
@@ -1453,6 +2347,7 @@ impl ActionMenuState {
             items,
             scoped_len,
             context,
+            row_identity,
             cursor: 0,
             scroll: std::cell::Cell::new(0),
             viewport: std::cell::Cell::new(0),
@@ -1506,6 +2401,8 @@ impl ActionMenuAction {
             Self::StopDaemon => "stop daemon",
             Self::StartShunt => "start shunt",
             Self::StopShunt => "stop shunt",
+            Self::RefreshPoolAccount => "refresh",
+            Self::RemovePoolAccount => "remove",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -1552,9 +2449,26 @@ pub(crate) enum Modal {
     /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
     /// to the footer indicator — the login keeps running.
     Login,
+    /// In-flight codex browser re-login progress; renders live from
+    /// [`App::codex_login`]. Its own shell: `r` opens the browser again, `c`
+    /// copies the authorize link, no paste door — codex's callback answers on
+    /// this machine alone.
+    CodexLogin,
     /// Read-only scrollable text modal for the shunt card's `check output`:
     /// the masked stderr of the last failed check.
     CheckOutput(String),
+    /// Startup re-bind confirm: move matching accounts onto the built-in
+    /// presets' current ids.
+    Rebind(RebindForm),
+    /// A screen switch away from unsaved work another screen also writes (see
+    /// Tab bar → Switching tabs → Loss warning).
+    LossWarning(LossWarningState),
+    /// A write would replace a macOS Keychain login no clauth account saved:
+    /// save it, replace it, or cancel the write.
+    BareItem(BareItemForm),
+    /// [`Modal::BareItem`]'s `save` over a login two profiles are cached with
+    /// the account of: pick which one takes it.
+    BareItemOwner(BareItemOwnerForm),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -1578,7 +2492,8 @@ const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
 /// macOS refuses to rotate an account with a running session (it can't reach the
 /// credential that session reads), so the two hosts promise different things.
 #[cfg(target_os = "macos")]
-const ROTATE_ALL_DETAIL: &str = "accounts with a live clauth start session are skipped.";
+const ROTATE_ALL_DETAIL: &str =
+    "accounts with a live clauth start or background session are skipped.";
 #[cfg(not(target_os = "macos"))]
 const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
 
@@ -1590,9 +2505,24 @@ const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on thei
 /// `cfg!`, so it still compiles here) — that keeps the strings reviewable and
 /// exact-match pinnable from a Linux run.
 const ROTATE_LIVE_SESSION_MSG: &str = "has a live clauth start session";
+const ROTATE_BACKGROUND_SESSION_MSG: &str = "has a background session";
+const ROTATE_UNREADABLE_JOBS_MSG: &str = "can't be checked for background sessions";
 const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry clauth can't write, so rotating would sign the \
      session out.";
 const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can't rotate it";
+
+/// The single-rotate refusal sentence for a blocked rotate, one suffix per
+/// cause ([`crate::runtime::RotationBlock`]), so the operator reads what
+/// actually blocks it: a launcher's own session, a background job, or a job
+/// store clauth cannot read.
+fn rotate_blocked_message(name: &str, block: crate::runtime::RotationBlock) -> String {
+    let suffix = match block {
+        crate::runtime::RotationBlock::LiveSession => ROTATE_LIVE_SESSION_MSG,
+        crate::runtime::RotationBlock::BackgroundJob => ROTATE_BACKGROUND_SESSION_MSG,
+        crate::runtime::RotationBlock::UnreadableJobStore(_) => ROTATE_UNREADABLE_JOBS_MSG,
+    };
+    format!("'{name}' {suffix}")
+}
 
 /// What disabling costs, for the action menu's confirm. The Setup row states the
 /// same thing in its own hint (`config::row_hint`) before arming.
@@ -1936,6 +2866,13 @@ pub(crate) enum ServiceFix {
     HealHerdrConfig(std::path::PathBuf),
     /// Install the clauth plugin through agentgear (user scope, embedded tree).
     InstallPlugin,
+    /// Rewrite the shell completion script through `completions::install`, the
+    /// one writer `clauth completions install` runs. `stale` picks the verb:
+    /// an update rewrites an older script, an install writes an absent one.
+    Completions {
+        shell: String,
+        stale: bool,
+    },
     /// Adopt a found standalone shunt config. `PathBuf` = the discovered TOML.
     AdoptConfig(std::path::PathBuf),
     /// Move a stopped standalone's account stores into clauth's managed stores.
@@ -1961,11 +2898,12 @@ pub(crate) struct Problem {
 
 /// One actionable line on the `shunt` card: a fix (`f  <verb>`), the `enabled`
 /// toggle row, the `check output` line, or a config-section stop (an entry row
-/// whose `↵`/`space` toggles it expanded, or a field row whose `↵`/`space` opens
-/// it and `space` cycles a cycle row). Descended, ↑↓ pages the card one line at
-/// a time; an actionable line takes focus as it scrolls into view, read-only
-/// rows never do, and `space`/`↵` act only on the focused one (`↵` on a fix
-/// line opens its confirm; `f` walks between fix lines).
+/// whose `↵`/`space` toggles it expanded, or a field row whose `↵` opens it and
+/// `space` cycles a cycle row). Descended, ↑↓ pages the card one line at a
+/// time; an actionable line takes focus as it scrolls into view, read-only rows
+/// never do. `space` acts only on the state controls (`enabled`, an entry, a
+/// cycle field); every other focused line acts on `↵` (`↵` on a fix line opens
+/// its confirm; `f` walks between fix lines).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShuntFocus {
     /// An `f  <verb>` line at this detail index.
@@ -1973,7 +2911,7 @@ pub(crate) enum ShuntFocus {
     /// The `enabled` toggle row at this detail index.
     Enabled { line: usize },
     /// The `check output` line at this detail index (a held failed-check
-    /// stderr; ↵/space opens its modal).
+    /// stderr; `↵` opens its modal).
     CheckOutput { line: usize },
     /// A config-section entry row (an upstream, model or route), whose `↵`/
     /// `space` toggles it expanded. Not a `Check::detail` line: the render
@@ -1982,7 +2920,7 @@ pub(crate) enum ShuntFocus {
     /// A config-section field row (an editable `key value` line, or a cycle
     /// row), whose `↵` opens it and `space` cycles a cycle row.
     Field { key: ShuntFieldKey },
-    /// A `+ add <kind>` action row ending its group, whose `↵`/`space` opens
+    /// A `+ add <kind>` action row ending its group, whose `↵` opens
     /// (or folds) that kind's blank draft in place.
     Add { kind: ShuntAddKind },
     /// The `save <kind>` row of an open draft, whose `↵` runs the add.
@@ -1992,7 +2930,7 @@ pub(crate) enum ShuntFocus {
     Remove { key: ShuntEntryKey },
     /// A client-token action-chip row, whose `↵` opens the remove confirm.
     Token { key: String },
-    /// The `+ add token` row ending the client-token group, whose `↵`/`space`
+    /// The `+ add token` row ending the client-token group, whose `↵`
     /// opens the profile picker.
     AddToken,
 }
@@ -2066,11 +3004,11 @@ impl ShuntFocus {
 }
 
 /// The identity of the shunt card's focused actionable line, by its kind. The
-/// key handler owns it; the render reads it and re-settles it (the descend
-/// rule) when a resize or a card change pushed the held line out of view. A
-/// resize or a card change keeps focus on the same line while that kind still
-/// exists, so the line index ([`ShuntFocus::line`]) is deliberately not part
-/// of it.
+/// key handler owns it; the render reads it, follows the held block back into
+/// view on a resize or a card change, and re-settles only a vanished stop or a
+/// none focus (the descend rule). A resize or a card change keeps focus on the
+/// same line while that kind still exists, so the line index
+/// ([`ShuntFocus::line`]) is deliberately not part of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShuntFocusLine {
     /// The `enabled` toggle row.
@@ -2311,6 +3249,38 @@ impl ShuntDrafts {
         }
     }
 
+    /// Whether the `+ add <kind>` draft holds any typed value (changed work:
+    /// a draft lives in memory until its `save <kind>` row writes it).
+    pub(crate) fn holds_typed_work(&self, kind: ShuntAddKind) -> bool {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream.as_ref().is_some_and(|d| {
+                d.name.is_some()
+                    || d.provider.is_some()
+                    || d.kind.is_some()
+                    || d.base_url.is_some()
+                    || d.auth_mode.is_some()
+                    || d.account.is_some()
+                    || d.accounts.is_some()
+                    || d.env.is_some()
+                    || d.header.is_some()
+                    || d.effort.is_some()
+                    || d.service_tier.is_some()
+            }),
+            ShuntAddKind::Model => self.model.as_ref().is_some_and(|d| {
+                d.id.is_some()
+                    || d.display_name.is_some()
+                    || d.upstream_model.iter().any(|(_, v)| v.is_some())
+            }),
+            ShuntAddKind::Route => self.route.as_ref().is_some_and(|d| {
+                d.model.is_some()
+                    || d.provider.is_some()
+                    || d.upstream_model.is_some()
+                    || d.effort.is_some()
+                    || d.service_tier.is_some()
+            }),
+        }
+    }
+
     /// Open (or reseed) the `+ add <kind>` draft in place, dropping any
     /// committed values and refusal from a previous open of the same kind. A
     /// model draft's `upstream_model` rows derive from the config's current
@@ -2501,6 +3471,30 @@ impl ShuntTokens {
     }
 }
 
+/// The Overview's active mark view of the client-token store: the profile names
+/// the store holds, and the store file's write stamp at the read that produced
+/// them. The mark keys on the store holding a token for the profile, so this
+/// cache follows the file itself rather than the Services record (the card's
+/// own rows go blank with no gateway record adopted; the mark does not).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShuntMark {
+    pub(crate) names: Vec<String>,
+    stamp: Option<StoreStamp>,
+}
+
+/// The client-token store file's write stamp, from ONE `metadata()` call per
+/// tick. Every store write lands on a fresh inode through an atomic rename, so
+/// on unix the identity moves with each one whatever the mtime granule (two
+/// writes between ticks can still reuse a freed inode number); elsewhere
+/// `(modified, len)` is the residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoreStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    id: (u64, u64),
+}
+
 /// A `require client tokens` whose first token was minted through the picker:
 /// the require waits for the feed to show a `healthy` pid that is `Some` and
 /// differs from the one read when the add/create job started (the running
@@ -2619,6 +3613,8 @@ pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
     match fix {
         ServiceFix::WireMcpServers => "wire mcp server",
         ServiceFix::InstallPlugin => "install plugin",
+        ServiceFix::Completions { stale: true, .. } => "update completions",
+        ServiceFix::Completions { stale: false, .. } => "install completions",
         ServiceFix::HealHerdrConfig(_) => "heal herdr config",
         ServiceFix::AdoptConfig(_) => "adopt config",
         ServiceFix::MoveStoresIn => "move stores in",
@@ -3107,7 +4103,9 @@ pub(crate) struct ServicesState {
     /// the moment focus leaves the remove row.
     pub(crate) shunt_remove_refusal: std::cell::RefCell<Option<ShuntRemoveRefusal>>,
     /// The client-token section's data, read beside the config view on the
-    /// recompute (the render reads this cache, never the store per frame).
+    /// recompute (the render reads this cache, never the store per frame). The
+    /// Overview's active mark keeps its own view ([`App::shunt_mark`]), because
+    /// it has to see the store with no gateway record adopted.
     pub(crate) shunt_tokens: ShuntTokens,
     /// A token remove's refusal (the last-token guard), as `(profile,
     /// sentence)`, rendered on the `└` line under the token row. RefCell so the
@@ -3149,15 +4147,32 @@ pub(crate) struct ServicesState {
     /// guard; a panicked save drains as a failed outcome that clears it.
     pub(crate) shunt_save_worker: ShuntActionWorker,
     /// The `shunt` detail's focused actionable line, by its kind. Owned by the
-    /// key handler and the recompute; the render reads it to draw the caret,
-    /// and re-settles it (the descend rule) where it publishes the geometry
-    /// when a resize or a card change pushed the held line out of view.
+    /// key handler and the recompute; the render reads it to draw the caret
+    /// and follows the held block back into view where it publishes the
+    /// geometry, re-settling only a vanished stop or a none focus (the descend
+    /// rule).
     pub(crate) shunt_focus: std::cell::RefCell<Option<ShuntFocusLine>>,
     /// The rendered line index of each [`Check::shunt_focus`] stop (parallel to
     /// that list), published by the last render so the key handler can tell
     /// which stops are in view. A stop's rendered row is what the in-view test
     /// measures: a wrapped read-only sentence above a stop can shift it down.
     pub(crate) shunt_stop_rows: std::cell::RefCell<Vec<usize>>,
+    /// The rendered line each stop's block ends on (exclusive), parallel to
+    /// [`Self::shunt_stop_rows`]: the walk pads `SCROLL_PAD` rows past a stop's
+    /// LAST line, so the in-view test needs the block span, not just its first
+    /// row.
+    pub(crate) shunt_stop_ends: std::cell::RefCell<Vec<usize>>,
+    /// The card's total rendered line count from the last render — the
+    /// `follow_scroll_offset` bound. [`ServicesState::detail_max_scroll`] is
+    /// clamped to `u16`, so it cannot recover this.
+    pub(crate) shunt_total: std::cell::Cell<usize>,
+    /// The shunt card's scroll offset: the render reads it, follows the focused
+    /// stop's block via [`follow_scroll_offset`], and writes the result back
+    /// each draw (the forms/Status precedent), so a walk landing, a refusal
+    /// growing the block, a page landing and a resize all keep `SCROLL_PAD` rows
+    /// past the block while content remains. Key handlers read this same state;
+    /// the generic detail keeps its own [`ServicesState::detail_scroll`].
+    pub(crate) shunt_scroll: std::cell::Cell<usize>,
     /// The last rendered shunt pane height, published by the render the way
     /// [`ServicesState::detail_max_scroll`] is — the key handler's viewport.
     pub(crate) shunt_viewport: std::cell::Cell<u16>,
@@ -3215,13 +4230,22 @@ pub(crate) struct ServicesState {
     pub(crate) herdr_fix_focus: bool,
     /// Typed editor for the `tag refresh` stepper — the Config-tab
     /// refresh-interval editor's shape. `None` = not editing.
-    pub(crate) herdr_tag_draft: Option<InputState>,
+    pub(crate) herdr_tag_draft: Option<SeededInput>,
     /// The herdr config verdict from the last recompute (a cheap file re-read
     /// that rides the per-tick refresh), cached so the render and the key
     /// handler never re-read the file per frame. `None` = unreadable or no
     /// config path. The options section reads it to decide whether the
     /// `delegate row text` row can write.
     pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
+    /// The last-seen plugin row health, the baseline for the out-of-view
+    /// activity poll: the first reading establishes it (no color), a later
+    /// change colors the Services tab. Updated by every recompute while the
+    /// tab is in view, so leaving the tab seeds the baseline to what the user
+    /// last saw.
+    pub(crate) plugin_health: Option<Health>,
+    /// The herdr row's twin of [`Self::plugin_health`]; `None` while no herdr
+    /// row exists.
+    pub(crate) herdr_health: Option<Health>,
     /// A pending first-herdr-launch landing: the cursor lands on the `herdr` row
     /// in the recompute that adopts its probe, or never. Cleared there, or
     /// earlier when a modal opens, the tab changes, or the user moves the
@@ -3272,6 +4296,9 @@ impl Default for ServicesState {
             shunt_save_worker: ShuntActionWorker::new(run_shunt_action),
             shunt_focus: std::cell::RefCell::new(None),
             shunt_stop_rows: std::cell::RefCell::new(Vec::new()),
+            shunt_stop_ends: std::cell::RefCell::new(Vec::new()),
+            shunt_total: std::cell::Cell::new(0),
+            shunt_scroll: std::cell::Cell::new(0),
             shunt_viewport: std::cell::Cell::new(0),
             last_plan_env_source: None,
             delegates: Vec::new(),
@@ -3288,6 +4315,8 @@ impl Default for ServicesState {
             herdr_fix_focus: false,
             herdr_tag_draft: None,
             herdr_config: None,
+            plugin_health: None,
+            herdr_health: None,
             land_on_herdr: false,
         }
     }
@@ -3342,25 +4371,30 @@ impl ServicesState {
     /// The shunt detail's focused actionable line, resolved by the focus
     /// identity the key handler owns and gated by the one in-view predicate
     /// every acting key and the footer consult: the resolved stop holds only
-    /// while its rendered row is on screen (the geometry the last render
-    /// published). A resize or a card change that pushes the focused line out
-    /// of view re-settles focus to the first actionable line in view (the
-    /// descend rule) where the render publishes the geometry, so this only
-    /// reads `None` when no actionable line is in view.
+    /// while any row of its block is on screen (the geometry the last render
+    /// published). A resize or a card change keeps a held block in view (the
+    /// render's per-draw follow); the render's re-settle runs only for a
+    /// vanished stop or a none focus, so this reads `None` when no stop is in
+    /// view.
     pub(crate) fn focused_shunt_focus(&self) -> Option<&ShuntFocus> {
         let kind = self.shunt_focus_kind()?;
         let stops = &self.selected_check()?.shunt_focus;
         let i = stops.iter().position(|s| s.kind() == kind)?;
         let rows = self.shunt_stop_rows.borrow();
-        if rows.len() != stops.len() {
+        let ends = self.shunt_stop_ends.borrow();
+        if rows.len() != stops.len() || ends.len() != stops.len() {
             // No geometry published for this card yet (a key before the first
             // frame, or a unit test that skips the render): with nothing to
             // measure, the by-kind identity is the answer. The in-view gate
             // only applies over a published geometry.
             return Some(&stops[i]);
         }
-        let scroll = self.detail_scroll.min(self.detail_max_scroll.get());
-        shunt_in_view(scroll, self.shunt_viewport.get() as usize, rows[i]).then_some(&stops[i])
+        let scroll = self
+            .shunt_scroll
+            .get()
+            .min(self.detail_max_scroll.get() as usize);
+        shunt_block_in_view(scroll, self.shunt_viewport.get() as usize, rows[i], ends[i])
+            .then_some(&stops[i])
     }
 
     /// Whether a save for `key` is still checking (its own worker in flight).
@@ -3404,32 +4438,39 @@ impl ServicesState {
     }
 
     /// The descend rule applied where the geometry is published: the render
-    /// calls this over the freshly rendered rows so a resize or a card change
-    /// re-settles focus to the first actionable line in view, else none. A
-    /// held line pushed out of view re-settles regardless of pane focus; a
-    /// focus that is none re-settles only while the detail pane holds focus —
-    /// with the list focused, ascend keeps the identity and a none focus is
-    /// the key handler's own state, never settled here.
+    /// follows the held block first, so a resize or a card change keeps it in
+    /// view; this then keeps a held block that is still in view, and re-settles
+    /// only a held stop that left the card (a recompute dropped it) or a none
+    /// focus, to the first stop whose block already sits inside the padded band
+    /// (else none — the render's follow then has nothing to move). The held
+    /// branch runs regardless of pane focus; a none focus re-settles only while
+    /// the detail pane holds focus — with the list focused, ascend keeps the
+    /// identity and a none focus is the key handler's own state, never settled
+    /// here.
     pub(crate) fn re_settle_shunt_focus(
         &self,
         stops: &[ShuntFocus],
         rows: &[usize],
-        scroll: u16,
+        ends: &[usize],
+        total: usize,
+        scroll: usize,
         viewport: usize,
     ) {
         if let Some(kind) = self.shunt_focus_kind() {
             if stops
                 .iter()
                 .position(|s| s.kind() == kind)
-                .and_then(|i| rows.get(i))
-                .is_some_and(|&r| shunt_in_view(scroll, viewport, r))
+                .and_then(|i| rows.get(i).zip(ends.get(i)))
+                .is_some_and(|(&start, &end)| shunt_block_in_view(scroll, viewport, start, end))
             {
                 return;
             }
         } else if self.focus != ServicesFocus::Detail {
             return;
         }
-        self.set_shunt_focus(shunt_first_in_view(stops, rows, scroll, viewport));
+        self.set_shunt_focus(shunt_first_follow_holds(
+            stops, rows, ends, scroll, viewport, total,
+        ));
     }
 
     /// Re-settle the delegates selection against the current job list: the
@@ -3512,8 +4553,19 @@ impl HerdrOption {
 
 // ── Footer alert ─────────────────────────────────────────────────────────────
 
+/// The key that armed the 2-step quit. One arm remembers its key, so `q`'s
+/// completion and `ctrl+c`'s never cross: the other key re-arms as itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitKey {
+    /// The top-level `q` armed it.
+    Q,
+    /// `ctrl+c` armed it.
+    CtrlC,
+}
+
 /// A transient message that replaces the hint bar in place until dismissed.
-/// `x` clears it (after all toasts are gone — see dismissal precedence).
+/// `x` clears it, as does every key that disarms the quit: all but `⌃c` and a
+/// `q` that arms or confirms it.
 /// Add variants as new conditions arise; keep one active at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FooterAlert {
@@ -3547,6 +4599,131 @@ pub(crate) struct Banner {
 pub(crate) enum MainItemKind {
     Profile(usize),
     Codex(usize),
+    /// A pool row, addressed as (provider index, account index) into the one
+    /// [`App::shunt_pool`] snapshot both the render and the key handlers read.
+    Shunt(usize, usize),
+}
+
+/// One structural entry in the shared band walk ([`App::band_entries`]):
+/// spacers and headings separate the claude, codex and shunt bands, and the
+/// items are the selectable rows. Headings and spacers are never selectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BandEntry {
+    Spacer,
+    /// A heading line's text (already control-escaped, with its two-cell
+    /// indent); the caller computes the focus tier from its own selection.
+    Heading(String),
+    Item(MainItemKind),
+}
+
+/// What Setup's selector has selected: a harness item, or the trailing `+ new`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupSelection {
+    Item(MainItemKind),
+    New,
+}
+
+/// The shared claude-row cursor: its flat profile index plus a monotonic move
+/// count. Private fields force every writer through `Cursor::set`, which bumps
+/// the count only when the index actually changes — a write of the same value
+/// is no move. A hidden held selection records the count right after its own
+/// placement and restores only while the count still equals it, so a move away
+/// and back (which the old equality-on-the-shown-selection compare could not
+/// see) closes the window for good.
+mod profile_cursor {
+    /// A claude-row cursor (see the module docs).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) struct Cursor {
+        index: usize,
+        moves: u64,
+    }
+
+    impl Cursor {
+        /// The current flat profile index.
+        pub(crate) fn read(&self) -> usize {
+            self.index
+        }
+
+        /// Land the cursor on `index`, bumping the move count only when the
+        /// index changed.
+        pub(crate) fn set(&mut self, index: usize) {
+            if self.index != index {
+                self.index = index;
+                self.moves += 1;
+            }
+        }
+
+        /// The number of index-changing moves since the cursor was created.
+        pub(crate) fn count(&self) -> u64 {
+            self.moves
+        }
+    }
+}
+
+/// Setup's stored selection for a codex or pool row, by IDENTITY — the profile
+/// name for a codex row, the `(provider name, account name)` for a pool row —
+/// never an index (lead's call: resolved to an index each time it is read, so
+/// a roster or listing change keeps the same account selected). The pool
+/// account is the listing's raw `String`, not a validated `ShuntAccountName`:
+/// a listing row outside shunt's grammar is still a selectable row (only the
+/// mutation needs the validated name, which `pool_row_at` re-checks). A claude
+/// row and `+ new` need no entry: they are `profile_cursor` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetupItem {
+    Codex(ProfileName),
+    Pool { provider: String, account: String },
+}
+
+/// One tab's identity-held selection slot: the stored codex/pool identity
+/// ([`SetupItem`]), its flat index when stored (for the dropped-for-good
+/// clamp), and a held-but-hidden identity (`remembered`) that restores only
+/// while the shared claude cursor's move count still equals the one the hide
+/// recorded (`remembered_moves`). Setup and Usage each own one slot
+/// ([`App::setup`] / [`App::usage`]); every clear site calls
+/// [`HeldSelection::clear`] so the two tabs' rules cannot fork.
+#[derive(Default)]
+struct HeldSelection {
+    item: Option<SetupItem>,
+    index: Option<usize>,
+    remembered: Option<SetupItem>,
+    /// The shared claude cursor's move count right after the hide's own
+    /// placement. The restore gate: a held identity returns only while the
+    /// count still equals this, so ANY writer that moves the shared cursor —
+    /// a move away and back on another tab included — closes the window for
+    /// good, present and future writers alike.
+    remembered_moves: Option<u64>,
+}
+
+impl HeldSelection {
+    /// Drop a held-but-hidden identity: a move or a descend adopted the shown
+    /// row, so the read must not restore the old identity over it.
+    fn clear(&mut self) {
+        self.remembered = None;
+        self.remembered_moves = None;
+    }
+}
+
+/// Which tab's [`HeldSelection`] a shared place/rehome call targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionSlotKind {
+    Setup,
+    Usage,
+}
+
+impl SelectionSlotKind {
+    fn tab(self) -> Tab {
+        match self {
+            Self::Setup => Tab::Setup,
+            Self::Usage => Tab::Usage,
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Setup => Self::Usage,
+            Self::Usage => Self::Setup,
+        }
+    }
 }
 
 /// The Overview's visible harness filter; selection maps onto the rows it shows.
@@ -3556,22 +4733,28 @@ pub(crate) enum HarnessFilter {
     All,
     Claude,
     Codex,
+    Shunt,
 }
 
 impl HarnessFilter {
-    /// `c` cycles: both → claude → codex → both.
+    /// `c` cycles: all → claude → codex → shunt → all.
     pub(crate) fn next(self) -> Self {
         match self {
             HarnessFilter::All => HarnessFilter::Claude,
             HarnessFilter::Claude => HarnessFilter::Codex,
-            HarnessFilter::Codex => HarnessFilter::All,
+            HarnessFilter::Codex => HarnessFilter::Shunt,
+            HarnessFilter::Shunt => HarnessFilter::All,
         }
     }
     pub(crate) fn shows_claude(self) -> bool {
-        !matches!(self, HarnessFilter::Codex)
+        matches!(self, HarnessFilter::All | HarnessFilter::Claude)
     }
     pub(crate) fn shows_codex(self) -> bool {
-        !matches!(self, HarnessFilter::Claude)
+        matches!(self, HarnessFilter::All | HarnessFilter::Codex)
+    }
+    /// Whether the shunt pool rows show: under `All` and `Shunt` only.
+    pub(crate) fn shows_shunt(self) -> bool {
+        matches!(self, HarnessFilter::All | HarnessFilter::Shunt)
     }
     /// Harness name for the accounts panel's left meta slot; `None` while both
     /// harnesses show, so the unfiltered panel renders no left slot.
@@ -3580,6 +4763,30 @@ impl HarnessFilter {
             HarnessFilter::All => None,
             HarnessFilter::Claude => Some("claude"),
             HarnessFilter::Codex => Some("codex"),
+            HarnessFilter::Shunt => Some("shunt"),
+        }
+    }
+}
+
+/// The Overview shunt section's pool listing: the providers and accounts the
+/// gateway reported, the reason a read failed, or no adopted gateway (no
+/// section at all). The one snapshot both the render and the key handlers
+/// read; `Absent` until the first read lands through [`shunt_pool_probe`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum ShuntPool {
+    #[default]
+    Absent,
+    NotRead(String),
+    Read(Vec<crate::gateway_admin::PoolProvider>),
+}
+
+impl ShuntPool {
+    /// The number of pool rows (one per provider-account pair), for the
+    /// accounts panel's title-right meta. Zero under `Absent` and `NotRead`.
+    pub(crate) fn row_count(&self) -> usize {
+        match self {
+            ShuntPool::Read(providers) => providers.iter().map(|p| p.accounts.len()).sum(),
+            _ => 0,
         }
     }
 }
@@ -3601,6 +4808,11 @@ pub(crate) struct CodexRow {
     /// Banked usage-limit resets off the same cache, floored at one
     /// available: `None` (or zero) renders no chip on the row.
     pub(crate) resets: Option<i64>,
+    /// Epoch-ms stamp dating this row's windows: the codex usage cache's own
+    /// `fetched_at` (epoch ms) when it is not in the future, else the cache
+    /// file's mtime (a pre-`fetched_at` cache, or a stamp past the clock).
+    /// `None` = no readable cache, so the pane reads `not read yet`.
+    pub(crate) fetched_at: Option<u64>,
 }
 
 /// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
@@ -3638,6 +4850,7 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
                     .as_ref()
                     .and_then(|u| u.codex_reset_credits)
                     .filter(|count| *count > 0),
+                fetched_at: crate::usage::usage_cache_clock_of(name, cached.as_ref()),
             }
         })
         .collect()
@@ -3652,9 +4865,10 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
 /// fresh login start).
 pub(crate) struct LoginSession {
     pub(crate) name: String,
-    /// true → the mint lands in the `+ new` draft (capture-then-commit);
-    /// false → re-login an existing profile in place (overwrite).
-    pub(crate) is_new: bool,
+    /// `None` → the mint lands in the `+ new` draft (capture-then-commit);
+    /// `Some` → re-login the account this [`ProfileId`] was claimed from at
+    /// start, in place, and only while `name` still holds it.
+    pub(crate) account: Option<ProfileId>,
     pub(crate) generation: u64,
     /// The URL `r` re-opens: an OAuth login's browser link, known at start; the
     /// console login's page, once its worker announces it.
@@ -3676,11 +4890,65 @@ pub(crate) struct LoginSession {
     pub(crate) paste_field: Option<InputState>,
 }
 
-/// The paste half of an OAuth login: the links `c` copies and a paste is
+/// In-flight codex browser re-login: the account name, the generation, the
+/// authorize URL once the worker announces it (`r` re-opens it, `c` copies it),
+/// and the cancel handle the worker's listener wait honours. No paste door and
+/// no stage — codex's callback answers on this machine alone, so the worker's
+/// next report is the minted chain or the failure.
+pub(crate) struct CodexLoginSession {
+    pub(crate) name: String,
+    pub(crate) generation: u64,
+    pub(crate) url: Option<String>,
+    pub(crate) cancel: crate::codex_login::LoginCancel,
+    /// `true` for a `+ new` form login (staged by `create account`), `false`
+    /// for a re-login of an existing account (lands itself). Only the former
+    /// counts as staged for the type-cycle confirm.
+    pub(crate) is_new: bool,
+}
+
+/// The codex browser login the `re-login` worker runs: the announce callback
+/// and the cancel handle, producing the minted outcome or its error sentence.
+#[cfg(test)]
+pub(crate) type CodexLoginWorker =
+    fn(
+        &dyn Fn(&str),
+        &crate::codex_login::LoginCancel,
+    ) -> std::result::Result<crate::codex_login::CodexLoginOutcome, String>;
+
+/// The paste half of an OAuth login: the link `c` copies and a paste is
 /// checked against, and the sender a parsed code goes down to the worker.
+/// The shunt add reuses the login modal's shell with its own raw door
+/// ([`App::shunt_paste`]), so this struct keeps its OAuth-only shape.
 pub(crate) struct PasteDoor {
     pub(crate) links: crate::oauth_login::LoginLinks,
     pub(crate) tx: std::sync::mpsc::Sender<crate::oauth_login::ManualCode>,
+}
+
+/// The shunt add's raw paste door: the pasted string relays VERBATIM to
+/// `complete_pool_account` (shunt holds the PKCE state; clauth never parses
+/// it). `sent` flips once a paste went down the door, so the modal's `p` hint
+/// hides after the one paste this add accepts. Stored beside [`App::login`] —
+/// which carries the claude login modal's shell — so [`LoginSession`]/[`PasteDoor`]
+/// keep their OAuth-only shapes.
+pub(crate) struct ShuntPasteDoor {
+    pub(crate) tx: std::sync::mpsc::Sender<String>,
+    /// The worker's cancel signal: dropping the door (a cancel) sets this
+    /// flag, which the worker reads. Kept off the paste channel so the
+    /// worker's `recv` stays that channel's only consumer — a cancel probe on
+    /// the paste channel would swallow a code pasted before the blocking wait.
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) sent: bool,
+    /// The add's `(family, name)`: the identity the result clears the guard
+    /// marker by, carried on the door so the drain reads it even on the error
+    /// path where the outcome holds nothing.
+    pub(crate) family: crate::gateway_admin::PoolFamily,
+    pub(crate) name: crate::gateway_admin::ShuntAccountName,
+}
+
+impl Drop for ShuntPasteDoor {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 impl LoginSession {
@@ -3711,11 +4979,21 @@ pub(crate) enum LoginStage {
     Verifying,
 }
 
-/// Worker→UI login channel payload: the console login's announced URL, or a
-/// stage bump (the first of which names the door that delivered the code).
+/// Worker→UI login channel payload: the console login's announced URL, a stage
+/// bump (the first of which names the door that delivered the code), or the
+/// shunt add's commit point (see [`LoginEvent::ShuntCommitted`]).
 pub(crate) enum LoginEvent {
     Url(String),
     Stage(LoginStage),
+    /// The shunt add reached its commit point: `complete_pool_account` is
+    /// being sent. Carries the add's `(family, name)` — the identity its guard
+    /// marker holds — so a late result clears only its own marker, never a
+    /// later pool action's. Tracked so a cancelled session still drains the
+    /// committed complete's outcome (the codex N1 rule).
+    ShuntCommitted(
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    ),
 }
 
 /// What a finished login worker produced. Both flows (the two-door OAuth
@@ -3730,6 +5008,26 @@ pub(crate) enum LoginEvent {
 pub(crate) enum LoginResult {
     Oauth(Box<crate::oauth_login::LoginOutcome>),
     Console(Box<crate::alibaba_login::ConsoleLoginOutcome>),
+    Shunt(Box<ShuntLoginOutcome>),
+}
+
+/// A shunt add's identity: its login generation and the `(family, name)` its
+/// guard marker holds. A finished add clears the guard only when the marker
+/// still equals this identity — never a later pool action's — and only this
+/// generation's committed slot.
+#[derive(Clone)]
+pub(crate) struct ShuntAddIdentity {
+    pub(crate) generation: u64,
+    pub(crate) family: crate::gateway_admin::PoolFamily,
+    pub(crate) name: crate::gateway_admin::ShuntAccountName,
+}
+
+/// A finished shunt pool-account add: the account's `(family, name)`, for the
+/// success toast and the pending landing. shunt's `live` bool is its own;
+/// clauth only toasts the add.
+pub(crate) struct ShuntLoginOutcome {
+    pub(crate) name: String,
+    pub(crate) family: crate::gateway_admin::PoolFamily,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -3807,34 +5105,54 @@ pub(crate) struct App {
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) third_party_broken: ThirdPartyBroken,
+    pub(crate) skipped_unreadable: SkippedUnreadable,
+    /// Scheduler-only stores held here so `forget_memory` can reach the whole
+    /// process's name-keyed state.
+    pub(crate) weekly_reset_kicks: WeeklyResetKicks,
+    pub(crate) suppressed_auth_expired: SuppressedAuthExpiredStore,
     /// The #74 degraded cue per profile, written each tick by `apply_usage`
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
     /// plain map, not a ranked store: written and read only on the UI thread.
     pub(crate) stale_cues: HashMap<String, bool>,
-    /// Per-name stat of the durable key-rejection record the last time
-    /// [`sync_broken_verdicts`] checked it (`None` = the record was absent).
-    /// The stat is the read gate: a per-second stat per profile is cheap, a
-    /// per-second read of every record is not.
-    pub(crate) broken_verdict_mtimes: HashMap<String, Option<std::time::SystemTime>>,
+    /// Per-name stats of the durable key-rejection records the last time
+    /// [`sync_broken_verdicts`] checked them. The stat is the read gate: a
+    /// per-second stat per profile is cheap, a per-second read of every record
+    /// is not.
+    pub(crate) broken_verdict_mtimes: crate::usage::DeadLoginStats,
     /// [`sync_broken_verdicts`]'s once-per-second gate (`None` = run on the
     /// first tick).
     pub(crate) last_broken_verdict_sync: Option<Instant>,
+    /// Every profile's credit refusal on record
+    /// ([`crate::profile_cache::CreditRefusal`]), re-read by
+    /// [`sync_credit_refusals`] so the per-frame projection never reads disk.
+    pub(crate) credit_refusals: HashMap<ProfileName, crate::profile_cache::CreditRefusal>,
+    /// The records' stats [`sync_credit_refusals`] last read, so a pass re-reads
+    /// only the records that moved.
+    pub(crate) credit_refusal_watch: crate::profile_cache::CreditRefusalWatch,
+    /// [`sync_credit_refusals`]'s once-per-second gate (`None` = run on the
+    /// first tick).
+    pub(crate) last_credit_refusal_sync: Option<Instant>,
     pub(crate) tab: Tab,
     /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
     /// carries a `[ herdr ]` tag and the TUI lands on the Services tab's herdr
     /// row. Read-only after construction — the mode is decided once at launch.
     pub(crate) herdr_mode: bool,
     pub(crate) modals: Vec<Modal>,
+    /// Bumped on every modal open and close, so a scroll bound stamped with an
+    /// older generation is never trusted as this frame's.
+    pub(crate) modal_generation: std::cell::Cell<u64>,
     /// First help-modal row on screen (↑↓ scrolls). Reset when the modal opens.
     pub(crate) help_scroll: u16,
     /// Max valid `help_scroll` from the last help render (`total - viewport`).
     /// Interior mutability because the render pass takes `&App`; clamping there
     /// stops a held ↓ from inflating `help_scroll` past the end.
     pub(crate) help_max_scroll: std::cell::Cell<u16>,
+    pub(crate) help_max_scroll_stamp: std::cell::Cell<ScrollStamp>,
     /// First `check output`-modal row on screen (↑↓ scrolls). Reset on open.
     pub(crate) check_output_scroll: u16,
     /// Max valid `check_output_scroll` from the last `check output` render.
     pub(crate) check_output_max_scroll: std::cell::Cell<u16>,
+    pub(crate) check_output_max_scroll_stamp: std::cell::Cell<ScrollStamp>,
     /// Visible `check output`-modal rows from the last render — the key
     /// handler's page step, published like `help_viewport`.
     pub(crate) check_output_viewport: std::cell::Cell<u16>,
@@ -3844,9 +5162,27 @@ pub(crate) struct App {
 
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
-    pub(crate) profile_cursor: usize,
+    pub(crate) profile_cursor: profile_cursor::Cursor,
+    /// Setup's identity-held selection slot. A claude row selected in Setup IS
+    /// `profile_cursor` (or its `+ new` synthetic at `profile_count()`); a
+    /// codex or pool row is stored in `slot.item` so it never moves the shared
+    /// cursor, and a pool hidden by an unread listing is held in
+    /// `slot.remembered` until the read restores it (a move or a descend
+    /// replaces it).
+    setup: HeldSelection,
+    /// Usage's identity-held selection slot — the same model as `setup` above,
+    /// in its own slot so Usage's walk never moves the shared `profile_cursor`.
+    usage: HeldSelection,
     pub(crate) overview_selector: ListView,
     pub(crate) overview_cursor: usize,
+    /// The one remembered Overview item: a cursor-move key sets it to the item
+    /// now under the cursor, and every placement (a filter change, tab entry,
+    /// a clamp) returns the cursor to it where the item set still holds it. A
+    /// claude row is remembered as `profile_cursor` itself (the stored index
+    /// is ignored, never a copy), a codex or pool row literally, so a pick on
+    /// another tab lands the Overview there for free while a codex/pool row
+    /// stays put; a filter merely hides it, so the round trip restores it.
+    pub(crate) overview_remembered: Option<MainItemKind>,
     pub(crate) usage_selector: ListView,
     pub(crate) usage_detail_focus: StatusFocus,
     pub(crate) usage_detail_scroll: usize,
@@ -3880,8 +5216,33 @@ pub(crate) struct App {
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Setup tab's right pane.
     pub(crate) config_action_cursor: usize,
+    /// The descended codex detail's armed 2-step (`delete account`). A separate
+    /// field from the claude draft's `armed_action` because the codex detail
+    /// has no `ConfigDraft`. The second ⏎ acts on the identity the SELECTION
+    /// still holds: any path that moved it while armed disarms first, so the
+    /// selection IS the armed identity (no separate field, the F2 call).
+    pub(crate) codex_detail_armed: bool,
+    /// The descended pool detail's armed 2-step (`remove`). The armed identity
+    /// is the selection's own pool pair, re-resolved on the second ⏎ (same
+    /// reason as the codex flag).
+    pub(crate) pool_detail_armed: bool,
     /// Inline editor for the Config detail pane; `Some` only while Actions has focus.
     pub(crate) config_draft: Option<ConfigDraft>,
+    /// The `+ new` form's draft while the form is not the active Setup pane —
+    /// suspended across a switch or while another account's detail is open, so
+    /// descending into `+ new` again restores its typed values. One slot cannot
+    /// hold both this and `config_draft` (an existing account's draft), which
+    /// is why the form gets its own home.
+    pub(crate) new_account_draft: Option<ConfigDraft>,
+    /// What the preset picker's open did to the Setup pane, so a cancel of the
+    /// pick sequence can reverse it losslessly.
+    pub(crate) preset_picker_open: PresetPickerOpen,
+    /// Set by [`App::reload_if_state_changed`] before the swap: Setup's
+    /// selection was `+ new` before the reload, so the tick's clamp keeps it
+    /// on the trailing row (a reload that moves the roster must never demote
+    /// `+ new` onto the last account). Read once by the tick, never by the
+    /// tab-switch or delete clamps.
+    pub(crate) reload_was_on_new: bool,
     /// Cursor into `chain_items()` on the Fallback left pane.
     pub(crate) chain_cursor: usize,
     /// Which Fallback pane has focus.
@@ -3899,13 +5260,13 @@ pub(crate) struct App {
     pub(crate) global_config_cursor: usize,
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
     /// owns keyboard). Space/`+`/`-` still cycle the presets when `None`.
-    pub(crate) refresh_interval_draft: Option<InputState>,
+    pub(crate) refresh_interval_draft: Option<SeededInput>,
     /// In-flight custom value for the Config tab's context-nudge editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
-    pub(crate) context_nudge_draft: Option<InputState>,
+    pub(crate) context_nudge_draft: Option<SeededInput>,
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
-    pub(crate) weekly_threshold_draft: Option<InputState>,
+    pub(crate) weekly_threshold_draft: Option<SeededInput>,
     /// The selected account's note (the usage tab's `notes:` row). Loaded on
     /// cursor moves, tab switches with a clamped cursor, and saves — never per
     /// frame.
@@ -3923,11 +5284,27 @@ pub(crate) struct App {
     pub(crate) below_width_floor: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
-    /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
-    pub(crate) update_handle: Option<JoinHandle<()>>,
+    /// Update check thread handle; awaited on TUI exit for clean shutdown.
+    pub(crate) update_handle: Option<update::UpdateThread>,
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
+    /// The shunt add's raw paste door, `Some` while a shunt `+ login` is in
+    /// flight. Lives beside [`App::login`] (the claude modal's shell) so the
+    /// OAuth `LoginSession`/`PasteDoor` shapes stay unchanged.
+    pub(crate) shunt_paste: Option<ShuntPasteDoor>,
+    /// The shunt add whose commit point the worker reached
+    /// (`complete_pool_account` sent). Set off the
+    /// [`LoginEvent::ShuntCommitted`] event, cleared in [`finish_shunt_add`], so
+    /// a cancelled session still drains the committed complete's outcome, and
+    /// carrying the add's identity so that late result clears only its own
+    /// guard marker.
+    pub(crate) shunt_add_committed: Option<ShuntAddIdentity>,
+    /// A pre-commit-cancelled add whose worker has not reported yet. Set by the
+    /// cancel (which holds the guard until then, R3-3), cleared when the
+    /// worker's report drains. Carries the identity so a stale result from an
+    /// older login never releases a newer add's guard.
+    pub(crate) shunt_add_cancelled: Option<ShuntAddIdentity>,
     /// What the login modal's `c` hands the hosted link to: OSC 52 on the
     /// terminal's stdout. Replaceable so a test keeps the escape off the
     /// terminal running the suite, which would take the fixture's link onto
@@ -3942,6 +5319,61 @@ pub(crate) struct App {
         std::sync::mpsc::Receiver<(u64, std::result::Result<LoginResult, String>)>,
     pub(crate) login_result_tx:
         std::sync::mpsc::Sender<(u64, std::result::Result<LoginResult, String>)>,
+
+    /// In-flight codex browser re-login (the Setup codex detail's `re-login`
+    /// row); `None` while idle. Its own session and channels: codex's callback
+    /// answers on this machine alone, so the flow is one worker with no paste
+    /// door. The worker LANDS the minted chain itself (behind the rotation
+    /// flock), so the result channel carries the canonical name or the error
+    /// sentence — the UI drains only the outcome, never parks on the flock.
+    pub(crate) codex_login: Option<CodexLoginSession>,
+    pub(crate) codex_login_generation: u64,
+    pub(crate) codex_login_url_rx: std::sync::mpsc::Receiver<(u64, String)>,
+    pub(crate) codex_login_url_tx: std::sync::mpsc::Sender<(u64, String)>,
+    pub(crate) codex_login_result_rx:
+        std::sync::mpsc::Receiver<(u64, String, std::result::Result<String, String>)>,
+    pub(crate) codex_login_result_tx:
+        std::sync::mpsc::Sender<(u64, String, std::result::Result<String, String>)>,
+    /// The `+ new` form's codex `+ login` result: the minted chain (staged,
+    /// never landed) or its error sentence, keyed by generation so a cancelled
+    /// login's late result is dropped.
+    pub(crate) codex_new_login_result_rx: std::sync::mpsc::Receiver<(
+        u64,
+        std::result::Result<crate::codex_login::CodexLoginOutcome, String>,
+    )>,
+    pub(crate) codex_new_login_result_tx: std::sync::mpsc::Sender<(
+        u64,
+        std::result::Result<crate::codex_login::CodexLoginOutcome, String>,
+    )>,
+    /// The codex browser login the `re-login` worker runs. A plain fn field so
+    /// a test swaps in a hermetic stand-in that never binds codex's loopback
+    /// ports or opens a browser (the `SchedulerState.fetcher` field precedent).
+    /// The non-test worker always runs [`codex_login::login_with`].
+    #[cfg(test)]
+    pub(crate) codex_login_worker: CodexLoginWorker,
+    /// The browser-open the shunt add's worker runs. A plain fn field so a test
+    /// swaps in a stand-in that never opens a browser (the `codex_login_worker`
+    /// precedent). The non-test worker always runs [`crate::platform::open_url`].
+    #[cfg(test)]
+    pub(crate) open_url_worker: fn(&str) -> anyhow::Result<()>,
+    /// A logline capture the shunt add's worker installs inside itself before
+    /// running, so a test can pin that the WORKER thread's lines never carry the
+    /// paste (a capture installed on the test thread alone sees nothing the
+    /// worker raises — the `drive_fallback_ticks` install-inside-the-thread
+    /// shape). `None` outside the tests that own one.
+    #[cfg(test)]
+    pub(crate) log_capture: Option<crate::logline::LogLines>,
+    /// A panic the shunt add's worker raises before running its job, so a test
+    /// can pin that a panicking add still lands a failure and never sticks the
+    /// guard (the `PoolJob::Panic` seam's twin). `false` outside that test.
+    #[cfg(test)]
+    pub(crate) shunt_add_panic: bool,
+    /// A seam the shunt add's worker parks on after it announces the URL and
+    /// before its `recv` waits for the paste. A test arms it with a receiver
+    /// whose sender it drops to release, so a paste can land in that window
+    /// deterministically. `None` outside the tests that own one.
+    #[cfg(test)]
+    pub(crate) shunt_add_paste_seam: Option<std::sync::mpsc::Receiver<()>>,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
     pub(crate) status: StatusState,
@@ -3969,6 +5401,19 @@ pub(crate) struct App {
     /// ([`crate::daemon::gateway::left_behind_gateway_runs`]), which picks the
     /// no-daemon toast's copy.
     pub(crate) left_behind_probe: ProbeWorker<bool>,
+    /// How a fresh daemon's binary changed, as last read beside
+    /// `daemon_health` ([`crate::daemon::daemon_binary_change`]): the plugin
+    /// card's line for that kind holds exactly while it is set, and each change
+    /// into `Some` tints the Services tab. Starts `None`, so a first changed
+    /// reading counts.
+    pub(crate) daemon_binary_change: Option<ExeChange>,
+    /// The kinds of daemon binary change whose toast was raised; each kind
+    /// toasts once per run.
+    pub(crate) daemon_toasted_kinds: ToastedKinds,
+    /// The kinds of change to this TUI's own binary whose toast was raised;
+    /// each kind toasts once per run, never on a probe made while this
+    /// process's own self-update holds its mark.
+    pub(crate) own_toasted_kinds: ToastedKinds,
     /// A `start daemon` / `stop daemon` worker is running; the action menu
     /// offers neither verb until its outcome lands. UI-thread-only.
     pub(crate) daemon_control_busy: bool,
@@ -4043,22 +5488,33 @@ pub(crate) struct App {
     pub(crate) pricing_refresh: std::sync::mpsc::Sender<()>,
 
     pub(crate) last_reload_fp: ReloadFingerprint,
+    /// The identity snapshot the reload compare diffs against, refreshed on
+    /// every applied forget.
+    pub(crate) snapshot:
+        Arc<RankedMutex<crate::usage::SnapshotMap, crate::lockorder::rank::Snapshot>>,
     /// The live credentials hold a login no profile owns (a login at all, and
     /// `find_matching_oauth_profile` misses) — the condition the `+ new`
     /// form's `+ capture current login` row renders on. Recomputed on
-    /// construct, on entering the Setup tab, on config reload (external
-    /// changes), and at every in-TUI mutation that pins `last_reload_fp`
-    /// forward instead of reloading (switch, capture, create, delete, login,
-    /// logout).
+    /// construct, on entering the Setup tab, on config reload, and at every
+    /// in-TUI mutation (switch, capture, create, delete, login, logout), whose
+    /// own write is drained but left unadopted so the next reload re-reads it.
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
+    /// Header mascot playback: a random big animation at launch and every 30
+    /// minutes, a subtler one every 10 seconds.
+    pub(crate) clawd: clawd::Clawd,
     /// Pinned animation phase for render tests that must sample a specific point
     /// of the wave. Backdating `started_at` instead would subtract from
     /// `Instant::now()`, which panics on a host whose uptime is shorter than the
     /// offset. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) anim_phase_ms: Option<u64>,
+    /// Pinned wall clock for render tests that must advance a tps snapshot past
+    /// its stale window without sleeping. `fresh_tps` reads this when set, so
+    /// freshness is still judged per call. Never compiled into the binary.
+    #[cfg(test)]
+    pub(crate) tps_now_override: Option<u64>,
     /// The day-list notices last surfaced, empty while the lists are ordinary.
     /// Holding the MESSAGES rather than a flag is what makes the gate right on
     /// both axes `AppConfig::day_claim_collision` documents: each string
@@ -4070,8 +5526,25 @@ pub(crate) struct App {
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
-    /// First `q` at top level arms this; second `q` confirms quit.
-    pub(crate) armed_quit: bool,
+    /// The quit is decided but the exit waits for a running write (a shunt-card
+    /// write or a token spend): the screen keeps drawing and the tick exits the
+    /// moment no write runs. A second quit during the wait exits at once.
+    pub(crate) exit_wait: bool,
+    /// The armed 2-step quit: the key that armed it, `None` when disarmed. A
+    /// second press of the SAME key confirms; the other quit key re-arms as
+    /// itself.
+    pub(crate) armed_quit: Option<QuitKey>,
+    /// The switch or quit target a loss-warning `save` is holding until a
+    /// field or `+ add` save lands; the hold's sync decides the landing and
+    /// refusal. While `Some`, a further switch does nothing; a quit turns a
+    /// held switch into a held quit, and a second quit exits at once.
+    pub(crate) loss_pending: Option<LossWarningTarget>,
+    /// The extra state a held `save` carries to its landing: a marker that a
+    /// field or `+ add` save owned the worker so the whole save must re-run, or
+    /// the lone-async save's cancel-on-refusal rule. `None` when the hold is a
+    /// direct switch/quit over an in-flight field save: nothing to commit, and
+    /// the gate re-runs on both outcomes.
+    pub(crate) loss_pending_sync: Option<LossPendingSync>,
     /// Live footer alert; replaces the hint bar in place while `Some`.
     /// Cleared on disarm, tab switch, or explicit `x` dismiss.
     pub(crate) footer_alert: Option<FooterAlert>,
@@ -4153,9 +5626,42 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
-    /// The widest the header's `[ N live ]` chip has read `N`, in cells: the
-    /// chip renders at least this wide for the TUI's lifetime.
-    pub(crate) live_count_width: usize,
+    /// The job-store snapshot the Setup detail's live-session field reads from,
+    /// so a frame never walks `~/.claude/jobs`. Cached like `live_sessions`:
+    /// refreshed by [`poll_live_sessions`] on its own tick, never on a config
+    /// reload (jobs come and go without touching config), and seeded in
+    /// [`App::new`] so the first frame already reads a real snapshot.
+    pub(crate) job_trees: crate::claude_jobs::JobTrees,
+    /// The members a handed-off chain row keeps live, derived from the same
+    /// per-tick `job_trees` snapshot (one registry read, never one per frame),
+    /// so a Setup-detail frame pays a set lookup instead of a registry walk.
+    pub(crate) handed_off: HashSet<String>,
+    /// The last tps snapshot read off the producer's cache, `None` when the
+    /// cache is absent. Seeded in [`App::new`] beside `live_sessions`, so the
+    /// header's `[ — tok/s ]` and the other no-reading forms render from the
+    /// first frame; re-read on the tick by [`poll_tps`].
+    pub(crate) tps: Option<crate::tps::Snapshot>,
+    /// Throttle for the per-tick tps cache re-read.
+    last_tps_refresh: Instant,
+    /// The Overview active mark's client-token names, with the store stamp they
+    /// were read at: the tick re-reads them only when the store file moves, so
+    /// every writer of the store is covered by the file's own event. Seeded in
+    /// [`App::new`] so the first frame already marks a shunt-backed account.
+    pub(crate) shunt_mark: ShuntMark,
+    /// Finished delegate jobs' resolved average speeds, keyed by job id. Filled
+    /// on the tick path (never in render) and evicted when a job leaves the
+    /// list; a job that has not resolved yet is simply absent and retried with
+    /// a per-job back-off.
+    pub(crate) delegate_speed_cache: HashMap<String, f64>,
+    /// Per-job retry state for finished jobs that have not resolved: the epoch
+    /// ms of the next attempt and the current (doubling) back-off.
+    pub(crate) delegate_speed_retry: HashMap<String, FinishedRetry>,
+    /// How many transcript-store walks the resolver has performed — a test seam
+    /// proving one walk per pass. Never compiled into the binary.
+    #[cfg(test)]
+    pub(crate) delegate_speed_walks: usize,
+    /// Throttle for the per-tick finished-speeds resolution.
+    last_finished_speeds_refresh: Instant,
     /// The codex roster as the Overview lists it and the header counts it.
     /// Cached like `live_sessions`: [`codex_rows`] is a roster read plus a few
     /// small files per account, the header draws on every tab every frame, and
@@ -4166,6 +5672,98 @@ pub(crate) struct App {
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
+    /// The Overview shunt section's pool listing (`Absent` until the first
+    /// read lands). UI-thread-only; the render and the key handlers both read
+    /// this one snapshot, never a per-frame re-read.
+    pub(crate) shunt_pool: ShuntPool,
+    /// Epoch ms of the last time `shunt_pool` landed a [`ShuntPool::Read`];
+    /// `None` while the pool was never read, or the last landing was an error.
+    /// The Usage pool pane's `read <age> ago` row reads this stamp alone.
+    pub(crate) shunt_pool_read_at_ms: Option<u64>,
+    /// The worker running [`shunt_pool_probe`]; `prober` is `None` under test.
+    pub(crate) shunt_pool_probe: ProbeWorker<ShuntPool>,
+    /// The shunt form's `+ login` disabled reason, computed on the tick (the
+    /// [`Self::unsaved_live_login`] precedent), never on the render path. `None`
+    /// while the add is available; the read-error rungs carry the error through
+    /// `escape_control`, so the value is a `String`, not a `&'static str`.
+    pub(crate) shunt_add_disabled: Option<String>,
+    /// Whether the operator's own codex login is capturable right now, computed
+    /// on the tick like [`Self::shunt_add_disabled`]. The codex form's
+    /// `+ capture current login` row's visibility reads this cache, never the
+    /// capture's disk reads, on the render path.
+    pub(crate) codex_operator_capturable: bool,
+    /// The pool account a finished add should land Setup and the Overview on,
+    /// resolved by [`land_pending_pool_add`] once a re-read publishes it. Held
+    /// as `(family, name)` so the landing matches the provider whose auth maps
+    /// to that family, never a same-named account in another family. Dropped by
+    /// any selection change and by the first read that does not hold it.
+    pub(crate) pending_pool_landing: Option<(crate::gateway_admin::PoolFamily, String)>,
+    /// Throttle for the per-tick pool re-read while the Overview or Setup tab
+    /// shows.
+    last_shunt_pool_refresh: Option<Instant>,
+    /// Throttle for the per-tick form-predicate re-read
+    /// ([`Self::refresh_form_predicates`]); `None` means un-sampled, which the
+    /// poll reads as due.
+    last_form_predicates_refresh: Option<Instant>,
+    /// The account `(family, name)` a remove/refresh worker is acting on;
+    /// `None` while none runs. Every row whose provider maps to that family and
+    /// whose name matches renders a braille spinner in its marker slot while
+    /// set, and a second pool action while one runs toasts that it is still
+    /// running. Keyed by identity, never a row index, so a reorder under a
+    /// running mutation cannot move the spinner onto another account.
+    pub(crate) pool_mutation_row: Option<(
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    )>,
+    /// Which job the in-flight mutation is — the detail pane spins the action
+    /// row whose job runs, `remove` included, never the wrong neighbour row.
+    pub(crate) pool_mutation_kind: Option<PoolMutationKind>,
+    /// Pool remove/refresh worker results; drained in `on_tick`.
+    pool_mutation_rx: std::sync::mpsc::Receiver<PoolMutationResult>,
+    pool_mutation_tx: std::sync::mpsc::Sender<PoolMutationResult>,
+    /// The account a delete worker is removing; `None` while none runs. A
+    /// second delete while one runs toasts that it is still running.
+    pub(crate) deleting: Option<ProfileName>,
+    /// Delete worker results; drained in `on_tick`.
+    delete_rx: std::sync::mpsc::Receiver<DeleteResult>,
+    delete_tx: std::sync::mpsc::Sender<DeleteResult>,
+    /// Where the bare-item workers read the macOS Keychain item.
+    pub(crate) bare_item_source: Option<BareItemSource>,
+    /// Bare-item worker answers for held writes; drained in `on_tick`.
+    bare_item_rx: std::sync::mpsc::Receiver<BareItemAnswer>,
+    bare_item_tx: std::sync::mpsc::Sender<BareItemAnswer>,
+    /// The settled placement a resumed write takes at its gate instead of
+    /// settling again; set only across [`resume_bare_item_write`]'s call.
+    bare_item_ready: Option<Option<[u8; 32]>>,
+    /// Non-switch Keychain checks still running on their workers
+    /// ([`begin_bare_item_check`]): the [`BARE_ITEM_CHECKING`] toast stays
+    /// up past its TTL while any runs, and goes once none does.
+    bare_item_checks: Arc<AtomicUsize>,
+    /// The bootstrap worker's settle, when it let the boot relink write: the
+    /// placement the startup one-shot's write holds. `None` keeps the
+    /// one-shot from writing while a source exists.
+    boot_bare_item: Arc<std::sync::Mutex<Option<Option<[u8; 32]>>>>,
+    /// [`App::refresh_unsaved_live_login`]'s worker answers, tagged with the
+    /// request they answer; drained in `on_tick`.
+    unsaved_login_rx: std::sync::mpsc::Receiver<(u64, bool)>,
+    unsaved_login_tx: std::sync::mpsc::Sender<(u64, bool)>,
+    /// The latest refresh asked for; an older answer is dropped.
+    unsaved_login_generation: u64,
+    /// The `+ capture current login` row's worker answers
+    /// ([`spawn_capture_login`]); drained in `on_tick`.
+    capture_login_rx: std::sync::mpsc::Receiver<Result<CaptureSnapshot>>,
+    capture_login_tx: std::sync::mpsc::Sender<Result<CaptureSnapshot>>,
+    /// The login [`NamePromptAction::SaveBareItem`]'s prompt names a new
+    /// profile for, the account its lookup proved, and the write it holds.
+    pub(crate) bare_item_naming: Option<BareItemNaming>,
+}
+
+/// What [`NamePromptAction::SaveBareItem`]'s ⏎ saves, then resumes.
+#[derive(Debug)]
+pub(crate) struct BareItemNaming {
+    pub(crate) login: crate::profile::ClaudeCredentials,
+    pub(crate) account: Option<crate::profile::AccountId>,
+    pub(crate) write: BareItemWrite,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -4215,10 +5813,16 @@ struct WorkerHandles {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    skipped_unreadable: SkippedUnreadable,
+    weekly_reset_kicks: WeeklyResetKicks,
+    suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
     bootstrap_active: Arc<AtomicBool>,
     startup_sender: StartupSender,
+    snapshot: Arc<
+        crate::lockorder::RankedMutex<crate::usage::SnapshotMap, crate::lockorder::rank::Snapshot>,
+    >,
 }
 
 impl WorkerHandles {
@@ -4245,10 +5849,14 @@ impl WorkerHandles {
             third_party_status: Arc::clone(&app.third_party_status),
             third_party_streaks: Arc::clone(&app.third_party_streaks),
             third_party_broken: Arc::clone(&app.third_party_broken),
+            skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+            weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+            suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
             bootstrap_active: Arc::clone(&app.bootstrap_active),
             startup_sender: app.startup_sender.clone(),
+            snapshot: Arc::clone(&app.snapshot),
         }
     }
 }
@@ -4290,8 +5898,9 @@ pub(crate) struct ReadingsSnapshot {
     /// Raw provider stats per profile name (the balance rows' source).
     pub(crate) third_party: HashMap<String, crate::providers::ThirdPartyStats>,
     /// Raw OAuth store per profile name, unpicked: the queue chips' canceled
-    /// source, the same one the scheduler's election reads, so a hybrid whose
-    /// OAuth plan is canceled drops from both.
+    /// source and their plan verdict, the same ones the scheduler's election
+    /// reads, so a hybrid whose OAuth plan is canceled or has no 5h limit drops
+    /// from both.
     pub(crate) oauth: HashMap<String, UsageInfo>,
     /// The #74 degraded cue per profile name, cloned off `App::stale_cues`.
     pub(crate) stale: HashMap<String, bool>,
@@ -4314,6 +5923,23 @@ impl ReadingsSnapshot {
 
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
+        // This process holds reading stores, so change sites record their
+        // forgets here and the per-site drains + `on_tick` apply them.
+        crate::usage::register_memory_stores();
+        // Take the reload fingerprint BEFORE seeding the snapshot: a write
+        // landing between the two then moves the fingerprint, so the first
+        // reload re-reads config while the snapshot already holds the newer
+        // identity — never a spurious forget off a stale snapshot.
+        let last_reload_fp = reload_fingerprint();
+        // Seed the identity snapshot from disk before the first compare, so a
+        // freshly-built TUI forgets nothing its own startup already seeded.
+        let snapshot = crate::usage::new_snapshot(
+            &config
+                .profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+        );
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
         let usage_status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
@@ -4338,11 +5964,10 @@ impl App {
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
-        // Seed the live mirror from the durable verdict so a fingerprint-bound
-        // key rejection survives a restart (see `durable_key_rejected_seed`).
-        if let Ok(mut broken) = third_party_broken.lock() {
-            broken.extend(Self::durable_key_rejected_seed(&config));
-        }
+        let skipped_unreadable: SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
+        let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+        let suppressed_auth_expired: SuppressedAuthExpiredStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
@@ -4435,11 +6060,27 @@ impl App {
         let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
+        let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
+        let (delete_tx, delete_rx) = std::sync::mpsc::channel();
+        let (bare_item_tx, bare_item_rx) = std::sync::mpsc::channel();
+        let (unsaved_login_tx, unsaved_login_rx) = std::sync::mpsc::channel();
+        let (capture_login_tx, capture_login_rx) = std::sync::mpsc::channel();
+        let (codex_login_url_tx, codex_login_url_rx) = std::sync::mpsc::channel();
+        let (codex_login_result_tx, codex_login_result_rx) = std::sync::mpsc::channel();
+        let (codex_new_login_result_tx, codex_new_login_result_rx) = std::sync::mpsc::channel();
 
         // Seed the token cache and the live tally before `config` moves into the
-        // handle below.
-        let live_sessions = crate::live_sessions::LiveTally::collect(&config);
+        // handle below. The tally and the handed-off set share ONE job-store
+        // snapshot, so a job landing mid-construction cannot split them; the
+        // tick refreshes the same pair from one read.
+        let job_trees = crate::claude_jobs::job_trees();
+        let live_sessions = crate::live_sessions::LiveTally::collect_in(&config, &job_trees);
+        let tps = crate::tps::load_cache();
         let daemon_health = crate::daemon::daemon_health();
+        // The Overview pool actions read this record without the Services tab
+        // ever opening: load it at construction, the same cheap local read the
+        // Services recompute makes.
+        let shunt_record = crate::gateway::GatewayRecord::load().ok().flatten();
         let session_tokens = collect_session_tokens(
             &config
                 .profiles
@@ -4451,6 +6092,7 @@ impl App {
             .profiles
             .first()
             .and_then(|p| crate::profile_notes::load_note(&p.name));
+        let handed_off = crate::runtime::handed_off_live_members(&job_trees);
 
         let mut app = Self {
             config: Arc::new(RankedMutex::new(config)),
@@ -4477,22 +6119,34 @@ impl App {
             third_party_status,
             third_party_streaks,
             third_party_broken,
+            skipped_unreadable,
+            weekly_reset_kicks,
+            suppressed_auth_expired,
             stale_cues: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
+            credit_refusals: HashMap::new(),
+            credit_refusal_watch: crate::profile_cache::CreditRefusalWatch::default(),
+            last_credit_refusal_sync: None,
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
             herdr_mode: false,
             modals: Vec::new(),
+            modal_generation: std::cell::Cell::new(0),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            help_max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
             check_output_scroll: 0,
             check_output_max_scroll: std::cell::Cell::new(0),
+            check_output_max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
             check_output_viewport: std::cell::Cell::new(0),
             help_viewport: std::cell::Cell::new(0),
-            profile_cursor: 0,
+            profile_cursor: profile_cursor::Cursor::default(),
+            setup: HeldSelection::default(),
+            usage: HeldSelection::default(),
             overview_selector: ListView::default(),
             overview_cursor: 0,
+            overview_remembered: None,
             usage_selector: ListView::default(),
             usage_detail_focus: StatusFocus::List,
             usage_detail_scroll: 0,
@@ -4521,6 +6175,8 @@ impl App {
             global_config_total: std::cell::Cell::new(0),
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
+            codex_detail_armed: false,
+            pool_detail_armed: false,
             fallback_focus: FallbackFocus::Chain,
             fallback_detail_cursor: 0,
             fallback_edit: None,
@@ -4532,6 +6188,9 @@ impl App {
             note_text: initial_note,
             note_editor: None,
             config_draft: None,
+            new_account_draft: None,
+            preset_picker_open: PresetPickerOpen::None,
+            reload_was_on_new: false,
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
@@ -4539,12 +6198,35 @@ impl App {
             update_results,
             update_handle,
             login: None,
+            shunt_paste: None,
+            shunt_add_committed: None,
+            shunt_add_cancelled: None,
             clipboard: crate::platform::copy_to_clipboard_osc52,
             login_generation: 0,
             login_event_rx,
             login_event_tx,
             login_result_rx,
             login_result_tx,
+            codex_login: None,
+            codex_login_generation: 0,
+            codex_login_url_rx,
+            codex_login_url_tx,
+            codex_login_result_rx,
+            codex_login_result_tx,
+            codex_new_login_result_rx,
+            codex_new_login_result_tx,
+            #[cfg(test)]
+            codex_login_worker: |_announce, _cancel| {
+                Err("test seam: no real codex browser login".to_string())
+            },
+            #[cfg(test)]
+            open_url_worker: crate::platform::open_url,
+            #[cfg(test)]
+            log_capture: None,
+            #[cfg(test)]
+            shunt_add_panic: false,
+            #[cfg(test)]
+            shunt_add_paste_seam: None,
             status: StatusState::default(),
             status_events,
             status_refresh,
@@ -4552,6 +6234,9 @@ impl App {
             gateway_state: crate::daemon::gateway_slot(daemon_health).0.state,
             gateway_unrun: false,
             left_behind_probe: ProbeWorker::new(crate::daemon::gateway::left_behind_gateway_runs),
+            daemon_binary_change: None,
+            daemon_toasted_kinds: ToastedKinds::default(),
+            own_toasted_kinds: ToastedKinds::default(),
             last_daemon_probe: Instant::now(),
             daemon_control_busy: false,
             daemon_control_rx,
@@ -4589,15 +6274,22 @@ impl App {
             price_failed: false,
             pricing_events,
             pricing_refresh,
-            last_reload_fp: reload_fingerprint(),
+            last_reload_fp,
+            snapshot,
             unsaved_live_login: false,
             started_at: Instant::now(),
+            clawd: clawd::Clawd::new(),
             #[cfg(test)]
             anim_phase_ms: None,
+            #[cfg(test)]
+            tps_now_override: None,
             day_claim_notices: Vec::new(),
             tick_count: 0,
             quit: false,
-            armed_quit: false,
+            exit_wait: false,
+            armed_quit: None,
+            loss_pending: None,
+            loss_pending_sync: None,
             footer_alert: None,
             banner: None,
             last_divergence_check: Some(Instant::now()),
@@ -4616,39 +6308,103 @@ impl App {
             wallet_cache,
             wallet_fp,
             session_tokens,
-            live_count_width: live_count_text(live_sessions.total()).chars().count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            job_trees,
+            handed_off,
+            tps,
+            last_tps_refresh: Instant::now(),
+            shunt_mark: ShuntMark::default(),
+            delegate_speed_cache: HashMap::new(),
+            delegate_speed_retry: HashMap::new(),
+            #[cfg(test)]
+            delegate_speed_walks: 0,
+            last_finished_speeds_refresh: Instant::now(),
             codex_rows: codex_rows(),
             last_codex_rows_refresh: Some(Instant::now()),
+            shunt_pool: ShuntPool::default(),
+            shunt_pool_read_at_ms: None,
+            shunt_pool_probe: ProbeWorker::new(shunt_pool_probe),
+            shunt_add_disabled: None,
+            codex_operator_capturable: false,
+            pending_pool_landing: None,
+            last_shunt_pool_refresh: None,
+            last_form_predicates_refresh: None,
+            pool_mutation_row: None,
+            pool_mutation_kind: None,
+            pool_mutation_rx,
+            pool_mutation_tx,
+            deleting: None,
+            delete_rx,
+            delete_tx,
+            bare_item_source: default_bare_item_source(),
+            bare_item_rx,
+            bare_item_tx,
+            bare_item_ready: None,
+            bare_item_checks: Arc::new(AtomicUsize::new(0)),
+            boot_bare_item: Arc::new(std::sync::Mutex::new(None)),
+            unsaved_login_rx,
+            unsaved_login_tx,
+            unsaved_login_generation: 0,
+            capture_login_rx,
+            capture_login_tx,
+            bare_item_naming: None,
         };
+        // A dead login survives a restart: the live mirror starts from the
+        // durable verdicts, through the seed the daemon runs too.
+        crate::usage::seed_dead_logins(&app.config, &app.third_party_broken);
+        adopt_shunt_record(&mut app, shunt_record);
+        // Seed the Overview's mark cache from the client-token store before the
+        // first paint; the tick re-reads it only when the store file moves.
+        refresh_shunt_mark(&mut app);
         app.refresh_unsaved_live_login();
+        app.refresh_form_predicates();
+        let rebind_form = {
+            let config = app.config();
+            Self::startup_rebind_form(&config)
+        };
+        if let Some(form) = rebind_form {
+            app.open_modal(Modal::Rebind(form));
+        }
         app
     }
 
-    /// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
-    /// one `(name, fingerprint)` per profile whose record matches the
-    /// credential it holds right now (`fallback::third_party_key_rejected` —
-    /// never a lapsed Alibaba console session, which stays usage-only). This
-    /// is what keeps a fingerprint-bound key rejection visible after a TUI
-    /// restart or in a stood-down TUI until a fetch recreates it; the
-    /// intersection in [`App::key_rejected_names`] still drops the name the
-    /// moment the credential changes.
-    fn durable_key_rejected_seed(config: &AppConfig) -> HashMap<String, u64> {
-        config
-            .profiles
+    /// The first-launch re-bind offer: open a confirm only when some account
+    /// has rows to move AND this release's bind-table digest was not yet
+    /// offered (an absent digest counts as not offered). Pure — the caller
+    /// decides when to push the modal.
+    fn startup_rebind_form(config: &AppConfig) -> Option<RebindForm> {
+        let offers = crate::presets::rebind_offers(config);
+        if offers.is_empty() {
+            return None;
+        }
+        let digest = crate::presets::builtin_binds_digest();
+        if config.state.preset_binds_offered.as_deref() == Some(digest.as_str()) {
+            return None;
+        }
+        let blocks = crate::presets::group_offers(offers);
+        let checked = blocks
             .iter()
-            .filter(|p| crate::fallback::third_party_key_rejected(p, &p.name))
-            .filter_map(|p| {
-                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.name.to_string(), fp))
-            })
-            .collect()
+            .map(|b| vec![true; b.accounts.len()])
+            .collect();
+        Some(RebindForm {
+            blocks,
+            checked,
+            cursor: 0,
+            choice: false,
+            scroll: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            digest,
+        })
     }
 
     /// The live key-rejected member set, read once per render (never per walk
     /// candidate): the broken fingerprint map intersected with the CURRENT
-    /// config profiles (the same `profile_credential_fingerprint` the scheduler
-    /// scans use), so a repair that landed in the config drops the name the
+    /// config profiles (the same `dead_login_fingerprint` the scheduler scans
+    /// use), so a repair that landed in the config drops the name the
     /// moment the render reads it — never gated on the separately refreshed
     /// `ThirdPartyList`.
     pub(crate) fn key_rejected_names(&self) -> HashSet<ProfileName> {
@@ -4663,12 +6419,34 @@ impl App {
             .collect()
     }
 
+    /// Whether a switch to `name` would install a long-lived session token: the
+    /// sidecar half of [`crate::fallback::no_usage_source`], answered off the
+    /// per-frame [`Self::session_tokens`] cache. The ONE reader of that cache
+    /// for this question, so the Fallback marker, the member card, the Overview
+    /// chain row and the add confirm cannot read it four different ways.
+    ///
+    /// Same verdict [`crate::claude::has_session_token`] gives off disk, which
+    /// is what a daemon (no cache, one read at boot) asks instead: a
+    /// `NotLongLived` mis-fill is `false` here exactly as it is there, because
+    /// the split stays disengaged and `credentials.json` remains what switches
+    /// install. An expired long-lived token is still `true`: it stops serving,
+    /// it does not make the account measurable.
+    pub(crate) fn installs_session_token(&self, name: &ProfileName) -> bool {
+        matches!(
+            self.session_tokens.get(name.as_str()),
+            Some(crate::claude::SessionTokenStatus::LongLived(_))
+        )
+    }
+
     /// Landing, armed at construction. The FIRST herdr launch opens the
     /// Services tab and, once the herdr probe lands, puts the herdr selector row
     /// under the cursor with its detail pane descended; construction marks the
     /// landing done in `[herdr] first_landing_done` — once, forever. Every other
     /// launch — a plain TUI, and herdr after the first — opens the top-level
-    /// `home_tab` (default overview); the herdr header tag is unaffected. The
+    /// `home_tab` (default overview); the herdr header tag is unaffected. A modal
+    /// already open at construction (the startup re-bind confirm) also takes the
+    /// non-landing arm and leaves `first_landing_done` UNSET, so the next herdr
+    /// launch still lands. The
     /// first landing's recompute starts the herdr probe on its worker, so the
     /// first paint never waits on its three subprocesses; the pending intent
     /// lands on the herdr row by label in the recompute that adopts the probe,
@@ -4678,21 +6456,17 @@ impl App {
     /// intent, so focus is never stolen once the user has acted.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
-        let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
+        let first_landing =
+            herdr_mode && !self.config().state.herdr.first_landing_done && self.modals.is_empty();
         if first_landing {
             self.tab = Tab::Services;
             // Land on the herdr row by label once its probe resolves.
             self.services.land_on_herdr = true;
             recompute_services_checks(&mut self, false, ShuntRefresh::Keep);
-            {
-                let mut cfg = self.config();
-                cfg.state.herdr.first_landing_done = true;
-                let _ = save_app_state(&cfg.state);
-            }
-            // Adopt the marker write like every other in-TUI save: without the
-            // bump, the app's own profiles.toml rewrite reads as an external
-            // change and re-runs a full config reload on the first tick.
-            self.last_reload_fp = reload_fingerprint();
+            self.save_state_delta(|s, _held| s.herdr.first_landing_done = true);
+            // Drain any forgets the marker write noted. The write is left
+            // unadopted, so the first tick's reload re-reads and adopts it.
+            self.apply_forgets();
         } else {
             let home: Tab = self.config().state.home_tab().into();
             self.tab = home;
@@ -4700,14 +6474,72 @@ impl App {
         self
     }
 
-    /// The production write path for the tally after construction: it also widens
-    /// the header chip's held count width, so a count shrinking by a digit
-    /// moves nothing right of the chip.
+    /// `false` paints Claude Code's simplified mascot, the one it draws on
+    /// Apple's Terminal.app.
+    pub(crate) fn with_full_sprite(mut self, full_sprite: bool) -> Self {
+        self.clawd.full_sprite = full_sprite;
+        self
+    }
+
+    /// The production write path for the tally after construction.
     pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
-        self.live_count_width = self
-            .live_count_width
-            .max(live_count_text(tally.total()).chars().count());
         self.live_sessions = tally;
+    }
+
+    /// The production write path for the tps snapshot read off the producer's
+    /// cache; `None` = no producer.
+    pub(crate) fn set_tps(&mut self, snapshot: Option<crate::tps::Snapshot>) {
+        // A fresh snapshot that dropped a day the previous snapshot held means
+        // the producer just folded that day into the speed ledger and dropped it
+        // from the cache in the same tick. Nudge the tokens worker so it
+        // re-reads the ledger at once, instead of leaving the merged day sums
+        // blank until its next 90 s cycle. A day that stays (no fold, or a fold
+        // whose ledger save failed keeps the day in the cache) fires nothing.
+        if let (Some(prev), Some(next)) = (&self.tps, &snapshot) {
+            let next_is_fresh = next
+                .age_ms(self.tps_now_ms())
+                .is_some_and(|age| age <= crate::tps::STALE_AFTER_MS);
+            if next_is_fresh && prev.days.keys().any(|d| !next.days.contains_key(d)) {
+                let _ = self.tokens_refresh.send(());
+            }
+        }
+        self.tps = snapshot;
+    }
+
+    /// The tok/s chip's figure ceiling, in cells: the widest whole figure
+    /// (`9999`) the header's whole-`k` form reaches, past which the figure
+    /// abbreviates to `10k` and the chip never grows.
+    pub(crate) const TPS_RATE_FIGURE_W: usize = 4;
+
+    /// The header chip's number: the fresh rate, or `—` for no producer / a
+    /// stale or unparseable cache.
+    pub(crate) fn tps_rate_text(&self) -> String {
+        match self.fresh_tps() {
+            Some(s) => crate::tps::format_figure_capped(s.total.live.rate, Self::TPS_RATE_FIGURE_W),
+            None => "—".to_owned(),
+        }
+    }
+
+    /// The tps snapshot while a fresh producer stands behind it: `None` for no
+    /// snapshot, one past [`crate::tps::STALE_AFTER_MS`], or an unparseable /
+    /// future `generated_at`. A surface renders a figure only off this, never
+    /// off [`App::tps`] alone.
+    pub(crate) fn fresh_tps(&self) -> Option<&crate::tps::Snapshot> {
+        let snap = self.tps.as_ref()?;
+        let now = self.tps_now_ms();
+        snap.age_ms(now)
+            .is_some_and(|age| age <= crate::tps::STALE_AFTER_MS)
+            .then_some(snap)
+    }
+
+    /// The wall clock the tps surfaces read: the test override when pinned,
+    /// else the real clock. Shared so every surface's "now" agrees.
+    pub(crate) fn tps_now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ms) = self.tps_now_override {
+            return ms;
+        }
+        crate::usage::now_ms()
     }
 
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
@@ -4746,25 +6578,58 @@ impl App {
     /// `StartupSignal::BootstrapDone` when done; the UI thread then rebuilds the
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
-    pub(crate) fn spawn_bootstrap(&self) {
+    pub(crate) fn spawn_bootstrap(&mut self) {
         let h = WorkerHandles::from_app(self);
         let done = BootstrapDoneGuard {
             bootstrap_active: h.bootstrap_active,
             startup_sender: h.startup_sender,
         };
+        let source = self.bare_item_source;
+        let bare_item_tx = self.bare_item_tx.clone();
+        let boot_bare_item = Arc::clone(&self.boot_bare_item);
+        // Re-establish the credentials symlink (shutdown replaced it with a
+        // plain file); without this, CC refreshes bypass the profile.
+        let active = self.config().state.active_profile.as_ref().cloned();
+        let check = active
+            .clone()
+            .and_then(|active| begin_bare_item_check(self, &BareItemWrite::BootRelink(active)));
 
         spawn_worker(move || {
             let _done = done;
 
-            // Re-establish the credentials symlink (shutdown replaced it with
-            // a plain file); without this, CC refreshes bypass the profile.
-            let active = Self::lock_config(&h.config)
-                .state
-                .active_profile
-                .as_ref()
-                .cloned();
             if let Some(active) = active {
-                let _ = link_profile_credentials(&active);
+                let write = BareItemWrite::BootRelink(active.clone());
+                let writer = write.writer();
+                let answer = BareItemAnswerGuard::new(bare_item_tx, write);
+                let _check = check;
+                // One settle answers for the relink here and the startup
+                // one-shot's write after it. A login only the user can place
+                // holds the relink until they answer; a failed settle leaves
+                // the relink to its own guard, which keeps an unsaved login in
+                // place.
+                match settle_bare_keychain_item(source, writer) {
+                    Ok(crate::claude::BareItemSettle::Settled(settled)) => {
+                        if let Some(notice) = &settled.notice {
+                            crate::logline::logline!("clauth: {notice}");
+                        }
+                        if let Ok(mut boot) = boot_bare_item.lock() {
+                            *boot = Some(settled.placed);
+                        }
+                        let _placed = enter_bare_item_placement(settled.placed);
+                        let _ = link_profile_credentials(&active);
+                        answer.disarm();
+                    }
+                    Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced)) => {
+                        answer.send(BareItemOutcome::Settled(Ok(
+                            crate::claude::BareItemSettle::NeedsChoice(unplaced),
+                        )));
+                    }
+                    Err(e) => {
+                        crate::logline::logline!("clauth: {e:#}");
+                        let _ = link_profile_credentials(&active);
+                        answer.disarm();
+                    }
+                }
             }
 
             // The store seed runs synchronously at the gate
@@ -4773,13 +6638,15 @@ impl App {
             // `third_party_entries` are the enabled-only work-lists that drive
             // that marking — a display-only name is never queued for a fetch it
             // will never get.
-            let (snapshot, third_party_entries) = {
+            let (seeds, third_party_entries) = {
                 let cfg = Self::lock_config(&h.config);
                 (
-                    collect_tokens(&cfg),
-                    collect_third_party_entries(&cfg.profiles),
+                    crate::usage::collect_token_seeds(&cfg),
+                    crate::usage::collect_third_party_entries(&cfg.profiles),
                 )
             };
+            // Anchor + stored-token reads run after the guard drops.
+            let snapshot = crate::usage::build_token_entries(seeds);
             let interval_ms = h.refresh_interval.load(Ordering::Relaxed);
 
             // Seeded-but-due and stale/missing profiles are fetched by the
@@ -4925,7 +6792,25 @@ impl App {
             &third_party_names,
             &polled,
         );
+        // The caption names where the walk lands, so it honours the live skip
+        // set — but it runs every frame, so it READS the set as the last scan
+        // left it (no `stored_login` read, no write): the scan already heals
+        // each cadence, and the render path never reads disk per frame.
+        snapshot.skipped_unreadable =
+            crate::usage::read_skipped_unreadable(&self.skipped_unreadable)
+                .into_iter()
+                .collect();
         snapshot.broken.extend(key_rejected.iter().cloned());
+        // The walk passes over a member on record as refusing a credit-billed
+        // request in its headroom and home passes and takes it after its
+        // serving-sink pass, off the copy `sync_credit_refusals` keeps.
+        snapshot.credit_skip = snapshot
+            .chain
+            .iter()
+            .map(|m| &m.name)
+            .filter(|name| self.credit_refusals.contains_key(*name))
+            .cloned()
+            .collect();
         let active_usage = usage.get(active.as_str()).cloned();
         let active_threshold = snapshot
             .chain
@@ -4961,6 +6846,8 @@ impl App {
             &projected,
             &third_party_names,
             crate::fallback::ActiveBurnRate::Supplied(active_rate),
+            false,
+            false,
         );
         AutoSwitchProjection {
             action,
@@ -5005,6 +6892,13 @@ impl App {
     /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,
     /// applies usage, runs startup auto-switch. No HTTP.
     fn finish_bootstrap(&mut self) {
+        // An exit wait starts no new write: a `BootstrapDone` that lands during
+        // the wait must not relink credentials or run the startup auto-switch
+        // after the user quit. The worker's `BootstrapDoneGuard` clears
+        // `bootstrap_active` before it posts this signal, so nothing waits on it.
+        if self.exit_wait {
+            return;
+        }
         self.refresh_tokens();
         self.start_scheduler();
         self.apply_usage();
@@ -5024,6 +6918,16 @@ impl App {
         // auto-switches off the corrected numbers.
         let switched = {
             let (active_fresh, rate) = self.active_bootstrap_state();
+            // The one-shot may switch or switch off under its own locks, over
+            // the bare item the bootstrap worker settled for its relink; it
+            // holds that settle's placement and settles nothing itself. With
+            // no settle to hold (one the user must answer, or one that
+            // failed) the one-shot skips: the scheduler's next decision
+            // reaches the switch gate, which settles again.
+            let boot_placed = self.boot_bare_item.lock().ok().and_then(|mut b| b.take());
+            let _placed = boot_placed.map(enter_bare_item_placement);
+            let active_fresh =
+                active_fresh && (self.bare_item_source.is_none() || boot_placed.is_some());
             if active_fresh {
                 // In-memory rate only (`history_cache`) — never a disk read
                 // under any guard; see `active_burn_rate`.
@@ -5074,11 +6978,6 @@ impl App {
     /// Bundle scheduler `Arc`s and launch the background refresher.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
-        // Session-scoped suppressed-auth-expired set: rebuilt fresh each TUI launch,
-        // dropped on exit. Purely scheduler-internal — the App never touches it
-        // (manual refresh clears suppression via the shared forced queue).
-        let suppressed_auth_expired: SuppressedAuthExpiredStore =
-            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -5091,6 +6990,7 @@ impl App {
             h.poll_streaks,
             h.kick_blocks,
             h.auto_start_queue,
+            h.weekly_reset_kicks,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -5099,7 +6999,8 @@ impl App {
             h.third_party_status,
             h.third_party_streaks,
             h.third_party_broken,
-            suppressed_auth_expired,
+            h.skipped_unreadable,
+            h.suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
             // like any instance, standing its refresher down while another holds
@@ -5111,21 +7012,84 @@ impl App {
             // Pinned by construction, not a test: no test drives this call site
             // (`spawn_refresher` builds its own state under `cfg!(test)`).
             true,
+            h.snapshot,
         );
     }
 
+    /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
+    /// the UI thread reaches the same maps the refresh thread shares.
+    fn memory_stores(&self) -> MemoryStores {
+        MemoryStores {
+            usage: Arc::clone(&self.usage_store),
+            usage_status: Arc::clone(&self.usage_status),
+            last_fetched: Arc::clone(&self.last_fetched),
+            next_refresh: Arc::clone(&self.next_refresh_per_profile),
+            poll_streaks: Arc::clone(&self.poll_streaks),
+            kick_blocks: Arc::clone(&self.kick_blocks),
+            weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            auto_start_queue: Arc::clone(&self.auto_start_queue),
+            third_party_usage: Arc::clone(&self.third_party_usage_store),
+            third_party_status: Arc::clone(&self.third_party_status),
+            third_party_streaks: Arc::clone(&self.third_party_streaks),
+            third_party_broken: Arc::clone(&self.third_party_broken),
+            suppressed: Arc::clone(&self.suppressed_auth_expired),
+            interval_ms: Arc::clone(&self.refresh_interval),
+            snapshot: Arc::clone(&self.snapshot),
+        }
+    }
+
+    /// Drain the forgets a change site noted and apply each to memory, with no
+    /// config guard held (the stores rank BELOW `Config`).
+    fn apply_forgets(&self) {
+        apply_pending_forgets(&self.memory_stores());
+    }
+
+    /// Save one in-TUI state delta: apply `f` to a fresh read under the state
+    /// flock, adopt the saved state, and toast the house `save failed` copy
+    /// when the write fails, leaving the in-memory state as it was. Returns
+    /// whether the save landed.
+    fn save_state_delta(&mut self, f: impl FnOnce(&mut AppState, &StateLockHeld)) -> bool {
+        let result = {
+            let mut cfg = self.config();
+            update_app_state(f).map(|state| cfg.state = state)
+        };
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
+                false
+            }
+        }
+    }
+
     /// Build the per-frame readings snapshot. The picker's per-name
-    /// classification is read under a transient config guard, DROPPED before
+    /// classification and the refused setup tokens (off the dead-login set,
+    /// read before) are read under a transient config guard, DROPPED before
     /// any store lock is taken (the stores rank BELOW `Config`, so holding both
     /// would invert the order the debug build asserts on); the four stores are
     /// then locked once each, in rank order, and released.
     pub(crate) fn readings_snapshot(&self) -> ReadingsSnapshot {
-        let third_party: HashMap<String, bool> = {
+        // The dead-login set the `⊘` reads, so the card and the mark never
+        // judge one account apart.
+        let key_rejected = self.key_rejected_names();
+        let (third_party, token_refused): (HashMap<String, bool>, HashSet<String>) = {
             let cfg = self.config();
-            cfg.profiles
-                .iter()
-                .map(|p| (p.name.to_string(), p.usage_cache_is_third_party()))
-                .collect()
+            (
+                cfg.profiles
+                    .iter()
+                    .map(|p| (p.name.to_string(), p.usage_cache_is_third_party()))
+                    .collect(),
+                cfg.profiles
+                    .iter()
+                    .filter(|p| {
+                        crate::usage::dead_login_is_setup_token(p) && key_rejected.contains(&p.name)
+                    })
+                    .map(|p| p.name.to_string())
+                    .collect(),
+            )
         };
         // ThirdPartyUsage 270, ThirdPartyStatus 280, Usage 300, UsageStatus 350.
         // A poisoned lock still holds the last good figure: read through it, or
@@ -5165,8 +7129,13 @@ impl App {
             ) {
                 usage.insert(name.clone(), info);
             }
-            // Fetch status follows the picker's side too.
-            let status = if *tp {
+            // Fetch status follows the picker's side too, but a refused setup
+            // token reads as the dead login it is ahead of both: a stored pair
+            // keeps its `/usage` poll fresh while every session a switch starts
+            // runs on the token, and with the probe off nothing writes a status.
+            let status = if token_refused.contains(name) {
+                Some(FetchStatus::AuthExpired)
+            } else if *tp {
                 third_party_status.get(name).copied()
             } else if status_store.contains_key(name) {
                 status_store.get(name).copied()
@@ -5202,6 +7171,7 @@ impl App {
             let mut wallet_names = Vec::new();
             for p in &cfg.profiles {
                 let name = p.name.to_string();
+                let interval_ms = crate::usage::usage_interval_ms(p, interval_ms);
                 // #74 degraded cue: cache age past the derived threshold reads
                 // stale, independent of fetch_status. Same threshold, same
                 // maxed-window exemption, and same age source as
@@ -5253,6 +7223,13 @@ impl App {
             (bells, history_names, wallet_names, stale_map)
         };
         self.stale_cues = stale_map;
+        // `bells` is the full profile set this pass observed, so an account
+        // deleted while ringing forgets and re-arms if re-created past the line.
+        {
+            let present: HashSet<&str> =
+                bells.iter().map(|(name, _, _, _)| name.as_str()).collect();
+            self.bell_fired.forget_absent(&present);
+        }
         for (name, threshold, util, fresh) in bells {
             if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
                 self.toast(ToastKind::Warning, message);
@@ -5298,11 +7275,60 @@ impl App {
     /// Flips come from the live file moving (a login minted elsewhere), the
     /// profile set changing, or a switch swapping the live file — every site
     /// that can produce one calls this (see the field's list).
+    /// The snapshot reads the macOS Keychain item (a `security` call), so it
+    /// runs on a worker and lands through [`drain_unsaved_live_login`]. A test
+    /// computes it in place: a detached worker would outlive the test's
+    /// `HomeSandbox` (the [`spawn_switch_gate`] precedent).
     pub(crate) fn refresh_unsaved_live_login(&mut self) {
-        self.unsaved_live_login = capture_snapshot().is_ok_and(|snap| {
-            !snapshot_is_empty(&snap)
-                && find_matching_oauth_profile(&self.config(), snap.credentials.as_ref()).is_none()
+        let config = Arc::clone(&self.config);
+        let unsaved = move || {
+            capture_snapshot().is_ok_and(|snap| {
+                !snapshot_is_empty(&snap)
+                    && find_matching_oauth_profile(
+                        &Self::lock_config(&config),
+                        snap.credentials.as_ref(),
+                    )
+                    .is_none()
+            })
+        };
+        if cfg!(test) {
+            self.unsaved_live_login = unsaved();
+            return;
+        }
+        self.unsaved_login_generation += 1;
+        let generation = self.unsaved_login_generation;
+        let tx = self.unsaved_login_tx.clone();
+        spawn_worker(move || {
+            let _ = tx.send((generation, unsaved()));
         });
+    }
+
+    /// Refresh the two form predicates the render path reads from the cache —
+    /// the shunt `+ login`'s disabled reason and the operator-codex
+    /// capturable flag. Computed on the tick (never per frame), the
+    /// [`Self::unsaved_live_login`] precedent: each is a handful of disk reads
+    /// the render path must not make.
+    pub(crate) fn refresh_form_predicates(&mut self) {
+        self.shunt_add_disabled = shunt_add_disabled_reason();
+        self.codex_operator_capturable = crate::actions::codex_operator_login_capturable();
+    }
+
+    /// The one predicate for whether the shunt form's `+ login` is disabled:
+    /// live while this form's own add is in flight (its raw paste door is
+    /// open, the same identity ⏎ reopens by), and `None` off the shunt form
+    /// (the selection is not Setup's `+ new`, or the draft's type is not
+    /// shunt) — so a claude or codex `+ new` login and an existing account's
+    /// re-login never inherit the shunt reason. Else the tick's cached reason.
+    /// The render (the row's faint style and its `└` reason), the footer hints
+    /// and ⏎ in `start_shunt_add` all read this, so they can never disagree.
+    pub(crate) fn shunt_login_disabled(&self) -> Option<String> {
+        if self.shunt_paste.is_some() {
+            return None;
+        }
+        if !new_account_type_is_shunt(self) {
+            return None;
+        }
+        self.shunt_add_disabled.clone()
     }
 
     /// Reload config if state mtime changed. Returns true on reload.
@@ -5312,27 +7338,67 @@ impl App {
             return false;
         }
         if let Ok(fresh) = load_config() {
+            // Capture Setup's selection BEFORE the swap, so the tick's clamp
+            // can keep `+ new` on the trailing row even when the roster moved
+            // (a post-swap cursor read cannot tell `+ new` from a deleted last
+            // account). The delete and tab-switch clamps never read this flag.
+            self.reload_was_on_new =
+                self.tab == Tab::Setup && self.setup_selection() == SetupSelection::New;
+            let profile_names: Vec<ProfileName> =
+                fresh.profiles.iter().map(|p| p.name.clone()).collect();
+            let probes_off = crate::usage::probes_switched_off(&self.config(), &fresh);
             *self.config() = fresh;
-            self.last_reload_fp = current;
-            // Collect under the config guard, then DROP it before locking the
-            // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
-            // them while config is held inverts the global lock order (same shape
-            // as `refresh_tokens`).
-            let (tokens, third_party, third_party_seed_names, names, broken_seed) = {
+            // Snapshot under the config guard, then DROP it before the disk
+            // reads AND before locking the token mutexes — the anchor read must
+            // not widen the config-lock hold, and TOKENS/THIRD_PARTY rank
+            // OUTSIDE CONFIG, so writing them while config is held inverts the
+            // global lock order (same shape as `refresh_tokens`).
+            let (seeds, third_party, third_party_seed_names, names) = {
                 let cfg = self.config();
-                let tokens = collect_tokens(&cfg);
-                let third_party = collect_third_party_entries(&cfg.profiles);
-                let third_party_seed_names = collect_third_party_seed_names(&cfg);
-                let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
-                let broken_seed = Self::durable_key_rejected_seed(&cfg);
                 (
-                    tokens,
-                    third_party,
-                    third_party_seed_names,
-                    names,
-                    broken_seed,
+                    crate::usage::collect_token_seeds(&cfg),
+                    crate::usage::collect_third_party_entries(&cfg.profiles),
+                    collect_third_party_seed_names(&cfg),
+                    cfg.profiles
+                        .iter()
+                        .map(|p| p.name.to_string())
+                        .collect::<Vec<String>>(),
                 )
             };
+            let tokens = crate::usage::build_token_entries(seeds);
+            // The reload re-read disk, so it adopts the fingerprint it just
+            // re-read. The token list is rebuilt BEFORE the compare's forget
+            // (the epoch bump): a partition landing between the two must clone
+            // the REBUILT entry, never the old entry under a post-bump epoch —
+            // that pairing stamps cadence for the old credential and delays
+            // the new login's first fetch. The reverse window, a partition
+            // between the rebuild and the compare while the snapshot half
+            // still holds the old identity, drops the rebuilt entry as stale
+            // for one tick; it self-heals on the next compare, never a wrong
+            // reading.
+            #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            {
+                *self
+                    .usage_tokens
+                    .lock()
+                    .expect("usage_tokens mutex poisoned") = tokens;
+                *self
+                    .third_party_tokens
+                    .lock()
+                    .expect("third_party_tokens mutex poisoned") = third_party;
+            }
+            // The compare runs after the token-list write, and BEFORE the store
+            // seeds and the broken-verdict union-add below: the union-add must
+            // re-add a re-keyed name's verdict AFTER the compare cleared it, so
+            // the seeded verdict survives the reload.
+            crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+            // A probe switched off in another process leaves the account here
+            // as the switch-off in this one does. After the compare, since its
+            // forget re-seeds the reading from disk.
+            for name in &probes_off {
+                crate::usage::forget_probe_reading(&self.memory_stores(), name);
+            }
+            self.last_reload_fp = current;
             // Seed from disk the display-superset names the store lacks (a
             // profile added since the last load). A name the store already
             // holds keeps its live reading, status and cadence stamp: the disk
@@ -5358,28 +7424,15 @@ impl App {
                 &[],
                 self.refresh_interval.load(Ordering::Relaxed),
             );
-            #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            {
-                *self
-                    .usage_tokens
-                    .lock()
-                    .expect("usage_tokens mutex poisoned") = tokens;
-                *self
-                    .third_party_tokens
-                    .lock()
-                    .expect("third_party_tokens mutex poisoned") = third_party;
-                // Union-add the durable seed: it can only ADD names whose record
-                // matches the CURRENT fingerprint, and a re-keyed name still
-                // drops at the intersection in `key_rejected_names`. A recovered
-                // name can flicker back in for at most one sync interval — the
-                // fetcher's error arm updates the live map before it clears the
-                // durable record, so a sync landing in that gap re-reads the
-                // still-standing record — and the next `sync_broken_verdicts`
-                // pass drops it again.
-                if let Ok(mut broken) = self.third_party_broken.lock() {
-                    broken.extend(broken_seed);
-                }
-            }
+            // Union-add the durable seed: it can only ADD names whose record
+            // matches the CURRENT fingerprint, and a re-keyed name still
+            // drops at the intersection in `key_rejected_names`. A recovered
+            // name can flicker back in for at most one sync interval — the
+            // fetcher's error arm updates the live map before it clears the
+            // durable record, so a sync landing in that gap re-reads the
+            // still-standing record — and the next `sync_broken_verdicts`
+            // pass drops it again.
+            crate::usage::seed_dead_logins(&self.config, &self.third_party_broken);
             self.session_tokens = collect_session_tokens(&names);
             self.refresh_unsaved_live_login();
             repin_member_edit(self);
@@ -5390,10 +7443,17 @@ impl App {
     }
 
     pub(crate) fn refresh_tokens(&self) {
-        // Drop `config` lock before taking `usage_tokens` — folding them would
-        // invert lock order (TOKENS is outer of CONFIG).
-        let tokens = collect_tokens(&self.config());
-        let third_party = collect_third_party_entries(&self.config().profiles);
+        // Snapshot under the config lock, drop it, THEN read each profile's
+        // anchor + stored token off disk — the anchor read must not widen the
+        // config-lock hold.
+        let (seeds, third_party) = {
+            let cfg = self.config();
+            (
+                crate::usage::collect_token_seeds(&cfg),
+                crate::usage::collect_third_party_entries(&cfg.profiles),
+            )
+        };
+        let tokens = crate::usage::build_token_entries(seeds);
         #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
             *self
@@ -5412,13 +7472,20 @@ impl App {
     /// `/profile`, keeping the global refresh light on the rate-limited host.
     pub(crate) fn manual_refresh(&self) {
         #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let names: Vec<ProfileName> = self
+        let mut names: Vec<ProfileName> = self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned")
             .iter()
             .map(|e| e.name.clone())
             .collect();
+        // The probe leg builds its list each tick, so its members come off the
+        // config.
+        names.extend(
+            crate::usage::collect_probe_seeds(&self.config())
+                .into_iter()
+                .map(|(name, _)| name),
+        );
         for name in names {
             self.enqueue_refetch(&name, false);
         }
@@ -5461,7 +7528,39 @@ impl App {
     /// action closed one.
     pub(crate) fn open_modal(&mut self, modal: Modal) {
         self.services.land_on_herdr = false;
+        self.modal_generation
+            .set(self.modal_generation.get().wrapping_add(1));
+        // Opening any modal (help, the action menu, a confirm, a login) moves
+        // focus away: an armed codex/pool 2-step disarms and its label restores
+        // (the cloudy-tui Inline 2-step rule).
+        disarm_codex_2step(self);
+        disarm_pool_2step(self);
         self.modals.push(modal);
+    }
+
+    /// Every modal closes here. The [`open_modal`] bump alone carries the
+    /// scroll soundness (a reopen bumps the generation past any bound published
+    /// before it), so the close bump is belt-and-braces.
+    pub(crate) fn pop_modal(&mut self) -> Option<Modal> {
+        let popped = self.modals.pop();
+        if popped.is_some() {
+            self.modal_generation
+                .set(self.modal_generation.get().wrapping_add(1));
+        }
+        popped
+    }
+
+    /// Drop every modal matching `pred` and bump the modal generation once
+    /// when any dropped, so a scroll bound published before the close is
+    /// stale. The login modals close through here; [`pop_modal`] covers the
+    /// top-modal pop.
+    fn retain_modals(&mut self, pred: impl Fn(&Modal) -> bool) {
+        let before = self.modals.len();
+        self.modals.retain(pred);
+        if self.modals.len() != before {
+            self.modal_generation
+                .set(self.modal_generation.get().wrapping_add(1));
+        }
     }
 
     /// Every write of [`App::gateway_state`] after construction lands here.
@@ -5492,15 +7591,18 @@ impl App {
 
     /// Disarm the 2-step quit and clear its accompanying footer alert.
     /// Only call this when the armed-quit sequence is interrupted (key switch,
-    /// tab change, etc.). For `x`-dismiss of an alert produced by a non-quit
-    /// condition, clear `footer_alert` directly instead.
+    /// tab change, etc.).
     pub(crate) fn disarm_quit(&mut self) {
-        self.armed_quit = false;
+        self.armed_quit = None;
         self.footer_alert = None;
     }
 
     pub(crate) fn prune_toasts(&mut self) {
+        let checking = self.bare_item_checks.load(Ordering::Acquire) > 0;
         self.toasts.retain(|toast| {
+            if toast.body == BARE_ITEM_CHECKING {
+                return checking;
+            }
             let ttl = if toast.kind == ToastKind::Danger {
                 TOAST_TTL_DANGER
             } else {
@@ -5550,15 +7652,105 @@ impl App {
 
     // ── Main list ────────────────────────────────────────────────────────────
 
+    /// The Overview's visible item list under its current harness filter.
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        let mut rows = Vec::new();
-        if self.harness_filter.shows_claude() {
-            rows.extend((0..self.profile_count()).map(MainItemKind::Profile));
+        self.main_items_for(self.harness_filter)
+    }
+
+    /// The flat item list for `filter`: the [`App::band_entries`] items in
+    /// walk order. One producer with the filter as a parameter — the Overview
+    /// passes its filter, Setup passes [`HarnessFilter::All`] — so the two
+    /// lists can never drift.
+    pub(crate) fn main_items_for(&self, filter: HarnessFilter) -> Vec<MainItemKind> {
+        self.band_entries(filter)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                BandEntry::Item(item) => Some(item),
+                BandEntry::Spacer | BandEntry::Heading(_) => None,
+            })
+            .collect()
+    }
+
+    /// The shared band walk: claude rows first (no chrome), then the codex
+    /// band, then the shunt band, each introduced by a blank spacer when rows
+    /// precede it and a section heading. Both selectors render from this one
+    /// walk — the Overview's `draw_overview_accounts` and Setup's `draw_selector`
+    /// derive their rows, headings, spacers and order from it, and each lifts a
+    /// heading only while a row under it holds focus via [`App::heading_ranges`].
+    pub(crate) fn band_entries(&self, filter: HarnessFilter) -> Vec<BandEntry> {
+        let claude_count = if filter.shows_claude() {
+            self.profile_count()
+        } else {
+            0
+        };
+        let codex_count = if filter.shows_codex() {
+            self.codex_rows.len()
+        } else {
+            0
+        };
+        let mut entries = Vec::new();
+        entries.extend((0..claude_count).map(|i| BandEntry::Item(MainItemKind::Profile(i))));
+        if codex_count > 0 {
+            if claude_count > 0 {
+                entries.push(BandEntry::Spacer);
+            }
+            entries.push(BandEntry::Heading("codex".to_string()));
+            entries.extend((0..codex_count).map(|i| BandEntry::Item(MainItemKind::Codex(i))));
         }
-        if self.harness_filter.shows_codex() {
-            rows.extend((0..self.codex_rows.len()).map(MainItemKind::Codex));
+        match (&self.shunt_pool, filter.shows_shunt()) {
+            (ShuntPool::Read(providers), true) if !providers.is_empty() => {
+                if claude_count + codex_count > 0 {
+                    entries.push(BandEntry::Spacer);
+                }
+                for (pi, provider) in providers.iter().enumerate() {
+                    entries.push(BandEntry::Heading(format!(
+                        "shunt ({})",
+                        escape_control(&provider.name)
+                    )));
+                    entries.extend(
+                        (0..provider.accounts.len())
+                            .map(|ai| BandEntry::Item(MainItemKind::Shunt(pi, ai))),
+                    );
+                }
+            }
+            (ShuntPool::NotRead(reason), true) => {
+                if claude_count + codex_count > 0 {
+                    entries.push(BandEntry::Spacer);
+                }
+                entries.push(BandEntry::Heading(format!(
+                    "shunt — not read: {}",
+                    escape_control(reason)
+                )));
+            }
+            _ => {}
         }
-        rows
+        entries
+    }
+
+    /// The flat item range each heading covers, in entry order:
+    /// `(entry_index, flat_start, flat_end)` (end exclusive). One shared walk
+    /// so the Overview and Setup selectors agree on which heading lifts when a
+    /// row under it holds focus.
+    pub(crate) fn heading_ranges(entries: &[BandEntry]) -> Vec<(usize, usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut flat = 0;
+        let mut open: Option<(usize, usize)> = None;
+        for (i, entry) in entries.iter().enumerate() {
+            match entry {
+                BandEntry::Heading(_) => {
+                    if let Some((hi, s)) = open.take() {
+                        ranges.push((hi, s, flat));
+                    }
+                    open = Some((i, flat));
+                }
+                BandEntry::Item(_) => flat += 1,
+                BandEntry::Spacer => {}
+            }
+        }
+        if let Some((hi, s)) = open.take() {
+            ranges.push((hi, s, flat));
+        }
+        ranges
     }
 
     pub(crate) fn profile_count(&self) -> usize {
@@ -5572,8 +7764,8 @@ impl App {
     /// Clamp `profile_cursor` to `0..profile_count`.
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
-        self.profile_cursor = self.profile_cursor.min(max);
-        self.clamp_overview_cursor();
+        self.profile_cursor.set(self.profile_cursor.read().min(max));
+        self.place_overview_cursor();
         // Every reload path lands here (a roster change can move or remove the
         // selected account), so the note tracks the selection for free.
         self.reload_selected_note();
@@ -5582,7 +7774,7 @@ impl App {
     /// Re-read the selected account's note from disk.
     pub(crate) fn reload_selected_note(&mut self) {
         self.note_text = self
-            .profile_name_at(self.profile_cursor)
+            .profile_name_at(self.profile_cursor.read())
             .and_then(|name| crate::profile_notes::load_note(&name));
     }
 
@@ -5590,16 +7782,487 @@ impl App {
         self.main_items().get(self.overview_cursor).copied()
     }
 
-    fn clamp_overview_cursor(&mut self) {
-        self.overview_cursor = self
-            .overview_cursor
-            .min(self.main_items().len().saturating_sub(1));
+    /// Setup's flat item list: the Overview's items under the all-filter. Its
+    /// `len()` is the trailing `+ new` row.
+    pub(crate) fn setup_items(&self) -> Vec<MainItemKind> {
+        self.main_items_for(HarnessFilter::All)
     }
 
+    /// What Setup's selector has selected: a harness item, or the trailing
+    /// `+ new`. A claude row is `profile_cursor` itself (its `+ new` synthetic
+    /// at `profile_count()`); a codex or pool row is the stored identity in
+    /// [`App::setup`], resolved to its index against the current lists. A
+    /// hidden identity lives in the slot's `remembered` alone, so the shown
+    /// selection IS the first row; a read list that dropped the identity is
+    /// re-homed by [`App::rehome_setup_selection`] on the tick.
+    pub(crate) fn setup_selection(&self) -> SetupSelection {
+        if let Some(item) = &self.setup.item
+            && let Some(resolved) = self.resolve_setup_item(item)
+        {
+            return SetupSelection::Item(resolved);
+        }
+        if self.profile_cursor.read() >= self.profile_count() {
+            SetupSelection::New
+        } else {
+            SetupSelection::Item(MainItemKind::Profile(self.profile_cursor.read()))
+        }
+    }
+
+    /// Resolve a stored Setup identity to its current `MainItemKind` index;
+    /// `None` when the current lists no longer hold it.
+    fn resolve_setup_item(&self, item: &SetupItem) -> Option<MainItemKind> {
+        match item {
+            SetupItem::Codex(name) => self
+                .codex_rows
+                .iter()
+                .position(|row| row.name == *name)
+                .map(MainItemKind::Codex),
+            SetupItem::Pool { provider, account } => {
+                let ShuntPool::Read(providers) = &self.shunt_pool else {
+                    return None;
+                };
+                providers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, p)| p.name == *provider)
+                    .and_then(|(pi, p)| {
+                        p.accounts
+                            .iter()
+                            .position(|a| a.name == account.as_str())
+                            .map(|ai| MainItemKind::Shunt(pi, ai))
+                    })
+            }
+        }
+    }
+
+    /// Whether the identity is still held — a codex name in the roster, a pool
+    /// `(provider, account)` in a read listing, or a pool hidden by an unread
+    /// listing (which keeps its rows like a filter, never drops them).
+    fn holds_setup_item(&self, item: &SetupItem) -> bool {
+        match item {
+            SetupItem::Codex(name) => self.codex_rows.iter().any(|row| row.name == *name),
+            SetupItem::Pool { provider, account } => match &self.shunt_pool {
+                ShuntPool::Read(providers) => providers.iter().any(|p| {
+                    p.name == *provider && p.accounts.iter().any(|a| a.name == account.as_str())
+                }),
+                ShuntPool::NotRead(_) | ShuntPool::Absent => true,
+            },
+        }
+    }
+
+    /// The identity for a resolved harness item; `None` for a claude row (the
+    /// shared cursor is its own identity).
+    fn setup_item_for(&self, item: MainItemKind) -> Option<SetupItem> {
+        match item {
+            MainItemKind::Codex(i) => self
+                .codex_rows
+                .get(i)
+                .map(|row| SetupItem::Codex(row.name.clone())),
+            MainItemKind::Shunt(pi, ai) => {
+                let (account, _) = self.shunt_pool_row(pi, ai)?;
+                let provider = pool_provider_name(self, pi)?;
+                let account = account.name.clone();
+                Some(SetupItem::Pool { provider, account })
+            }
+            MainItemKind::Profile(_) => None,
+        }
+    }
+
+    /// The flat cursor position of the current Setup selection (an index into
+    /// [`App::setup_items`], its `len()` the trailing `+ new` row) — the input
+    /// to the wrapping ↑↓ step. A held-but-hidden identity (an unread pool)
+    /// shows on the first row, the Overview's placement rule.
+    pub(crate) fn setup_position(&self) -> usize {
+        let items = self.setup_items();
+        match self.setup_selection() {
+            SetupSelection::New => items.len(),
+            SetupSelection::Item(item) => items.iter().position(|row| *row == item).unwrap_or(0),
+        }
+    }
+
+    /// The selection slot `kind` owns.
+    fn selection_slot(&self, kind: SelectionSlotKind) -> &HeldSelection {
+        match kind {
+            SelectionSlotKind::Setup => &self.setup,
+            SelectionSlotKind::Usage => &self.usage,
+        }
+    }
+
+    fn selection_slot_mut(&mut self, kind: SelectionSlotKind) -> &mut HeldSelection {
+        match kind {
+            SelectionSlotKind::Setup => &mut self.setup,
+            SelectionSlotKind::Usage => &mut self.usage,
+        }
+    }
+
+    /// Land a tab's selection on flat position `pos`: a codex or pool item is
+    /// stored as its [`SetupItem`] identity (leaving `profile_cursor` alone); a
+    /// claude row or `+ new` clears it and moves the shared cursor. A move is a
+    /// choice of a new row, so it replaces the slot's held-but-hidden identity
+    /// (`remembered`) and drops a pending pool landing. A shared-claude-cursor
+    /// move bumps the move count, which the restore gate in
+    /// [`App::rehome_selection`] reads; the other slot's clear rides the user
+    /// step alone ([`App::step_selection`]), never this placement path, so a
+    /// rehome clears nothing. Setup's past-end (`+ new`) and Usage's past-end
+    /// differ only in where the shared cursor rests.
+    fn place_selection(&mut self, kind: SelectionSlotKind, pos: usize) {
+        self.selection_slot_mut(kind).clear();
+        self.pending_pool_landing = None;
+        match self.setup_items().get(pos) {
+            Some(item @ (MainItemKind::Codex(_) | MainItemKind::Shunt(..))) => {
+                if let Some(identity) = self.setup_item_for(*item) {
+                    let slot = self.selection_slot_mut(kind);
+                    slot.item = Some(identity);
+                    slot.index = Some(pos);
+                }
+            }
+            Some(MainItemKind::Profile(i)) => {
+                let slot = self.selection_slot_mut(kind);
+                slot.item = None;
+                slot.index = None;
+                if self.profile_cursor.read() != *i {
+                    self.profile_cursor.set(*i);
+                    self.reload_selected_note();
+                }
+            }
+            None => {
+                let slot = self.selection_slot_mut(kind);
+                slot.item = None;
+                slot.index = None;
+                self.profile_cursor.set(match kind {
+                    SelectionSlotKind::Setup => self.profile_count(),
+                    SelectionSlotKind::Usage => self.profile_count().saturating_sub(1),
+                });
+            }
+        }
+    }
+
+    fn place_setup_selection(&mut self, pos: usize) {
+        self.place_selection(SelectionSlotKind::Setup, pos);
+    }
+
+    /// A user step (a ↑/↓ or page key, never a rehome) lands `kind`'s
+    /// selection on flat position `pos`. A step whose row actually changed ends
+    /// the other tab's held-but-hidden identity — the Overview's rule
+    /// ([`App::move_overview_cursor`]): any index change clears the hold, and
+    /// the shared claude cursor's move count cannot see all of them (a step off
+    /// a codex/pool row onto the claude row the cursor already holds moves no
+    /// count). The clear reaches Setup <-> Usage only; the Overview's own
+    /// `overview_remembered` is untouched. It rides only this user-move path,
+    /// so a rehome's own `place_selection` (a listing blip, no user move) never
+    /// ends the other tab's hold.
+    fn step_selection(&mut self, kind: SelectionSlotKind, pos: usize) {
+        let current = match kind {
+            SelectionSlotKind::Setup => self.setup_position(),
+            SelectionSlotKind::Usage => self.usage_position(),
+        };
+        self.place_selection(kind, pos);
+        if current != pos {
+            self.selection_slot_mut(kind.other()).clear();
+        }
+    }
+
+    /// The flat [`App::setup_items`] index `item` sits at (a claude row's is
+    /// its profile index; `+ new` is the list's `len()`).
+    fn flat_index_of(&self, item: MainItemKind) -> usize {
+        self.setup_items()
+            .iter()
+            .position(|row| *row == item)
+            .unwrap_or(0)
+    }
+
+    /// Ascend a tab out of its descended pane before a re-place lands it on a
+    /// different row.
+    fn leave_selection_detail(&mut self, kind: SelectionSlotKind) {
+        match kind {
+            SelectionSlotKind::Setup => {
+                if self.config_focus == ConfigFocus::Actions {
+                    leave_config_detail(self);
+                }
+            }
+            SelectionSlotKind::Usage => {
+                if self.usage_detail_focus == StatusFocus::Detail {
+                    self.usage_detail_focus = StatusFocus::List;
+                }
+            }
+        }
+    }
+
+    /// Re-place a tab's selection after the codex or pool snapshot changed,
+    /// the Overview's placement rule. Runs only while the slot's own tab shows
+    /// (the Overview's precedent: [`App::place_overview_cursor`] returns early
+    /// off the Overview), so a pool read on another tab never rewrites the
+    /// shared claude cursor its row is. A selection that still resolves stays
+    /// (its flat index refreshed beside it); a hidden-but-held one (an unread
+    /// pool) ascends out of the detail, holds the identity separately in the
+    /// slot's `remembered` and shows on the first row; a dropped-for-good one
+    /// lands on the row now at the flat index it held, clamped to the last
+    /// item row (`+ new` only when no item row exists) — across bands, never
+    /// the shared claude cursor by accident. A held identity comes back only
+    /// while the shared claude cursor's move count still equals the one the
+    /// hide recorded (`remembered_moves`) — any writer that moves the cursor
+    /// makes the restore a no-op by construction.
+    fn rehome_selection(&mut self, kind: SelectionSlotKind) {
+        if self.tab != kind.tab() {
+            return;
+        }
+        // A held-but-hidden identity restores when the read returns it — only
+        // if the shared claude cursor has not moved since the hide's own
+        // placement.
+        if let Some(remembered) = self.selection_slot(kind).remembered.clone() {
+            let unmoved =
+                self.selection_slot(kind).remembered_moves == Some(self.profile_cursor.count());
+            if unmoved && let Some(resolved) = self.resolve_setup_item(&remembered) {
+                let index = self.flat_index_of(resolved);
+                let slot = self.selection_slot_mut(kind);
+                slot.item = Some(remembered);
+                slot.index = Some(index);
+                slot.remembered = None;
+                slot.remembered_moves = None;
+                return;
+            }
+            if !self.holds_setup_item(&remembered) {
+                self.selection_slot_mut(kind).clear();
+            }
+        }
+        let Some(item) = self.selection_slot(kind).item.clone() else {
+            return;
+        };
+        if let Some(resolved) = self.resolve_setup_item(&item) {
+            self.selection_slot_mut(kind).index = Some(self.flat_index_of(resolved));
+            return; // still resolves
+        }
+        if self.holds_setup_item(&item) {
+            // Hidden but held: ascend, hold the identity separately (like
+            // `overview_remembered`) and put the selection on the shown first
+            // row, recording the cursor's move count right after that
+            // placement. It comes back only while the count still equals it.
+            self.leave_selection_detail(kind);
+            if self.selection_slot(kind).remembered.is_none() {
+                self.place_selection(kind, 0);
+                let moves = self.profile_cursor.count();
+                let slot = self.selection_slot_mut(kind);
+                slot.remembered = Some(item);
+                slot.remembered_moves = Some(moves);
+            }
+            return;
+        }
+        // Dropped for good: the row now at the flat index it held, clamped to
+        // the last item row (`+ new` only when no item row exists), across
+        // bands.
+        let items = self.setup_items();
+        let held = self.selection_slot(kind).index.unwrap_or(0);
+        let pos = if items.is_empty() {
+            0
+        } else {
+            held.min(items.len() - 1)
+        };
+        self.place_selection(kind, pos);
+        self.leave_selection_detail(kind);
+    }
+
+    fn rehome_setup_selection(&mut self) {
+        self.rehome_selection(SelectionSlotKind::Setup);
+    }
+
+    fn rehome_usage_selection(&mut self) {
+        self.rehome_selection(SelectionSlotKind::Usage);
+    }
+
+    /// The current Setup selection as a codex-row index, `None` off a codex row.
+    pub(crate) fn setup_codex_index(&self) -> Option<usize> {
+        match self.setup_selection() {
+            SetupSelection::Item(MainItemKind::Codex(i)) if i < self.codex_rows.len() => Some(i),
+            _ => None,
+        }
+    }
+
+    /// The current Setup selection as a `(provider, account)` pool pair.
+    pub(crate) fn setup_pool_pair(&self) -> Option<(usize, usize)> {
+        match self.setup_selection() {
+            SetupSelection::Item(MainItemKind::Shunt(pi, ai)) => Some((pi, ai)),
+            _ => None,
+        }
+    }
+
+    /// What Usage has selected: always a harness item — a claude row is
+    /// `profile_cursor` itself, a codex or pool row is the stored identity in
+    /// [`App::usage`] resolved against the current lists. With no claude
+    /// profile the fallback is the first band item (a codex or pool row), so
+    /// the caret row and the pane agree; `New` (Setup's trailing `+ new`
+    /// variant) is produced only when no item exists at all, where the claude
+    /// pane draws its empty state. A hidden identity re-homes on the tick via
+    /// [`App::rehome_usage_selection`].
+    pub(crate) fn usage_selection(&self) -> SetupSelection {
+        if let Some(item) = &self.usage.item
+            && let Some(resolved) = self.resolve_setup_item(item)
+        {
+            return SetupSelection::Item(resolved);
+        }
+        if self.profile_count() > 0 {
+            return SetupSelection::Item(MainItemKind::Profile(
+                self.profile_cursor.read().min(self.profile_count() - 1),
+            ));
+        }
+        match self.setup_items().first() {
+            Some(item) => SetupSelection::Item(*item),
+            None => SetupSelection::New,
+        }
+    }
+
+    /// The flat cursor position of the current Usage selection (an index into
+    /// [`App::setup_items`]). A selection that no longer resolves (a hidden
+    /// pool) reads the first row, the Overview's placement rule.
+    pub(crate) fn usage_position(&self) -> usize {
+        let items = self.setup_items();
+        match self.usage_selection() {
+            SetupSelection::Item(item) => items.iter().position(|row| *row == item).unwrap_or(0),
+            SetupSelection::New => 0,
+        }
+    }
+
+    /// The current Usage selection as a codex-row index, `None` off a codex row.
+    pub(crate) fn usage_codex_index(&self) -> Option<usize> {
+        match self.usage_selection() {
+            SetupSelection::Item(MainItemKind::Codex(i)) if i < self.codex_rows.len() => Some(i),
+            _ => None,
+        }
+    }
+
+    /// The current Usage selection as a `(provider, account)` pool pair.
+    pub(crate) fn usage_pool_pair(&self) -> Option<(usize, usize)> {
+        match self.usage_selection() {
+            SetupSelection::Item(MainItemKind::Shunt(pi, ai)) => Some((pi, ai)),
+            _ => None,
+        }
+    }
+
+    /// The pool account and its provider's auth at `(provider, account)`.
+    pub(crate) fn shunt_pool_row(
+        &self,
+        pi: usize,
+        ai: usize,
+    ) -> Option<(
+        &crate::gateway_admin::PoolAccount,
+        &crate::gateway_admin::PoolAuth,
+    )> {
+        match &self.shunt_pool {
+            ShuntPool::Read(providers) => {
+                let provider = providers.get(pi)?;
+                Some((provider.accounts.get(ai)?, &provider.auth))
+            }
+            ShuntPool::NotRead(_) | ShuntPool::Absent => None,
+        }
+    }
+
+    /// Every provider serving the pool account named `name` under the auth mode
+    /// `auth`, control-escaped, in listing order — the pool detail's `provider`
+    /// row (` · `-joined). A provider serves an account only when its auth
+    /// family equals the account's (shunt stores accounts per family); kimi and
+    /// unknown modes, which have no family, match on the auth mode itself.
+    pub(crate) fn pool_providers_for(
+        &self,
+        auth: &crate::gateway_admin::PoolAuth,
+        name: &str,
+    ) -> Vec<String> {
+        let family = auth.clone().family();
+        match &self.shunt_pool {
+            ShuntPool::Read(providers) => providers
+                .iter()
+                .filter(|p| {
+                    p.accounts.iter().any(|a| a.name == name)
+                        && match family {
+                            Some(f) => p.auth.clone().family() == Some(f),
+                            None => p.auth.clone() == auth.clone(),
+                        }
+                })
+                .map(|p| escape_control(&p.name))
+                .collect(),
+            ShuntPool::NotRead(_) | ShuntPool::Absent => Vec::new(),
+        }
+    }
+
+    /// Whether the item universe still holds `item` (regardless of filter). A
+    /// row is gone only when its own list was read and lacks it; an unread
+    /// pool (`NotRead` / `Absent`) hides its rows like a filter, never drops
+    /// them, so the next read restores the cursor.
+    fn holds_item(&self, item: MainItemKind) -> bool {
+        match item {
+            MainItemKind::Profile(i) => i < self.profile_count(),
+            MainItemKind::Codex(i) => i < self.codex_rows.len(),
+            MainItemKind::Shunt(pi, ai) => match &self.shunt_pool {
+                ShuntPool::Read(providers) => {
+                    providers.get(pi).is_some_and(|p| ai < p.accounts.len())
+                }
+                ShuntPool::NotRead(_) | ShuntPool::Absent => true,
+            },
+        }
+    }
+
+    /// Place the Overview cursor on the remembered item's row when the current
+    /// view shows it; on row 0 when the item still exists but the filter hides
+    /// it (`c` never writes it); when the item set no longer holds it, or
+    /// nothing is remembered, keep the cursor's index clamped to the view and
+    /// remember the item now there. Identity stays by (kind, index); a
+    /// remembered claude row is `profile_cursor` itself, never a stored copy.
+    fn place_overview_cursor(&mut self) {
+        if self.tab != Tab::Overview {
+            return;
+        }
+        let items = self.main_items();
+        let remembered = match self.overview_remembered {
+            Some(MainItemKind::Profile(_)) => {
+                Some(MainItemKind::Profile(self.profile_cursor.read()))
+            }
+            other => other,
+        };
+        let target = remembered.and_then(|item| items.iter().position(|row| *row == item));
+        if let Some(idx) = target {
+            self.overview_cursor = idx;
+        } else {
+            match remembered {
+                Some(item) if self.holds_item(item) => {
+                    self.overview_cursor = 0;
+                }
+                _ => {
+                    self.overview_cursor = self.overview_cursor.min(items.len().saturating_sub(1));
+                    self.overview_remembered = items.get(self.overview_cursor).copied();
+                }
+            }
+        }
+        self.sync_overview_profile_selection();
+    }
+
+    /// The placement invariant: while the Overview shows and its cursor rests
+    /// on a claude row k, `profile_cursor == k`, so the `a` menu names the
+    /// highlighted claude row (off the Overview, entering it re-places first).
+    /// The note reloads only when the selection actually moved.
     fn sync_overview_profile_selection(&mut self) {
-        if let Some(MainItemKind::Profile(idx)) = self.current_main_item() {
-            self.profile_cursor = idx;
+        if let Some(MainItemKind::Profile(idx)) = self.current_main_item()
+            && self.profile_cursor.read() != idx
+        {
+            self.profile_cursor.set(idx);
             self.reload_selected_note();
+        }
+    }
+
+    /// A cursor-move key: when the index changed, the remembered item is the
+    /// one now under the cursor (a move onto a claude row remembers it as
+    /// `profile_cursor` itself). A key that leaves the index where it was (a
+    /// one-row view) remembers nothing — it was no choice of a new row.
+    fn move_overview_cursor(&mut self, next: usize) {
+        if next != self.overview_cursor {
+            self.overview_cursor = next;
+            self.overview_remembered = self.current_main_item();
+            self.sync_overview_profile_selection();
+            // A selection change on another tab replaces a held-but-hidden
+            // identity in both slots: the read must not restore it over this
+            // pick.
+            self.setup.clear();
+            self.usage.clear();
+            // And drops a pending pool landing: the user moved on, so the
+            // re-read must not yank the Overview onto the added row.
+            self.pending_pool_landing = None;
         }
     }
 }
@@ -5619,21 +8282,20 @@ impl App {
 /// [`reconcile_startup`] on the arms above, else from [`maybe_spawn_bootstrap`]
 /// at the gate.
 fn seed_startup_stores(app: &App) {
+    let interval_ms = app.refresh_interval.load(Ordering::Relaxed);
     let (seed_names, third_party, third_party_work) = {
         let cfg = app.config();
         (
-            collect_oauth_seed_names(&cfg),
+            collect_oauth_seed_names(&cfg, interval_ms),
             collect_third_party_seed_names(&cfg),
             collect_third_party_entries(&cfg.profiles),
         )
     };
-    let interval_ms = app.refresh_interval.load(Ordering::Relaxed);
     bootstrap_fetch(
         &app.usage_store,
         &app.usage_status,
         &app.last_fetched,
         &seed_names,
-        interval_ms,
     );
     bootstrap_third_party(
         &app.third_party_usage_store,
@@ -5713,17 +8375,6 @@ pub(crate) fn has_sub_focus(app: &App) -> bool {
         || (app.tab == Tab::Tokens && app.token_view == TokenView::Models)
 }
 
-/// True while focus is descended into the delegates detail: `←` ascends and
-/// `→` is inert there, the master-detail arrow-trap, instead of switching tabs.
-fn services_delegates_descended(app: &App) -> bool {
-    app.tab == Tab::Services
-        && app.services.focus == ServicesFocus::Detail
-        && app
-            .services
-            .selected_check()
-            .is_some_and(|c| c.label == "delegates")
-}
-
 /// What owns the keyboard this frame: every key it claims ([`KeyOwner::claims`]),
 /// `←`/`→` included, reaches it before any tab switch or global binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5769,6 +8420,24 @@ impl KeyOwner {
         if self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')) {
             return false;
         }
+        // `?` falls through from the re-bind confirm so the footer derives
+        // `? help` and the key opens the help modal above it.
+        if self == Self::Modal
+            && matches!(app.modals.last(), Some(Modal::Rebind(_)))
+            && matches!(code, KeyCode::Char('?'))
+        {
+            return false;
+        }
+        // `x` dismisses the topmost toast even while a modal owns input, so a
+        // toast drawn over the modal is still dismissable; the typed-entry
+        // modals keep `x` as data (name entry, the login code field).
+        if self == Self::Modal
+            && code == KeyCode::Char('x')
+            && !app.toasts.is_empty()
+            && !modal_types_x_as_data(app)
+        {
+            return false;
+        }
         if self == Self::ShuntField
             && app
                 .services
@@ -5780,6 +8449,17 @@ impl KeyOwner {
             return false;
         }
         true
+    }
+}
+
+/// Whether the top modal types `x` into a field (data) rather than letting it
+/// dismiss a toast: the name-entry modals and the login modal's open code
+/// field.
+fn modal_types_x_as_data(app: &App) -> bool {
+    match app.modals.last() {
+        Some(Modal::CaptureName(_) | Modal::NamePrompt(_)) => true,
+        Some(Modal::Login) => app.login.as_ref().is_some_and(|s| s.paste_field.is_some()),
+        _ => false,
     }
 }
 
@@ -5826,21 +8506,195 @@ pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
     }
 }
 
+/// What the tab-switch keys do on the current screen, the one answer
+/// [`handle_key`], the footer and the help modal all derive from so their
+/// hints cannot drift from the keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneState {
+    /// Top level: `←`/`→`/`tab`/`⇧tab` all switch screens.
+    Rest,
+    /// A descended read-only detail: `←` ascends, `→` is inert, `tab`/`⇧tab`
+    /// ascend AND switch.
+    ReadOnly,
+    /// A descended editable detail at rest: `←` ascends (the esc path),
+    /// `→`/`tab`/`⇧tab` are inert.
+    Editable,
+}
+
+/// The pane focus this frame, reached only while nothing owns the keyboard (an
+/// open editor claims the arrows and tab itself, so it never lands here).
+pub(crate) fn pane_state(app: &App) -> PaneState {
+    if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+        || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
+        || (app.tab == Tab::Tokens
+            && app.token_view == TokenView::Models
+            && app.model_detail_focus == StatusFocus::Detail)
+    {
+        return PaneState::ReadOnly;
+    }
+    if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
+        return PaneState::Editable;
+    }
+    if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
+        return PaneState::Editable;
+    }
+    if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
+        // The shunt card, the herdr options and the plugin fixes change saved
+        // data; the delegates job list and every other check's detail scroll
+        // read-only.
+        let editable = app
+            .services
+            .selected_check()
+            .is_some_and(|c| matches!(c.label, "shunt" | "herdr" | "plugin"));
+        return if editable {
+            PaneState::Editable
+        } else {
+            PaneState::ReadOnly
+        };
+    }
+    PaneState::Rest
+}
+
+/// Back out of the current sub-focus, the `esc`/`←` ascend path. Mirrors the
+/// `esc` chain exactly so `←` and `esc` can never diverge.
+fn ascend_pane(app: &mut App) {
+    if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail {
+        app.usage_detail_focus = StatusFocus::List;
+    } else if app.tab == Tab::Tokens
+        && app.token_view == TokenView::Models
+        && app.model_detail_focus == StatusFocus::Detail
+    {
+        app.model_detail_focus = StatusFocus::List;
+    } else if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
+        leave_config_detail(app);
+    } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
+        leave_fallback_detail(app);
+    } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
+        app.status.focus = StatusFocus::List;
+    } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
+        if !shunt_esc_folds_entry(app) {
+            leave_shunt_detail(app);
+        }
+    } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
+        app.token_view = TokenView::Dashboard;
+    }
+}
+
+/// The direction a `Tab`/`BackTab` keypress names, or `None` when a reported
+/// CONTROL or ALT makes it inert. A bare `Tab` and a `Tab` with SHIFT
+/// (the kitty form of shift+tab) are distinguished; `BackTab` switches back
+/// with or without its shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabStep {
+    Next,
+    Prev,
+}
+
+fn tab_switch_direction(key: KeyEvent) -> Option<TabStep> {
+    // `tab` switches with no modifier besides shift: any other
+    // reported modifier (ctrl, alt, super, hyper, meta) makes it inert.
+    if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(TabStep::Prev),
+        KeyCode::Tab => Some(TabStep::Next),
+        KeyCode::BackTab => Some(TabStep::Prev),
+        _ => None,
+    }
+}
+
+/// The tab an `⌥1`–`⌥9` keypress jumps to: `⌥1`–`⌥8` positional, `⌥9` the last
+/// tab, `⌥0` unbound. Only `ALT` may be present.
+fn alt_jump_target(key: KeyEvent) -> Option<Tab> {
+    // `⌥digit` requires ALT alone: any other reported modifier
+    // (shift, ctrl, super, hyper, meta) makes it inert.
+    if key.modifiers != KeyModifiers::ALT {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(d @ '1'..='9') => {
+            let n = d.to_digit(10)? as usize;
+            Some(if n == 9 {
+                Tab::ALL[Tab::ALL.len() - 1]
+            } else {
+                Tab::ALL[n - 1]
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
     }
 
+    // `ctrl+c` arms or completes its own 2-step quit, ahead of every owner so a
+    // modal, an editor or an ⌥-jump never sees the key.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.quit = true;
-        app.shutting_down.store(true, Ordering::SeqCst);
+        if app.armed_quit == Some(QuitKey::CtrlC) {
+            // A second ⌃c over an open switch warning retargets it to the quit
+            // form; over a quit warning it does nothing more; elsewhere it
+            // quits, or opens the quit warning over changed work.
+            let warning_open = matches!(app.modals.last(), Some(Modal::LossWarning(_)));
+            if let Some(Modal::LossWarning(state)) = app.modals.last_mut()
+                && state.target != LossWarningTarget::Quit
+            {
+                state.target = LossWarningTarget::Quit;
+            }
+            app.disarm_quit();
+            if !warning_open {
+                request_quit(app);
+            }
+        } else {
+            app.armed_quit = Some(QuitKey::CtrlC);
+            app.footer_alert = Some(FooterAlert::Warn(format!(
+                "press {} again to quit",
+                prose::key("\u{2303}c")
+            )));
+        }
+        return;
+    }
+
+    let owner = keyboard_owner(app);
+
+    // Every key but a top-level `q` (which reads the arm below) disarms the
+    // quit before it does its own job — `x` included, so a toast-pop or alert
+    // dismiss never reads the arm; owners included, so a key the modal or
+    // editor swallows still disarms.
+    let reads_arm = matches!(
+        key.code,
+        KeyCode::Char('q')
+            if !owner.is_some_and(|o| o.claims(app, KeyCode::Char('q')))
+                && app.login.is_none()
+                && app.codex_login.is_none()
+    );
+
+    // The quit is decided and the exit waits for the running writes:
+    // only a top-level `q` gets past here (`⌃c` is handled above), everything
+    // else only disarms an armed quit — an edit typed now would die with the exit.
+    if app.exit_wait && !(reads_arm && !has_sub_focus(app)) {
+        app.disarm_quit();
+        return;
+    }
+    if !reads_arm {
+        app.disarm_quit();
+    }
+
+    // `⌥1`–`⌥9` jump, live inside every editor but inert while a modal owns the
+    // keyboard — so it runs before any non-modal owner claims the key.
+    if app.modals.is_empty()
+        && let Some(target) = alt_jump_target(key)
+    {
+        request_switch(app, target);
         return;
     }
 
     // A modal, then an open editor, owns the keyboard: typed digits and
     // letters can't trip global shortcuts, and ←/→ never switch the tab. A key
     // the owner does not claim falls through to the global senses below.
-    if let Some(owner) = keyboard_owner(app).filter(|owner| owner.claims(app, key.code)) {
+    if let Some(owner) = owner.filter(|owner| owner.claims(app, key.code)) {
         match owner {
             KeyOwner::Modal => handle_modal_key(app, key),
             KeyOwner::SetupField | KeyOwner::NewAccountField => handle_config_edit_key(app, key),
@@ -5863,51 +8717,55 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // footer whose login line never yields to the armed alert. Sits BELOW the
     // editor captures so typing a literal `q` into a field can't cancel.
     if app.login.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-        app.login = None;
+        // A shunt add holds the pool-action guard until its result: a cancel
+        // BEFORE the commit point (no paste sent) cancels the add (the guard
+        // releases once the worker reports, R3-3); a cancel AFTER the paste is
+        // sent only closes the modal and the login line — the door, the guard
+        // and the committed slot stay, and the complete runs to its result.
+        cancel_open_login(app, true);
         app.toast(ToastKind::Info, "login canceled");
         return;
     }
 
+    // The codex re-login's twin: a collapsed login cancels on esc/q the same
+    // way — the worker's listener wait stops (its ports free) and `q` never
+    // arms the 2-step quit around a live login.
+    if app.codex_login.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        cancel_codex_login(app);
+        return;
+    }
+
     match key.code {
-        KeyCode::Left if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail => {
-            app.usage_detail_focus = StatusFocus::List;
+        KeyCode::Left => {
+            if pane_state(app) == PaneState::Rest {
+                request_switch(app, app.tab.prev());
+            } else {
+                ascend_pane(app);
+            }
             return;
         }
-        KeyCode::Left
-            if app.tab == Tab::Tokens
-                && app.token_view == TokenView::Models
-                && app.model_detail_focus == StatusFocus::Detail =>
-        {
-            app.model_detail_focus = StatusFocus::List;
+        KeyCode::Right => {
+            // Inert in every descended pane; switches only at rest.
+            if pane_state(app) == PaneState::Rest {
+                request_switch(app, app.tab.next());
+            }
             return;
         }
-        KeyCode::Left if services_delegates_descended(app) => {
-            leave_shunt_detail(app);
-            return;
-        }
-        KeyCode::Right
-            if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
-                || (app.tab == Tab::Tokens
-                    && app.token_view == TokenView::Models
-                    && app.model_detail_focus == StatusFocus::Detail) =>
-        {
-            return;
-        }
-        KeyCode::Right if services_delegates_descended(app) => {
-            return;
-        }
-        KeyCode::Right | KeyCode::Tab => {
-            app.disarm_quit();
-            switch_tab(app, app.tab.next());
-            return;
-        }
-        KeyCode::Left | KeyCode::BackTab => {
-            app.disarm_quit();
-            switch_tab(app, app.tab.prev());
+        KeyCode::Tab | KeyCode::BackTab => {
+            // A ctrl/alt variant is inert; a descended editable pane
+            // traps the keys entirely.
+            if let Some(step) = tab_switch_direction(key)
+                && pane_state(app) != PaneState::Editable
+            {
+                let target = match step {
+                    TabStep::Next => app.tab.next(),
+                    TabStep::Prev => app.tab.prev(),
+                };
+                request_switch(app, target);
+            }
             return;
         }
         KeyCode::Char('?') => {
-            app.disarm_quit();
             app.help_scroll = 0;
             app.open_modal(Modal::Help);
             return;
@@ -5916,7 +8774,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             // Open the divergence resolver from the banner (no-op when the
             // live link is clean).
             if let Some(notice) = app.divergence_pending.clone() {
-                app.disarm_quit();
                 open_divergence_modal(app, &notice.active);
             }
             return;
@@ -5925,18 +8782,24 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // has nothing to mean anywhere else. Guarded rather than swallowed so
         // `c` still reaches the per-tab dispatch (Tokens binds it too).
         KeyCode::Char('c') if app.tab == Tab::Overview => {
-            app.disarm_quit();
-            let selected = app.current_main_item();
+            // `c` changes the filter, then places the cursor on the remembered
+            // item's row when the new view shows it, else row 0; it never
+            // writes the remembered item (a filter only hides it).
             app.harness_filter = app.harness_filter.next();
-            app.overview_cursor = selected
-                .and_then(|item| app.main_items().iter().position(|row| *row == item))
-                .unwrap_or(0);
-            app.sync_overview_profile_selection();
+            app.place_overview_cursor();
             app.overview_selector.offset.set(0);
             return;
         }
+        // Overview only, so the Usage tab's `e` (estimates toggle) keeps its
+        // sense. No row under the cursor (an empty roster or a filter hiding
+        // every row) is a no-op.
+        KeyCode::Char('e') if app.tab == Tab::Overview => {
+            if let Some(item) = app.current_main_item() {
+                start_edit_selected(app, item);
+            }
+            return;
+        }
         KeyCode::Char('a') => {
-            app.disarm_quit();
             let state = build_action_menu(app);
             if !state.items.is_empty() {
                 app.open_modal(Modal::ActionMenu(state));
@@ -5944,7 +8807,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('r') => {
-            app.disarm_quit();
             if app.tab == Tab::Status {
                 trigger_status_refresh(app);
                 return;
@@ -5960,7 +8822,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             if app.tab == Tab::Usage {
-                queue_focused_usage_refresh(app);
+                usage_refresh(app);
             } else {
                 app.manual_refresh();
                 app.toast(ToastKind::Info, "refreshing every account");
@@ -5968,7 +8830,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('t') => {
-            app.disarm_quit();
             // Tokens claims `t` for its period lens (as `r` reloads there);
             // rotate-all stays reachable from every other tab.
             if app.tab == Tab::Tokens {
@@ -5985,12 +8846,18 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('n') => {
-            app.disarm_quit();
-            // The usage tab claims `n` for the account's note editor (footer +
-            // help modal advertise it there); the empty roster keeps the empty
-            // state's `n to create one` promise. Everywhere else: new account.
-            if app.tab == Tab::Usage && app.profile_count() > 0 {
-                open_note_editor(app);
+            // The usage tab claims `n` for the account's note editor, on a
+            // claude row only (a codex or pool row has no note); the empty
+            // roster keeps the empty state's `n to create one` promise.
+            // Everywhere else: new account.
+            if app.tab == Tab::Usage {
+                match app.usage_selection() {
+                    SetupSelection::Item(MainItemKind::Profile(_)) if app.profile_count() > 0 => {
+                        open_note_editor(app);
+                    }
+                    SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {}
+                    _ => start_new_account(app),
+                }
             } else {
                 start_new_account(app);
             }
@@ -5998,28 +8865,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
-            app.disarm_quit();
-            if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail {
-                app.usage_detail_focus = StatusFocus::List;
-            } else if app.tab == Tab::Tokens
-                && app.token_view == TokenView::Models
-                && app.model_detail_focus == StatusFocus::Detail
-            {
-                app.model_detail_focus = StatusFocus::List;
-            } else if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
-                leave_config_detail(app);
-            } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
-                leave_fallback_detail(app);
-            } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
-                app.status.focus = StatusFocus::List;
-            } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
-                if !shunt_esc_folds_entry(app) {
-                    leave_shunt_detail(app);
-                }
-            } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
-                app.token_view = TokenView::Dashboard;
-            }
-            // At top level, Esc is a no-op — ctrl+c or `q q` to quit.
+            ascend_pane(app);
+            // At top level, Esc is a no-op — `⌃c ⌃c` or `q q` to quit.
             return;
         }
         // First `q` at the top level arms the 2-step quit; second confirms.
@@ -6042,11 +8889,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
-            } else if app.armed_quit {
-                app.quit = true;
-                app.shutting_down.store(true, Ordering::SeqCst);
+            } else if app.armed_quit == Some(QuitKey::Q) {
+                request_quit(app);
             } else {
-                app.armed_quit = true;
+                // Armed by ctrl+c, or not armed: q runs its own job and arms
+                // (or re-arms) its own quit.
+                app.armed_quit = Some(QuitKey::Q);
                 app.footer_alert = Some(FooterAlert::Warn(format!(
                     "press {} again to quit",
                     prose::key("q")
@@ -6055,22 +8903,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('x') => {
-            // Dismissal precedence: toasts first, then footer alert.
-            // `x` dismisses the alert directly; quit disarming is a side effect
-            // only when armed_quit was the producer — not a general alert clear.
+            // Dismissal precedence: the topmost toast pops first. The quit arm
+            // (and its alert) already disarmed at the gate above.
             if !app.toasts.is_empty() {
                 app.toasts.pop_front();
-            } else if app.footer_alert.is_some() {
-                app.footer_alert = None;
-                if app.armed_quit {
-                    app.armed_quit = false;
-                }
             }
             return;
         }
-        _ => {
-            app.disarm_quit();
-        }
+        _ => {}
     }
 
     match app.tab {
@@ -6374,24 +9214,452 @@ fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
     i
 }
 
+/// Every changed edit and staged pick, in `Tab::ALL` order. The single source
+/// the switch, quit, retarget, `save` validation and the body's screen list
+/// all read, so a new editor can never warn on a switch and not on a quit. An
+/// edit is changed when its buffer differs from the value it opened from; a
+/// staged pick when the staged value differs from the saved one. Clean edits
+/// never appear here and suspend silently.
+fn changed_work(app: &App) -> Vec<Dirty> {
+    let mut out = Vec::new();
+    // Usage: the note editor (Tab::ALL puts Usage before Setup).
+    if app.note_editor.as_ref().is_some_and(note_dirty) {
+        out.push(Dirty::Note);
+    }
+    // Setup: an open existing-account field, then the `+ new` form (typed work,
+    // open or suspended, a field open or not).
+    if let Some(d) = app.config_draft.as_ref()
+        && d.editing_name.is_some()
+        && let Some(field) = d.active
+        && d.field(field)
+            .is_some_and(|input| Some(input.value.as_str()) != d.field_seed.as_deref())
+    {
+        out.push(Dirty::SetupField);
+    }
+    let new_form_dirty = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none() && d.holds_typed_work())
+        || app
+            .new_account_draft
+            .as_ref()
+            .is_some_and(ConfigDraft::holds_typed_work);
+    if new_form_dirty {
+        out.push(Dirty::NewAccountForm);
+    }
+    // Fallback: the member-card typed field. The day picker saves each toggle
+    // and the custom stop is UI state dropped with the card, so neither is
+    // changed work.
+    if fallback_field_dirty(app) {
+        out.push(Dirty::FallbackField);
+    }
+    if app
+        .refresh_interval_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::RefreshInterval);
+    }
+    if app
+        .context_nudge_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::ContextNudge);
+    }
+    if app
+        .weekly_threshold_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::WeeklyThreshold);
+    }
+    if app
+        .services
+        .herdr_tag_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::HerdrTag);
+    }
+    if let Some(key) = shunt_field_dirty(app) {
+        out.push(Dirty::ShuntField(key));
+    }
+    let draft_editor = draft_editor_dirty(app);
+    for kind in [
+        ShuntAddKind::Upstream,
+        ShuntAddKind::Model,
+        ShuntAddKind::Route,
+    ] {
+        // A draft whose own `save <kind>` is still checking is not changed work,
+        // exactly like a field whose own save is checking: a switch or quit over
+        // it holds on that save instead of warning.
+        if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+            continue;
+        }
+        if app.services.shunt_drafts.holds_typed_work(kind) || draft_editor == Some(kind) {
+            out.push(Dirty::ShuntAdd(kind));
+        }
+    }
+    out
+}
+
+/// The seed `begin_refresh_interval_edit` opens the field with, in the atomic's
+/// whole seconds — the value the editor opened from.
+fn refresh_interval_seed(app: &App) -> String {
+    (app.refresh_interval.load(Ordering::Relaxed) / 1000).to_string()
+}
+
+/// The seed `begin_context_nudge_edit` opens the field with.
+fn context_nudge_seed(current: Option<u64>) -> String {
+    match current {
+        None => String::from("300k"),
+        Some(v) if v.is_multiple_of(1_000_000) => format!("{}k", v / 1000),
+        Some(v) => format_threshold_tokens(v),
+    }
+}
+
+/// Whether the Fallback member-card's open typed field differs from the value
+/// it opened from (its stored seed). The day picker saves each toggle, so it
+/// never differs.
+fn fallback_field_dirty(app: &App) -> bool {
+    let Some(edit) = app.fallback_edit.as_ref() else {
+        return false;
+    };
+    match &edit.state {
+        CardEdit::Threshold(input) | CardEdit::Weekly(input) | CardEdit::MaxSpend(input) => {
+            edit.seed.as_deref() != Some(input.value.as_str())
+        }
+        CardEdit::Days(_) | CardEdit::ArmedRemove => false,
+    }
+}
+
+/// Whether a field editor's value differs from the one it opened on. A pending
+/// cycle pick differs only when its staged value is not the saved one.
+fn shunt_edit_dirty(edit: &ShuntFieldEdit) -> bool {
+    match edit {
+        ShuntFieldEdit::Typed { input, saved } => {
+            saved.as_deref().unwrap_or("") != input.value.as_str()
+        }
+        ShuntFieldEdit::Pick { saved, picked } => saved.as_deref() != Some(picked.as_str()),
+    }
+}
+
+/// The key of the shunt field editor when it holds a value differing from the
+/// one it opened on. A `+ add` draft's field editor is its kind's typed work,
+/// never a field, and a field whose own save is still checking is not changed
+/// work (a switch or quit holds on that save instead of warning).
+fn shunt_field_dirty(app: &App) -> Option<ShuntFieldKey> {
+    let state = app.services.shunt_field_edit.as_ref()?;
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        return None;
+    }
+    if app.services.saving(&ShuntSaveKey::Field(state.key.clone())) {
+        return None;
+    }
+    shunt_edit_dirty(&state.edit).then(|| state.key.clone())
+}
+
+/// The `+ add` kind whose open draft field editor holds uncommitted typed work
+/// (its buffer differs from the value it opened on), if any.
+fn draft_editor_dirty(app: &App) -> Option<ShuntAddKind> {
+    let state = app.services.shunt_field_edit.as_ref()?;
+    let ShuntFieldKey::Draft { kind, .. } = &state.key else {
+        return None;
+    };
+    shunt_edit_dirty(&state.edit).then_some(*kind)
+}
+
+/// Whether the note editor's draft differs from the note it opened from.
+fn note_dirty(editor: &NoteEditor) -> bool {
+    editor.buf.text() != editor.seed
+}
+
+/// The changed work a SWITCH away from `screen` warns over: only what sits on
+/// the screen being left. A quit keeps the whole set ([`changed_work`]).
+fn changed_work_on(app: &App, screen: Tab) -> Vec<Dirty> {
+    changed_work(app)
+        .into_iter()
+        .filter(|d| d.screen() == screen)
+        .collect()
+}
+
+/// An in-flight shunt field or `+ add` save: its editor/draft is not changed
+/// work, but a switch, quit or jump over it, or a warning `save` beside it,
+/// must hold until the outcome resolves it. A landed save proceeds (or warns),
+/// a refusal re-runs the trigger's gate over the still-open, red item.
+fn in_flight_shunt_edit_save(app: &App) -> bool {
+    app.services
+        .shunt_save
+        .as_ref()
+        .is_some_and(|save| matches!(save.key, ShuntSaveKey::Field(_) | ShuntSaveKey::SaveAdd(_)))
+}
+
+/// A running shunt-card write the exit waits for: any shunt save (a field,
+/// `+ add`, remove, token or require save), the `shunt_action` worker, or a
+/// running pool account remove. The `require client tokens` restart wait is not
+/// a write — an exit drops it and the next `f` asks again.
+fn in_flight_shunt_card_write(app: &App) -> bool {
+    app.services.shunt_save.is_some()
+        || app.services.shunt_action.running
+        || app.pool_mutation_kind == Some(PoolMutationKind::Remove)
+}
+
+/// A running write the exit waits for, the one predicate both the quit's
+/// decision (`quit_or_wait`) and its resolution (`on_tick`) call so the two
+/// cannot drift: any shunt-card write, a profile delete's worker, or an account
+/// between a refresh token's request and its stage write. Dying inside that
+/// window loses the minted pair, and dying inside a delete can leave the record
+/// beside a half-removed profile dir, so a quit over either waits instead of
+/// exiting. A usage read never holds a quit.
+fn in_flight_exit_write(app: &App) -> bool {
+    in_flight_shunt_card_write(app)
+        || app.deleting.is_some()
+        || token_spend_in_flight(&app.activity)
+}
+
+/// A switch the user asked for: disarm it, warn over changed work, hold on an
+/// in-flight shunt save, else perform it. `target == app.tab` (a jump to the
+/// active tab) does nothing.
+fn request_switch(app: &mut App, target: Tab) {
+    if app.loss_pending.is_some() {
+        return;
+    }
+    if app.tab == target {
+        return;
+    }
+    disarm_switch(app);
+    let dirty = changed_work_on(app, app.tab);
+    if !dirty.is_empty() {
+        open_loss_warning(app, LossWarningTarget::Switch(target), dirty);
+        return;
+    }
+    if in_flight_shunt_edit_save(app) {
+        app.loss_pending = Some(LossWarningTarget::Switch(target));
+        return;
+    }
+    do_switch(app, target);
+}
+
+/// A quit the user asked for (a second `⌃c` or `q` at the top level): warn
+/// over changed work wherever it sits, hold on an in-flight field or `+ add`
+/// save, else quit or enter the exit wait. A quit pressed while a switch or
+/// jump is held turns that held target into a held quit (the landing quits,
+/// never switches). A second quit during the exit wait, or while a quit is
+/// held on a checking save, exits at once.
+fn request_quit(app: &mut App) {
+    app.disarm_quit();
+    if app.exit_wait {
+        // A second quit during the exit wait exits at once, whatever still runs.
+        app.quit = true;
+        app.shutting_down.store(true, Ordering::SeqCst);
+        return;
+    }
+    if let Some(pending) = app.loss_pending.as_mut() {
+        if matches!(pending, LossWarningTarget::Quit) {
+            // A second quit while a quit is held on a checking field or `+ add`
+            // save exits at once, the same as during the exit wait.
+            app.quit = true;
+            app.shutting_down.store(true, Ordering::SeqCst);
+        } else {
+            *pending = LossWarningTarget::Quit;
+            // A held switch only ever waits on a field or `+ add` save, whose
+            // quit hold re-runs the gate on a refusal (the direct hold).
+            app.loss_pending_sync = None;
+        }
+        return;
+    }
+    let dirty = changed_work(app);
+    if !dirty.is_empty() {
+        open_loss_warning(app, LossWarningTarget::Quit, dirty);
+        return;
+    }
+    quit_or_wait(app);
+}
+
+/// The one place a quit is decided: a field or `+ add` save in flight holds the
+/// quit (a refusal re-runs the gate over the red item); any other running write
+/// enters the exit wait (the exit waits until the write finishes, whatever its
+/// outcome) — a shunt-card write, a profile delete, or a token spend, which must
+/// land its minted pair before the process dies; otherwise it quits at once.
+fn quit_or_wait(app: &mut App) {
+    if in_flight_shunt_edit_save(app) {
+        app.loss_pending = Some(LossWarningTarget::Quit);
+    } else if in_flight_exit_write(app) {
+        app.exit_wait = true;
+        // Stop the scheduler and refuse new spends while the exit waits: the
+        // wait resolves when the running write lands, and a spend that starts
+        // during it would either extend it or die mid-exchange after the tick
+        // that decided the quit.
+        app.shutting_down.store(true, Ordering::SeqCst);
+    } else {
+        app.quit = true;
+        app.shutting_down.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Open the loss warning over `dirty`. `save` is the default focus when any
+/// item can save; `go back` is, for the two-button `+ new` form.
+fn open_loss_warning(app: &mut App, target: LossWarningTarget, dirty: Vec<Dirty>) {
+    let focus = if dirty.iter().any(|d| d.saveable()) {
+        LossWarningButton::Save
+    } else {
+        LossWarningButton::GoBack
+    };
+    app.open_modal(Modal::LossWarning(LossWarningState {
+        focus,
+        target,
+        drop: LossWarningDrop { dirty },
+    }));
+}
+
+/// Perform a switch: suspend the pane it leaves, then land.
+fn do_switch(app: &mut App, target: Tab) {
+    suspend_source(app);
+    switch_tab(app, target);
+}
+
+/// Disarm everything a switch disarms at the switch itself: the
+/// 2-step quit and Fallback's armed remove. Setup's armed action is not set
+/// here: an armed Setup draft always rests with no field open, so the switch
+/// drops it whole through [`leave_config_detail`], and the `+ new` form has no
+/// armable row.
+fn disarm_switch(app: &mut App) {
+    app.disarm_quit();
+    if matches!(
+        app.fallback_edit.as_ref().map(|e| &e.state),
+        Some(CardEdit::ArmedRemove)
+    ) {
+        app.fallback_edit = None;
+    }
+}
+
+/// The one writer of `new_account_draft`. A suspended `+ new` form holding
+/// typed work is never overwritten: the incoming draft is handed back to the
+/// caller, which keeps it, so no slot write can drop a form and no UI path
+/// panics. `Some(draft)` = refused and returned; `None` = stored. A switch or
+/// jump over a typed form warns instead, and the preset-picker cancel restores
+/// a clean one; the detail descend moves whatever the suspended form holds, and
+/// keeps it on its pane when this writer refuses.
+fn set_new_account_draft(app: &mut App, draft: ConfigDraft) -> Option<ConfigDraft> {
+    if app
+        .new_account_draft
+        .as_ref()
+        .is_some_and(ConfigDraft::holds_typed_work)
+    {
+        return Some(draft);
+    }
+    app.new_account_draft = Some(draft);
+    None
+}
+
+/// Suspend the pane the switch leaves: an open edit stays (only
+/// reachable by `⌥digit`, since editors own the arrows and tab), everything
+/// else ascends to its selector, keeping unsaved state.
+fn suspend_source(app: &mut App) {
+    let edit_open = keyboard_owner(app).is_some();
+    match app.tab {
+        Tab::Usage => {
+            // The note editor keeps the Usage descent; a bare detail
+            // ascends.
+            if !edit_open {
+                app.usage_detail_focus = StatusFocus::List;
+            }
+        }
+        Tab::Tokens => app.model_detail_focus = StatusFocus::List,
+        Tab::Setup if app.config_focus == ConfigFocus::Actions => {
+            if edit_open {
+                // Keep the descent and the edit; returning lands back in it.
+            } else if app
+                .config_draft
+                .as_ref()
+                .is_some_and(|d| d.editing_name.is_none())
+            {
+                // The `+ new` form's typed values survive in its own home.
+                let Some(draft) = app.config_draft.take() else {
+                    return;
+                };
+                match set_new_account_draft(app, draft) {
+                    None => app.config_focus = ConfigFocus::Profiles,
+                    // The slot already holds a typed form: put this form back
+                    // and keep the descent, so the pane stays on its form and
+                    // nothing is dropped.
+                    Some(draft) => app.config_draft = Some(draft),
+                }
+            } else {
+                leave_config_detail(app);
+            }
+        }
+        Tab::Fallback if app.fallback_focus == FallbackFocus::Detail => {
+            if !edit_open {
+                leave_fallback_detail(app);
+            }
+        }
+        Tab::Status => app.status.focus = StatusFocus::List,
+        Tab::Services
+            if app.services.focus == ServicesFocus::Detail
+            // `leave_shunt_detail` keeps the in-memory `+ add` drafts; only
+            // ascend while no editor (shunt field or herdr tag) owns the keys.
+            // Never `shunt_esc_folds_entry` here: that esc-path helper folds
+            // drafts, which a switch must not drop.
+            && !edit_open =>
+        {
+            leave_shunt_detail(app);
+        }
+        _ => {}
+    }
+}
+
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
-    if tab == Tab::Overview && app.tab != Tab::Overview {
-        app.overview_cursor = app.profile_cursor;
-    }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
-    app.config_draft = None;
     // Leaving the Services tab cancels a still-pending herdr landing: the user
     // has moved on, so a later recompute must not yank the cursor back.
     app.services.land_on_herdr = false;
+    // Entering the Overview with nothing remembered seeds the claude row
+    // (whose index is `profile_cursor` itself) before the placement runs.
+    if tab == Tab::Overview && app.overview_remembered.is_none() {
+        app.overview_remembered = Some(MainItemKind::Profile(app.profile_cursor.read()));
+    }
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
         Tab::Overview => {}
         Tab::Usage => {
-            app.usage_detail_focus = StatusFocus::List;
+            if keyboard_owner(app).is_some() {
+                // A suspended note editor returns under its own account:
+                // pin the selector to the editor's profile and reload
+                // the note, so the header and the editor never disagree about
+                // whose note is open. A deleted account closes the editor and
+                // ascends, as a deleted account's Setup edit does.
+                let profile = app.note_editor.as_ref().map(|e| e.profile.clone());
+                if let Some(name) = profile {
+                    let idx = app.config().profiles.iter().position(|p| p.name == name);
+                    match idx {
+                        Some(i) => {
+                            app.profile_cursor.set(i);
+                            app.reload_selected_note();
+                        }
+                        None => {
+                            // The account is gone (deleted, or renamed by
+                            // another process): close the editor so no
+                            // invisible editor owns the keys. Keeping a typed
+                            // editor open under its old name left it drawn by
+                            // nobody while it still captured every key.
+                            app.note_editor = None;
+                            app.usage_detail_focus = StatusFocus::List;
+                        }
+                    }
+                }
+            } else {
+                app.usage_detail_focus = StatusFocus::List;
+            }
             app.usage_detail_scroll = 0;
+            // The codex or pool snapshot may have changed while Usage was
+            // hidden; place the selection on entry, before the first frame and
+            // the first key — the same rule Setup follows.
+            app.rehome_usage_selection();
         }
         Tab::Tokens => {
             // Land on the dashboard; keep the model cursor reset for descend.
@@ -6401,53 +9669,252 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.token_model_cursor = 0;
         }
         Tab::Setup => {
-            app.config_focus = ConfigFocus::Profiles;
-            app.config_action_cursor = 0;
+            if keyboard_owner(app).is_some() {
+                // A suspended open edit returns into it with the selector pinned
+                // to the edit's own subject: an existing account's slot
+                // or the `+ new` row. A deleted account closes the edit through
+                // `leave_config_detail` rather than resurrecting it.
+                match app
+                    .config_draft
+                    .as_ref()
+                    .and_then(|d| d.editing_name.clone())
+                {
+                    Some(name) => {
+                        let name = ProfileName::from(name.as_str());
+                        let idx = app.config().profiles.iter().position(|p| p.name == name);
+                        match idx {
+                            Some(i) => {
+                                app.setup.item = None;
+                                app.profile_cursor.set(i);
+                            }
+                            None => leave_config_detail(app),
+                        }
+                    }
+                    None => {
+                        app.setup.item = None;
+                        app.profile_cursor.set(app.profile_count());
+                    }
+                }
+            } else {
+                app.config_focus = ConfigFocus::Profiles;
+                app.config_action_cursor = 0;
+                disarm_codex_2step(app);
+                disarm_pool_2step(app);
+                // A suspended `+ new` form re-homes the selector onto its row.
+                // Skipped while a suspended edit owns the selector.
+                if app.new_account_draft.is_some() {
+                    app.setup.item = None;
+                    app.profile_cursor.set(app.profile_count());
+                    app.reload_selected_note();
+                } else {
+                    // Fresh entry: land on the shared claude row (a remembered
+                    // codex or pool selection is its own item, kept across a
+                    // switch back).
+                }
+            }
             // The `+ new` form's capture row renders off this flag, and a
             // login may have been minted (or saved) elsewhere since the last
             // Setup visit.
             app.refresh_unsaved_live_login();
+            // The codex or pool snapshot may have changed while Setup was
+            // hidden; place the selection on entry, before the first frame and
+            // the first key — the Overview's precedent (`place_overview_cursor`
+            // runs in `switch_tab`), never one tick late on `on_tick`.
+            app.rehome_setup_selection();
         }
         Tab::Fallback => {
-            app.chain_cursor = chain_cursor_for_profile(app);
-            sync_profile_from_chain(app);
-            leave_fallback_detail(app);
+            if keyboard_owner(app).is_some() {
+                // A suspended edit returns into it, pinned to the edit's member
+                // (`repin_member_edit` also closes the edit once the member left
+                // the chain, as a deleted account's Setup edit does).
+                repin_member_edit(app);
+                sync_profile_from_chain(app);
+            } else {
+                app.chain_cursor = chain_cursor_for_profile(app);
+                sync_profile_from_chain(app);
+                leave_fallback_detail(app);
+            }
         }
         Tab::Config => {
-            app.global_config_cursor = 0;
-            app.refresh_interval_draft = None;
-            app.context_nudge_draft = None;
-            app.weekly_threshold_draft = None;
+            // A suspended editor returns into it; a fresh entry re-homes the
+            // cursor. The drafts themselves clear only on their own commit /
+            // cancel — an open editor is never stale here.
+            if keyboard_owner(app).is_none() {
+                app.global_config_cursor = 0;
+            }
         }
         Tab::Status => {
             // Keep the incident cursor; reset focus to the list per the contract.
             app.status.focus = StatusFocus::List;
         }
         Tab::Services => {
-            leave_shunt_detail(app);
-            app.services.cursor = 0;
-            app.services.detail_scroll = 0;
-            // Entering the tab clears an open tag editor the same way the
-            // Config tab clears its drafts; `switch_tab` matches the
-            // destination, so the clear runs on entry, not on exit.
-            app.services.herdr_tag_draft = None;
+            // A suspended shunt field or herdr tag editor returns into it; a
+            // fresh entry resets the descent and the selection.
+            if keyboard_owner(app).is_none() {
+                leave_shunt_detail(app);
+                app.services.cursor = 0;
+                app.services.detail_scroll = 0;
+                app.services.shunt_scroll.set(0);
+            }
             // Recompute on focus; the cached `claude --version` is not
             // re-probed, but the shunt plan and pool read re-run so a card
             // left stale by an action elsewhere reads fresh on re-entry.
             recompute_services_checks(app, false, ShuntRefresh::Restart);
         }
     }
+    reseed_edits(app);
+}
+
+/// Re-seed every suspended open editor from its current stored value on
+/// landing, but only the CLEAN ones (buffer == seed): a clean edit whose
+/// stored value changed while it was suspended (an out-of-band reload) returns
+/// holding the new value, caret at the end, so it never returns changed; a
+/// dirty edit keeps its typed text and stays dirty whatever the store did.
+fn reseed_edits(app: &mut App) {
+    // Setup existing-account field.
+    if let Some((name, field)) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| Some((d.editing_name.clone()?, d.active?)))
+    {
+        let name = ProfileName::from(name.as_str());
+        let saved = {
+            let cfg = app.config();
+            row_committed_value(cfg.find(&name), &name, field)
+        };
+        if let Some(d) = app.config_draft.as_mut() {
+            let clean = d
+                .field(field)
+                .is_some_and(|input| d.field_seed.as_deref() == Some(input.value.as_str()));
+            if clean && d.field(field).is_some_and(|input| input.value != saved) {
+                if let Some(input) = d.field_mut(field) {
+                    *input = InputState::new(&saved);
+                }
+                d.field_seed = Some(saved);
+            }
+        }
+    }
+    // Fallback member field.
+    let fallback_saved: Option<String> = app.fallback_edit.as_ref().and_then(|edit| {
+        let cfg = app.config();
+        let profile = cfg.find(&edit.member);
+        match &edit.state {
+            CardEdit::Threshold(_) => Some(
+                profile
+                    .map(crate::fallback::threshold_for)
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_default(),
+            ),
+            CardEdit::Weekly(_) => Some(
+                profile
+                    .and_then(|p| p.weekly_threshold)
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_default(),
+            ),
+            CardEdit::MaxSpend(_) => Some(format!(
+                "{:.2}",
+                profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0)
+            )),
+            CardEdit::Days(_) | CardEdit::ArmedRemove => None,
+        }
+    });
+    if let Some(saved) = fallback_saved
+        && let Some(edit) = app.fallback_edit.as_mut()
+        && let Some(input) = edit.state.input_mut()
+        && edit.seed.as_deref() == Some(input.value.as_str())
+        && input.value != saved
+    {
+        *input = InputState::new(&saved);
+        edit.seed = Some(saved);
+    }
+    // Config editors.
+    let refresh_seed = refresh_interval_seed(app);
+    if let Some(draft) = app.refresh_interval_draft.as_mut() {
+        draft.reseed(&refresh_seed);
+    }
+    let nudge_seed = context_nudge_seed(app.config().state.context_nudge_threshold_tokens());
+    if let Some(draft) = app.context_nudge_draft.as_mut() {
+        draft.reseed(&nudge_seed);
+    }
+    let weekly_seed = format_weekly_pct(app.config().state.weekly_switch_threshold_pct());
+    if let Some(draft) = app.weekly_threshold_draft.as_mut() {
+        draft.reseed(&weekly_seed);
+    }
+    // Services herdr tag.
+    let herdr_seed = app.config().state.herdr.tag_watch_secs.to_string();
+    if let Some(draft) = app.services.herdr_tag_draft.as_mut() {
+        draft.reseed(&herdr_seed);
+    }
+    // Shunt field editor: re-seed the typed input and its `saved` seed from the
+    // current view when clean; a pending pick re-seeds its `saved` too.
+    reseed_shunt_field(app);
+    // Usage note editor.
+    if let Some(editor) = app.note_editor.as_mut() {
+        let saved = crate::profile_notes::load_note(&editor.profile).unwrap_or_default();
+        if editor.buf.text() == editor.seed && saved != editor.seed {
+            editor.buf = NoteBuffer::new(&saved);
+            editor.seed = saved;
+        }
+    }
+}
+
+/// Re-seed a clean suspended shunt `Typed` editor from the current config
+/// view: a buffer equal to its `saved` seed takes the newer stored value
+/// (buffer and seed), caret at the end. A dirty editor stays untouched; a
+/// pending `Pick` is staged work and is left alone.
+fn reseed_shunt_field(app: &mut App) {
+    let Some(state) = app.services.shunt_field_edit.as_ref() else {
+        return;
+    };
+    if let ShuntFieldKey::Draft { .. } = state.key {
+        return;
+    }
+    let ShuntFieldEdit::Typed { input, saved } = &state.edit else {
+        return;
+    };
+    // The same clean test `shunt_field_dirty` uses: an unset field reads as
+    // empty, so a buffer equal to its (unset or set) seed is clean.
+    if saved.as_deref().unwrap_or("") != input.value.as_str() {
+        return;
+    }
+    let Some(view) = config_view(app) else {
+        return;
+    };
+    let current = shunt_field_value(view, &app.services.shunt_drafts, &state.key).flatten();
+    if current == *saved {
+        return;
+    }
+    let Some(state) = app.services.shunt_field_edit.as_mut() else {
+        return;
+    };
+    let ShuntFieldEdit::Typed { input, saved } = &mut state.edit else {
+        return;
+    };
+    *input = InputState::new(current.as_deref().unwrap_or(""));
+    *saved = current;
 }
 
 /// Move `profile_cursor` by `delta`, wrapping in `0..len`.
-fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
+/// Move Usage's selection by `delta`, wrapping over the flat item list (the
+/// band walk's items; headings and spacers are never selectable). A step onto a
+/// claude row moves `profile_cursor`; onto a codex or pool row stores the
+/// identity, leaving the shared cursor alone.
+fn step_usage_cursor(app: &mut App, delta: i32) {
+    let items = app.setup_items();
+    if items.is_empty() {
+        return;
+    }
+    let next = (app.usage_position() as i32 + delta).rem_euclid(items.len() as i32) as usize;
+    app.step_selection(SelectionSlotKind::Usage, next);
+}
+
+/// Move Setup's selector by `delta`, wrapping over the item rows plus `+ new`.
+fn step_setup_cursor(app: &mut App, delta: i32, len: usize) {
     if len == 0 {
         return;
     }
-    app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
-    // The note belongs to the selection: the row must never show the previous
-    // account's note under the newly selected header.
-    app.reload_selected_note();
+    let next = (app.setup_position() as i32 + delta).rem_euclid(len as i32) as usize;
+    app.step_selection(SelectionSlotKind::Setup, next);
 }
 
 /// One page = the current viewport minus one overlap line (minimum 1), so a
@@ -6622,20 +10089,22 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
         KeyCode::Up if count > 0 => {
-            app.overview_cursor = (app.overview_cursor + count - 1) % count;
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor((app.overview_cursor + count - 1) % count);
         }
         KeyCode::Down if count > 0 => {
-            app.overview_cursor = (app.overview_cursor + 1) % count;
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor((app.overview_cursor + 1) % count);
         }
         KeyCode::PageUp if count > 0 => {
-            app.overview_cursor = selector_page_up(app.overview_cursor, &app.overview_selector);
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor(selector_page_up(
+                app.overview_cursor,
+                &app.overview_selector,
+            ));
         }
         KeyCode::PageDown if count > 0 => {
-            app.overview_cursor = selector_page_down(app.overview_cursor, &app.overview_selector);
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor(selector_page_down(
+                app.overview_cursor,
+                &app.overview_selector,
+            ));
         }
         KeyCode::Enter => activate_main_item(app),
         _ => {}
@@ -6667,27 +10136,31 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    let count = app.profile_count();
+    let count = app.setup_items().len();
     match key.code {
         KeyCode::Up => {
-            step_profile_cursor(app, -1, count);
+            step_usage_cursor(app, -1);
             app.usage_detail_scroll = 0;
         }
         KeyCode::Down => {
-            step_profile_cursor(app, 1, count);
+            step_usage_cursor(app, 1);
             app.usage_detail_scroll = 0;
         }
         KeyCode::PageUp => {
-            app.profile_cursor = selector_page_up(app.profile_cursor, &app.usage_selector);
-            app.reload_selected_note();
+            let next = selector_page_up(app.usage_position(), &app.usage_selector);
+            app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
         }
         KeyCode::PageDown => {
-            app.profile_cursor = selector_page_down(app.profile_cursor, &app.usage_selector);
-            app.reload_selected_note();
+            let next = selector_page_down(app.usage_position(), &app.usage_selector);
+            app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
         }
         KeyCode::Enter if count > 0 => {
+            // Descending into the shown row adopts it: a held-but-hidden Usage
+            // identity is replaced, never restored over the pane now open (the
+            // rule Setup's `enter_config_detail` keeps).
+            app.usage.clear();
             app.usage_detail_focus = StatusFocus::Detail;
             app.usage_detail_scroll = 0;
         }
@@ -6699,31 +10172,41 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
 
 /// Open the note editor on the selected account, seeded from disk.
 fn open_note_editor(app: &mut App) {
-    let Some(name) = app.profile_name_at(app.profile_cursor) else {
+    // Opening the editor adopts the shown row: a held-but-hidden Usage identity
+    // is replaced, never restored over the editor now open.
+    app.usage.clear();
+    let Some(name) = app.profile_name_at(app.profile_cursor.read()) else {
         return;
     };
     let text = crate::profile_notes::load_note(&name).unwrap_or_default();
     app.note_editor = Some(NoteEditor {
         profile: name,
+        seed: text.clone(),
         buf: NoteBuffer::new(&text),
     });
 }
 
 /// `⏎` in the note editor: persist the draft (an empty draft clears the note).
-/// A failed save keeps the editor open — the draft is the only copy.
-fn commit_note(app: &mut App) {
+/// A failed save keeps the editor open — the draft is the only copy. Returns
+/// whether the commit landed.
+fn commit_note(app: &mut App) -> bool {
     let Some(editor) = app.note_editor.take() else {
-        return;
+        return true;
     };
     let text = editor.buf.text();
     match crate::profile_notes::save_note(&editor.profile, &text) {
         Ok(()) => {
             app.note_text = crate::profile_notes::load_note(&editor.profile);
             app.toast(ToastKind::Success, "note saved");
+            true
         }
         Err(e) => {
             app.note_editor = Some(editor);
-            app.toast(ToastKind::Danger, format!("couldn't save the note: {e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("couldn't save the note: {}", escape_control(&e.to_string())),
+            );
+            false
         }
     }
 }
@@ -6764,7 +10247,9 @@ fn handle_note_editor_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
     match action {
-        NoteKey::Commit => commit_note(app),
+        NoteKey::Commit => {
+            let _ = commit_note(app);
+        }
         NoteKey::Cancel => app.note_editor = None,
         _ => {
             let Some(editor) = app.note_editor.as_mut() else {
@@ -6879,12 +10364,14 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Up if len > 0 => {
                     app.services.cursor = (app.services.cursor + len - 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
                 KeyCode::Down if len > 0 => {
                     app.services.cursor = (app.services.cursor + 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
@@ -6892,6 +10379,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     app.services.cursor =
                         selector_page_up(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
@@ -6899,6 +10387,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     app.services.cursor =
                         selector_page_down(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
@@ -7045,9 +10534,10 @@ fn walk_to_next_fix(app: &mut App) {
 }
 
 /// The shunt card's half of [`walk_to_next_fix`]: the next fix stop after the
-/// focused one in card order (the first one from the list, or the first at or
-/// below the top of the view when nothing holds focus), wrapping, scrolled
-/// just far enough to bring it into view.
+/// focused one in card order (the first one from the list, or the first fix
+/// the render's follow would not pull the view back for when nothing holds
+/// focus), wrapping. Setting the focus is all it does: the render is the
+/// follow site, so the next draw pads `SCROLL_PAD` rows past the fix's block.
 fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
@@ -7058,11 +10548,20 @@ fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
     let Some(&first) = fixes.first() else {
         return;
     };
+    if from_list {
+        // `f` from the list descends onto the card at the top.
+        app.services.shunt_scroll.set(0);
+    }
     let rows = app.services.shunt_stop_rows.borrow().clone();
-    let geometry = rows.len() == stops.len();
+    let ends = app.services.shunt_stop_ends.borrow().clone();
+    let geometry = rows.len() == stops.len() && ends.len() == stops.len();
+    let scroll = app
+        .services
+        .shunt_scroll
+        .get()
+        .min(app.services.detail_max_scroll.get() as usize);
     let viewport = app.services.shunt_viewport.get() as usize;
-    let max = app.services.detail_max_scroll.get();
-    let scroll = app.services.detail_scroll.min(max);
+    let total = app.services.shunt_total.get();
     let target = if from_list {
         first
     } else {
@@ -7072,24 +10571,16 @@ fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
             .and_then(|f| stops.iter().position(|s| s == f))
         {
             Some(cur) => fixes.iter().copied().find(|&i| i > cur).unwrap_or(first),
-            None if geometry => fixes
-                .iter()
-                .copied()
-                .find(|&i| rows[i] >= scroll as usize)
-                .unwrap_or(first),
+            None if geometry => {
+                shunt_none_focus_target(&rows, &ends, scroll, viewport, total, true, |i| {
+                    stops[i].fix().is_some()
+                })
+                .unwrap_or(first)
+            }
             None => first,
         }
     };
     app.services.set_shunt_focus(Some(stops[target].kind()));
-    if geometry && !shunt_in_view(scroll, viewport, rows[target]) {
-        let row = rows[target];
-        let scroll = if row < scroll as usize {
-            row
-        } else {
-            row + 1 - viewport.max(1)
-        };
-        app.services.detail_scroll = scroll.min(max as usize) as u16;
-    }
 }
 
 /// The plugin detail's problem walk: ↑↓ and `f` move over the fixable
@@ -7187,14 +10678,17 @@ fn track_delegates_selection(app: &mut App) {
 /// The shunt detail's keymap: ↑↓ walks the actionable lines (landing on each
 /// as it scrolls into view, one line at a time through the read-only text),
 /// `f` walks to the next fix line, `↵` opens the focused fix's confirm, and
-/// `space`/`↵` act on any other focused line (flip the `enabled` toggle, open
-/// the `check output` modal, expand/collapse a config entry, or open/step a
-/// config field editor — `space` cycles a cycle field).
+/// `space`/`↵` act on the card's state controls (flip the `enabled` toggle,
+/// expand/collapse a config entry; `space` steps a cycle field, `↵` opens a
+/// field's editor). The action rows (`check output`, `+ add <kind>`,
+/// `save <kind>`, `remove <kind>`, `+ add token`, a token row) act on `↵`
+/// alone.
 /// Focus is the key handler's own state (a [`ShuntFocusLine`] identity); the
-/// render reads it and re-settles it (the descend rule) when a resize or a
-/// card change pushed the held line out of view. Only the shunt detail routes
-/// here; the herdr options and plugin problems keep their own walks, every
-/// other detail keeps the scroll-only keymap.
+/// render reads it and follows the held block back into view on a resize or a
+/// card change, re-settling only a vanished stop or a none focus (the descend
+/// rule). Only the shunt detail routes here; the herdr options and plugin
+/// problems keep their own walks, every other detail keeps the scroll-only
+/// keymap.
 fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up => shunt_step(app, false),
@@ -7214,7 +10708,9 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 open_shunt_field_editor(app, &key);
             }
             Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
-            Some(ShuntFocus::SaveAdd { kind }) => commit_shunt_add(app, *kind),
+            Some(ShuntFocus::SaveAdd { kind }) => {
+                let _ = commit_shunt_add(app, *kind);
+            }
             Some(ShuntFocus::Remove { key }) => {
                 let key = key.clone();
                 confirm_shunt_remove(app, &key);
@@ -7229,24 +10725,21 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
         },
         KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
             Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
-            Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
             Some(ShuntFocus::Entry { key }) => {
                 let key = key.clone();
                 toggle_shunt_entry(app, &key);
             }
-            Some(ShuntFocus::Field { key }) => {
+            Some(ShuntFocus::Field { key }) if is_cycle_field(key) => {
+                // `space` acts only on state controls: a cycle field steps its
+                // pick, while a typed field opens its editor on `↵` alone.
                 let key = key.clone();
-                // `space` on a cycle row moves the pick; on a typed row it
-                // opens the editor, like `↵`.
-                if is_cycle_field(&key) {
-                    step_shunt_pick(app, &key);
-                } else {
-                    open_shunt_field_editor(app, &key);
-                }
+                step_shunt_pick(app, &key);
             }
-            Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
-            Some(ShuntFocus::AddToken) => open_token_picker(app, false),
-            Some(ShuntFocus::SaveAdd { .. })
+            Some(ShuntFocus::CheckOutput { .. })
+            | Some(ShuntFocus::Add { .. })
+            | Some(ShuntFocus::AddToken)
+            | Some(ShuntFocus::Field { .. })
+            | Some(ShuntFocus::SaveAdd { .. })
             | Some(ShuntFocus::Remove { .. })
             | Some(ShuntFocus::Token { .. }) => {}
             Some(ShuntFocus::Fix { .. }) | None => {}
@@ -7256,13 +10749,16 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
 }
 
 /// One `↑`/`↓` on the shunt card, over the geometry the last render published
-/// ([`ServicesState::shunt_stop_rows`] + [`ServicesState::shunt_viewport`] +
+/// ([`ServicesState::shunt_stop_rows`] + [`ServicesState::shunt_stop_ends`] +
+/// [`ServicesState::shunt_viewport`] + [`ServicesState::shunt_total`] +
 /// [`ServicesState::detail_max_scroll`]): move focus to the next/previous
 /// actionable line in card order, scrolling one rendered line at a time only
 /// while that target is out of view, and never past either end. Read-only rows
-/// never take focus; with no further actionable line a press scrolls (while
-/// there is text to scroll) and focus stays on its line while that line is in
-/// view.
+/// never take focus. A text scroll (target out of view, or no further stop)
+/// keeps the held focus only while its block sits inside the padded band —
+/// where the render's follow would leave the view put — and drops it the moment
+/// the follow would move, so the render never pulls a text scroll back; the
+/// render is the follow site, so a landing needs no offset math here.
 fn shunt_step(app: &mut App, down: bool) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
@@ -7271,35 +10767,38 @@ fn shunt_step(app: &mut App, down: bool) {
         // A card with no actionable line still scrolls one rendered line per
         // ↑↓ (round 1 S14's behaviour): the read-only detail scrolls, and the
         // footer's `↑↓ scroll` is true exactly while this does something.
-        let max = app.services.detail_max_scroll.get();
-        app.services.detail_scroll = if down {
-            app.services.detail_scroll.saturating_add(1).min(max)
+        let max = app.services.detail_max_scroll.get() as usize;
+        let scroll = app.services.shunt_scroll.get().min(max);
+        app.services.shunt_scroll.set(if down {
+            scroll.saturating_add(1).min(max)
         } else {
-            app.services.detail_scroll.min(max).saturating_sub(1)
-        };
+            scroll.saturating_sub(1)
+        });
         return;
     }
     let rows = app.services.shunt_stop_rows.borrow().clone();
-    if rows.len() != stops.len() {
+    let ends = app.services.shunt_stop_ends.borrow().clone();
+    if rows.len() != stops.len() || ends.len() != stops.len() {
         // The render has not published this card's geometry yet (nothing drawn
         // to walk over).
         return;
     }
     let viewport = app.services.shunt_viewport.get() as usize;
-    let max_scroll = app.services.detail_max_scroll.get();
-    let mut scroll = app.services.detail_scroll.min(max_scroll);
+    let total = app.services.shunt_total.get();
+    let max_scroll = app.services.detail_max_scroll.get() as usize;
+    let mut scroll = app.services.shunt_scroll.get().min(max_scroll);
 
     // Reconcile only a held identity that left the view (a resize can move it
-    // out): the descend rule — the first actionable line in view — settles it,
-    // and the step below walks from there. A none focus is NOT reconciled
-    // here: `↓`/`↑` from none start from the target rule itself (the first
-    // stop at/after the top of the view going down, the last before the bottom
-    // going up), so the first visible line is never skipped.
+    // out): the descend rule settles it, and the step below walks from there.
+    // A none focus is NOT reconciled here: `↓`/`↑` from none start from the
+    // target rule itself (a stop the render's follow would not pull the view
+    // back against the key), so a stop a text scroll just dropped is never
+    // re-taken.
     let focus = app.services.shunt_focus_kind().and_then(|kind| {
         stops
             .iter()
             .position(|s| s.kind() == kind)
-            .filter(|&i| shunt_in_view(scroll, viewport, rows[i]))
+            .filter(|&i| shunt_block_in_view(scroll, viewport, rows[i], ends[i]))
             .map(|i| stops[i].kind())
     });
     let cur = focus
@@ -7307,52 +10806,62 @@ fn shunt_step(app: &mut App, down: bool) {
         .and_then(|kind| stops.iter().position(|s| s.kind() == kind));
 
     // The target stop: the one after/before the focused line, or (with no
-    // focus) the first at/after the top of the view going down, the last
-    // before the bottom of the view going up.
+    // focus) the first stop the render's follow would not pull the view back
+    // up for going down, the last it would not pull back down for going up.
     let target = if down {
         match cur {
             Some(cur) => (cur + 1 < stops.len()).then_some(cur + 1),
-            None => (0..stops.len()).find(|&i| rows[i] >= scroll as usize),
+            // From none, `↓` targets the first stop the render's follow would
+            // not pull the view back up for (the stop a text scroll just
+            // dropped): the one none-focus target rule `↓`/`↑`/`f` share.
+            None => shunt_none_focus_target(&rows, &ends, scroll, viewport, total, true, |_| true),
         }
     } else {
         match cur {
-            Some(cur) => (cur > 0).then_some(cur - 1),
-            None => (0..stops.len())
-                .rev()
-                .find(|&i| rows[i] < scroll as usize + viewport),
+            Some(cur) => (cur > 0).then(|| cur - 1),
+            // The `↑` mirror at the bottom band: the last stop the follow
+            // would not pull the view back down for.
+            None => shunt_none_focus_target(&rows, &ends, scroll, viewport, total, false, |_| true),
         }
     };
 
-    // The current focus kept while its line is still in view after a scroll.
+    // The current focus kept while its block sits inside the padded band after
+    // a text scroll — where the render's follow leaves the offset put. Once the
+    // follow would move the view, the focus drops, so the one-line scroll is
+    // never pulled back.
     let stops_ref = &stops;
     let rows_ref = &rows;
-    let keep_focus = move |scroll: u16| {
+    let ends_ref = &ends;
+    let keep_focus = move |scroll: usize| {
         focus.filter(|kind| {
             stops_ref
                 .iter()
                 .position(|s| s.kind() == kind.clone())
-                .is_some_and(|i| shunt_in_view(scroll, viewport, rows_ref[i]))
+                .is_some_and(|i| {
+                    shunt_follow_holds(scroll, viewport, total, rows_ref[i], ends_ref[i])
+                })
         })
     };
 
     match target {
-        Some(t) if shunt_in_view(scroll, viewport, rows[t]) => {
+        Some(t) if shunt_block_in_view(scroll, viewport, rows[t], ends[t]) => {
+            // The target's block is already in view: take it; the render pads
+            // past its block on the next draw.
             app.services.set_shunt_focus(Some(stops[t].kind()));
         }
         Some(_) => {
-            // The target is out of view: scroll one line toward it, then take
-            // it if that brought it into view, else keep the current focus
-            // while its line is still visible.
+            // The target's block is out of view: scroll one line toward it,
+            // then take it if that brought its block into view, else keep the
+            // current focus while it stays inside the padded band.
             if down {
                 scroll = scroll.saturating_add(1).min(max_scroll);
             } else {
                 scroll = scroll.saturating_sub(1);
             }
-            let target_taken = target
-                .filter(|&t| shunt_in_view(scroll, viewport, rows[t]))
-                .map(|t| stops[t].kind());
-            app.services
-                .set_shunt_focus(target_taken.or_else(|| keep_focus(scroll)));
+            match target.filter(|&t| shunt_block_in_view(scroll, viewport, rows[t], ends[t])) {
+                Some(t) => app.services.set_shunt_focus(Some(stops[t].kind())),
+                None => app.services.set_shunt_focus(keep_focus(scroll)),
+            }
         }
         None => {
             // No further actionable line: scroll one line while there is text
@@ -7365,86 +10874,181 @@ fn shunt_step(app: &mut App, down: bool) {
             app.services.set_shunt_focus(keep_focus(scroll));
         }
     }
-    app.services.detail_scroll = scroll;
+    app.services.shunt_scroll.set(scroll);
 }
 
-/// Whether a rendered row is inside the current viewport.
-fn shunt_in_view(scroll: u16, viewport: usize, r: usize) -> bool {
-    r >= scroll as usize && r < scroll as usize + viewport
+/// Whether any row of a stop's block `start..end` (end exclusive) is inside the
+/// current viewport. The one in-view predicate the walk's take gate and
+/// reconcile, `focused_shunt_focus`, the render's caret gate and the held-focus
+/// keep of `settle_shunt_focus`/`re_settle_shunt_focus` all share: a multi-line
+/// stop is in view while any of its rows shows, never its first row alone.
+pub(crate) fn shunt_block_in_view(
+    scroll: usize,
+    viewport: usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    start < scroll + viewport && end > scroll
+}
+
+/// Whether the render's follow over a stop's block `start..end` leaves `scroll`
+/// unchanged — the block already sits inside the padded band (the band shrinks
+/// at the card's ends as [`follow_scroll_offset`] does). The text-scroll arms
+/// keep a held focus only while this holds, and the page keys settle onto the
+/// first stop where it does, so the render never pulls either back.
+fn shunt_follow_holds(
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    follow_scroll_offset(total, viewport, (start, end), scroll) == scroll
+}
+
+/// The one none-focus target rule the `↓`/`↑` arms of [`shunt_step`] and the
+/// no-focus arm of [`shunt_walk_to_next_fix`] share: the first (down) or last
+/// (up) stop in card order the render's follow over its block would not pull
+/// the view back against the key's direction — `follow_scroll_offset` lands at
+/// or above `scroll` going down, at or below `scroll` going up — so a stop a
+/// text scroll just dropped (still inside the top/bottom band) is never
+/// re-taken. `filter` narrows the candidates (`f` passes only its fix stops;
+/// `↓`/`↑` pass every stop). Returns the stop's index, or `None` when no stop
+/// passes (the caller falls back to its own wrap).
+fn shunt_none_focus_target(
+    rows: &[usize],
+    ends: &[usize],
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+    down: bool,
+    filter: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let pass = |i: usize| {
+        let follow = follow_scroll_offset(total, viewport, (rows[i], ends[i]), scroll);
+        if down {
+            ends[i] > scroll && follow >= scroll
+        } else {
+            rows[i] < scroll + viewport && follow <= scroll
+        }
+    };
+    if down {
+        (0..rows.len()).find(|&i| filter(i) && pass(i))
+    } else {
+        (0..rows.len()).rev().find(|&i| filter(i) && pass(i))
+    }
 }
 
 /// One `PageUp`/`PageDown` on the shunt card: scroll the read-only detail one
-/// page (`viewport - 1` lines), then re-pick the first actionable line in view
-/// (or none) — the same rule a resize applies.
+/// page (`viewport - 1` lines), then re-settle to the first stop whose block
+/// already sits inside the padded band (else none) — the render's follow then
+/// has nothing to move.
 fn shunt_page(app: &mut App, down: bool) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
     };
     let rows = app.services.shunt_stop_rows.borrow().clone();
-    if rows.len() != stops.len() {
+    let ends = app.services.shunt_stop_ends.borrow().clone();
+    if rows.len() != stops.len() || ends.len() != stops.len() {
         // Geometry not published yet (a key before the first draw) — as in
         // `shunt_step`, there is nothing to walk over.
         return;
     }
-    let max = app.services.detail_max_scroll.get();
+    let max = app.services.detail_max_scroll.get() as usize;
     let viewport = app.services.shunt_viewport.get() as usize;
+    let total = app.services.shunt_total.get();
     // Compare the RENDERED offset (the stored scroll clamped to the last
     // render's bound), not the raw stored value: a taller terminal leaves the
     // stored scroll above the new bound, and a page over a stale number must
     // not re-pick focus while the rendered view stays put.
-    let before = app.services.detail_scroll.min(max);
+    let before = app.services.shunt_scroll.get().min(max);
     let paged = if down {
-        page_down_scroll(before as usize, max as usize, viewport) as u16
+        page_down_scroll(before, max, viewport)
     } else {
-        page_up_scroll(before as usize, max as usize, viewport) as u16
+        page_up_scroll(before, max, viewport)
     };
-    app.services.detail_scroll = paged;
+    app.services.shunt_scroll.set(paged);
     if paged == before {
         // The card fits, or is already at this end: the held focus stays.
         return;
     }
-    app.services
-        .set_shunt_focus(shunt_first_in_view(&stops, &rows, paged, viewport));
+    app.services.set_shunt_focus(shunt_first_follow_holds(
+        &stops, &rows, &ends, paged, viewport, total,
+    ));
 }
 
-/// The shunt card's descend rule: the first actionable line in view, else
-/// none.
+/// The first stop whose block already sits inside the padded band at `scroll`
+/// (the render's follow leaves `scroll` unchanged), else none. The page keys
+/// and the render's re-settle land here, so the follow has nothing further to
+/// move; a text scroll's dropped focus is not re-picked (it left the band).
+fn shunt_first_follow_holds(
+    stops: &[ShuntFocus],
+    rows: &[usize],
+    ends: &[usize],
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+) -> Option<ShuntFocusLine> {
+    stops
+        .iter()
+        .zip(rows)
+        .zip(ends)
+        .find(|&((_, &start), &end)| shunt_follow_holds(scroll, viewport, total, start, end))
+        .map(|((s, _), _)| s.kind())
+}
+
+/// The first stop whose block is in view (any row showing), else none. The
+/// descend rule lands here: at the top of the card a stop near the bottom edge
+/// is still "in view", and the render's follow then pads it.
 fn shunt_first_in_view(
     stops: &[ShuntFocus],
     rows: &[usize],
-    scroll: u16,
+    ends: &[usize],
+    scroll: usize,
     viewport: usize,
 ) -> Option<ShuntFocusLine> {
     stops
         .iter()
         .zip(rows)
-        .find(|(_, r)| shunt_in_view(scroll, viewport, **r))
-        .map(|(s, _)| s.kind())
+        .zip(ends)
+        .find(|&((_, &start), &end)| shunt_block_in_view(scroll, viewport, start, end))
+        .map(|((s, _), _)| s.kind())
 }
 
 /// The shunt card's descend rule applied on descend: focus keeps its held
-/// identity while that line is in view, else it becomes the first actionable
-/// line in view (else none). Re-descending after an ascend therefore restores
-/// the walk position instead of resetting to the top of the card.
+/// identity while that block is in view, else it becomes the first actionable
+/// block in view (else none) — the render's follow then pads it. Re-descending
+/// after an ascend therefore restores the walk position instead of resetting
+/// to the top of the card.
 fn settle_shunt_focus(app: &mut App) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
     };
+    // Descend opens the card at the top (the render then follows the settled
+    // block).
+    app.services.shunt_scroll.set(0);
     let rows = app.services.shunt_stop_rows.borrow().clone();
+    let ends = app.services.shunt_stop_ends.borrow().clone();
     let viewport = app.services.shunt_viewport.get() as usize;
     let scroll = app
         .services
-        .detail_scroll
-        .min(app.services.detail_max_scroll.get());
+        .shunt_scroll
+        .get()
+        .min(app.services.detail_max_scroll.get() as usize);
     let held = app.services.shunt_focus_kind().and_then(|kind| {
         stops
             .iter()
             .position(|s| s.kind() == kind)
-            .filter(|&i| i < rows.len() && shunt_in_view(scroll, viewport, rows[i]))
+            .filter(|&i| {
+                i < rows.len()
+                    && i < ends.len()
+                    && shunt_block_in_view(scroll, viewport, rows[i], ends[i])
+            })
             .map(|i| stops[i].kind())
     });
-    app.services
-        .set_shunt_focus(held.or_else(|| shunt_first_in_view(&stops, &rows, scroll, viewport)));
+    app.services.set_shunt_focus(
+        held.or_else(|| shunt_first_in_view(&stops, &rows, &ends, scroll, viewport)),
+    );
 }
 
 /// Flip the record's `disabled` flag at once, reading and writing the value
@@ -7473,7 +11077,7 @@ fn toggle_shunt_enabled(app: &mut App) {
     recompute_services_checks(app, false, ShuntRefresh::Restart);
 }
 
-/// Toggle one config entry row expanded/collapsed (the cloudy-tui disclosure
+/// Toggle one config entry row expanded/collapsed (the disclosure
 /// contract: `space` and `↵` both activate, independently per entry). The
 /// recompute prunes an expanded key whose entry left the config, so a key
 /// re-appearing after an edit arrives collapsed.
@@ -7536,12 +11140,12 @@ fn rebuild_shunt_config_stops(app: &mut App) {
 
 // ── add and remove rows ─────────────────────────────────────────────────────
 
-/// `↵`/`space` on `+ add <kind>`: open the blank draft in place, or fold it
-/// when it is already open (the Setup `+ new` form's precedent, which `esc` at
-/// rest on a draft row follows too). Focus stays on the `+ add` row.
+/// `↵` on `+ add <kind>`: open the blank draft in place, or fold it when it
+/// is already open (the Setup `+ new` form's precedent, which `esc` at rest on
+/// a draft row follows too). Focus stays on the `+ add` row.
 fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
-    // A locked draft ignores fold (ruling 2): `↵`/`space` on `+ add <kind>` are
-    // inert while its `save <kind>` checks.
+    // A locked draft ignores fold: `↵` on `+ add <kind>` is inert while its
+    // `save <kind>` checks.
     if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
         return;
     }
@@ -7552,8 +11156,19 @@ fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
         app.services.shunt_drafts.open(kind);
     }
     // A folded draft closes its field editor too (a draft field's included).
-    if was_open
-        && let Some(state) = &app.services.shunt_field_edit
+    if was_open {
+        close_draft_editor_if_open(app, kind);
+    }
+    rebuild_shunt_config_stops(app);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
+}
+
+/// Close a folded `+ add <kind>` draft's field editor when the open editor is
+/// that kind's draft field; an editor of another kind (or a real field) stays
+/// open.
+fn close_draft_editor_if_open(app: &mut App, kind: ShuntAddKind) {
+    if let Some(state) = &app.services.shunt_field_edit
         && let ShuntFieldKey::Draft {
             kind: state_kind, ..
         } = state.key
@@ -7561,27 +11176,30 @@ fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
     {
         app.services.shunt_field_edit = None;
     }
-    rebuild_shunt_config_stops(app);
-    app.services
-        .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
 }
 
 /// `↵` on `save <kind>`: build the `New*` from the draft (a blank field is
 /// left out) and run it through the save worker. A required field left blank
 /// refuses before any worker runs, on the `└` line under `save <kind>`.
-fn commit_shunt_add(app: &mut App, kind: ShuntAddKind) {
+/// Returns `AsyncStarted` once the worker runs, `Refused` otherwise.
+fn commit_shunt_add(app: &mut App, kind: ShuntAddKind) -> CommitResult {
     if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
-        return;
+        return CommitResult::AsyncStarted;
     }
     let Some(view) = config_view(app).cloned() else {
-        return;
+        return CommitResult::Refused;
     };
     match build_add_edit(&view, &app.services.shunt_drafts, kind) {
         AddDraft::Refuse(sentence) => {
             app.services.shunt_drafts.set_refusal(kind, sentence);
+            CommitResult::Refused
         }
         AddDraft::Edit(edit) => {
-            start_shunt_save(app, ShuntSaveKey::SaveAdd(kind), *edit, false);
+            if start_shunt_save(app, ShuntSaveKey::SaveAdd(kind), *edit, false) {
+                CommitResult::AsyncStarted
+            } else {
+                CommitResult::Refused
+            }
         }
     }
 }
@@ -7842,11 +11460,10 @@ fn is_rename_field(key: &ShuntFieldKey) -> bool {
 }
 
 /// Open one field's typed editor, seeded from the saved value (`None` = unset).
-/// Both `↵` and `space` open a typed row; a cycle row's `↵` at rest opens the
-/// same custom-value editor. A row whose save is still checking never reopens a
-/// fresh editor over the file's value: `↵`/`space` are inert there, so a
-/// refusal landing later toasts instead of describing text the editor no
-/// longer shows.
+/// `↵` opens a typed row; a cycle row's `↵` at rest opens the same custom-value
+/// editor. A row whose save is still checking never reopens a fresh editor over
+/// the file's value: `↵` is inert there, so a refusal landing later toasts
+/// instead of describing text the editor no longer shows.
 fn open_shunt_field_editor(app: &mut App, key: &ShuntFieldKey) {
     if field_locked(app, key) {
         return;
@@ -7926,7 +11543,9 @@ fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.services.shunt_field_edit = None;
         }
-        KeyCode::Enter => commit_shunt_field(app, &state.key),
+        KeyCode::Enter => {
+            let _ = commit_shunt_field(app);
+        }
         KeyCode::Char(' ') if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => {
             step_shunt_pick(app, &state.key);
         }
@@ -7942,10 +11561,91 @@ fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
 
 /// `↵` in a field editor: build the edit and either save it (through a confirm
 /// for a bind restart or a cascading rename) or show the dry run's refusal.
-fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
-    let Some(state) = app.services.shunt_field_edit.clone() else {
-        return;
+/// How one changed item's commit resolved under a loss-warning `save`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitResult {
+    /// Committed synchronously.
+    Landed,
+    /// An async save worker started; its outcome resolves (or cancels) the
+    /// hold on the switch/quit target.
+    AsyncStarted,
+    /// The item refused at commit time; the editor stays open.
+    Refused,
+    /// The commit opened a further dialog instead of landing.
+    Dialog,
+}
+
+/// The further confirm a real shunt field's save opens instead of starting
+/// the save: a rename cascade, or a bind restart. `None` = save directly. The
+/// save's dialog pre-check and the commit both read this, so the two can never
+/// disagree.
+fn shunt_field_confirm(app: &App, state: &ShuntFieldEditState) -> Option<ConfirmState> {
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        return None;
+    }
+    let typed = match &state.edit {
+        ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+        ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
     };
+    let view = config_view(app)?;
+    let edit = edit_for_field(view, &state.key, &typed)?;
+    if is_rename_field(&state.key) {
+        let record = app.services.shunt_record.clone()?;
+        if let Ok(Some(cascade)) = crate::gateway_edit::plan_cascade(&record, &edit)
+            && cascade_has_refs(&cascade, &state.key)
+        {
+            let counts = rename_counts_line(&cascade, &state.key);
+            let kind = match &state.key {
+                ShuntFieldKey::Upstream { .. } => "upstream",
+                _ => "model",
+            };
+            let from = rename_from(&state.key);
+            return Some(ConfirmState {
+                message: format!(
+                    "rename {kind} \"{from}\" to \"{}\"?",
+                    escape_control(&typed)
+                ),
+                detail: Some(format!("also renames it in {counts}.")),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::RenameField {
+                    key: state.key.clone(),
+                    edit: Box::new(edit),
+                },
+            });
+        }
+        return None;
+    }
+    if state.key == ShuntFieldKey::Bind {
+        let changed = match &state.edit {
+            ShuntFieldEdit::Typed { saved, .. } => saved.as_deref().unwrap_or("") != typed.as_str(),
+            ShuntFieldEdit::Pick { .. } => true,
+        };
+        if changed && bind_save_needs_confirm(app) {
+            let detail = bind_restart_detail(app, &typed);
+            return Some(ConfirmState {
+                message: "restart shunt?".to_string(),
+                detail: Some(detail),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::RestartBind {
+                    key: state.key.clone(),
+                    edit: Box::new(edit),
+                },
+            });
+        }
+    }
+    None
+}
+
+fn commit_shunt_field(app: &mut App) -> CommitResult {
+    let Some(state) = app.services.shunt_field_edit.clone() else {
+        return CommitResult::Refused;
+    };
+    // The open editor's OWN key, never a key captured when a warning opened:
+    // a route remove can shift the key while the warning waits, and writing
+    // the captured key would land the typed value on the wrong route.
+    let key = &state.key;
     let typed = match &state.edit {
         ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
         ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
@@ -7959,79 +11659,36 @@ fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
         app.services.shunt_drafts.clear_refusal(*kind);
         app.services.shunt_field_edit = None;
         rebuild_shunt_config_stops(app);
-        return;
+        return CommitResult::Landed;
+    }
+    // A rename cascade or a bind restart opens a confirm instead of saving.
+    if let Some(confirm) = shunt_field_confirm(app, &state) {
+        app.disarm_quit();
+        app.open_modal(Modal::Confirm(confirm));
+        return CommitResult::Dialog;
     }
     let Some(record) = app.services.shunt_record.clone() else {
-        return;
+        return CommitResult::Refused;
     };
     let Some(view) = config_view(app).cloned() else {
-        return;
+        return CommitResult::Refused;
     };
     let Some(edit) = edit_for_field(&view, key, &typed) else {
-        return;
+        return CommitResult::Refused;
     };
-
-    // A rename dry-runs the same edit (no write, no check) and counts what
-    // else it touches; any count confirms first.
-    if is_rename_field(key) {
-        match crate::gateway_edit::plan_cascade(&record, &edit) {
-            Ok(Some(cascade)) if cascade_has_refs(&cascade, key) => {
-                let counts = rename_counts_line(&cascade, key);
-                let kind = match key {
-                    ShuntFieldKey::Upstream { .. } => "upstream",
-                    _ => "model",
-                };
-                let from = rename_from(key);
-                app.disarm_quit();
-                app.open_modal(Modal::Confirm(ConfirmState {
-                    message: format!(
-                        "rename {kind} \"{from}\" to \"{}\"?",
-                        escape_control(&typed)
-                    ),
-                    detail: Some(format!("also renames it in {counts}.")),
-                    choice: false,
-                    scroll: ConfirmScroll::default(),
-                    on_confirm: ConfirmAction::RenameField {
-                        key: key.clone(),
-                        edit: Box::new(edit),
-                    },
-                }));
-                return;
-            }
-            Err(e) => {
-                show_field_refusal(app, key, &e);
-                return;
-            }
-            Ok(_) => {}
-        }
+    // A rename with no cascade still dry-runs; a refused dry-run keeps the
+    // editor open with its `└` sentence.
+    if is_rename_field(key)
+        && let Err(e) = crate::gateway_edit::plan_cascade(&record, &edit)
+    {
+        show_field_refusal(app, key, &e);
+        return CommitResult::Refused;
     }
-
-    // A bind save restarts the gateway: confirm while supervised and running
-    // (and the value actually changed — an equal-value save writes nothing;
-    // an emptied bind over an unset one is no change either).
-    if key == &ShuntFieldKey::Bind {
-        let changed = match &state.edit {
-            ShuntFieldEdit::Typed { saved, .. } => saved.as_deref().unwrap_or("") != typed.as_str(),
-            ShuntFieldEdit::Pick { .. } => true,
-        };
-        if changed && bind_save_needs_confirm(app) {
-            let detail = bind_restart_detail(app, &typed);
-            app.disarm_quit();
-            app.open_modal(Modal::Confirm(ConfirmState {
-                message: "restart shunt?".to_string(),
-                detail: Some(detail),
-                choice: false,
-                scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::RestartBind {
-                    key: key.clone(),
-                    edit: Box::new(edit),
-                },
-            }));
-            return;
-        }
+    if start_shunt_save(app, ShuntSaveKey::Field(key.clone()), edit, false) {
+        CommitResult::AsyncStarted
+    } else {
+        CommitResult::Refused
     }
-
-    start_shunt_save(app, ShuntSaveKey::Field(key.clone()), edit, false);
 }
 
 /// The rename confirm's `from`: the entry's current name/id, control-escaped
@@ -8169,20 +11826,21 @@ fn show_field_refusal(app: &mut App, key: &ShuntFieldKey, err: &anyhow::Error) {
 /// every config save, token add and token remove shares; a second toasts the
 /// guard). `value`/`entry` are the [`ShuntSave`] fields the config-save path
 /// carries for its row; token jobs pass none. A field's editor stays open with
-/// the typed text until the outcome lands.
+/// the typed text until the outcome lands. Returns whether the worker started;
+/// `false` means the guard refused and nothing was enqueued.
 fn start_on_save_worker(
     app: &mut App,
     key: ShuntSaveKey,
     value: Option<String>,
     entry: Option<ShuntEntryKey>,
     job: ShuntActionJob,
-) {
+) -> bool {
     if app.services.shunt_save_worker.running {
         app.toast(
             ToastKind::Info,
             "a save is still checking\nwait for it, then save again",
         );
-        return;
+        return false;
     }
     app.services.shunt_save = Some(ShuntSave {
         key,
@@ -8191,17 +11849,20 @@ fn start_on_save_worker(
         entry,
     });
     app.services.shunt_save_worker.start(job);
+    true
 }
 
 /// Start the save worker for one config row (the outcome drains on the tick).
+/// Returns whether the worker started, so a one-save-guard refusal is a real
+/// refusal, never an "async started".
 fn start_shunt_save(
     app: &mut App,
     key: ShuntSaveKey,
     edit: crate::gateway_edit::Edit,
     confirmed: bool,
-) {
+) -> bool {
     let Some(record) = app.services.shunt_record.clone() else {
-        return;
+        return false;
     };
     let entry = add_edit_entry_key(&edit, config_view(app));
     start_on_save_worker(
@@ -8215,7 +11876,7 @@ fn start_shunt_save(
             key,
             confirmed,
         },
-    );
+    )
 }
 
 /// Start a token remove on the one save worker (the same one-save slot every
@@ -8379,6 +12040,14 @@ fn stderr_display_lines(text: &str) -> Vec<String> {
     strip_ansi_csi(text).lines().map(escape_control).collect()
 }
 
+/// A danger toast body over a multi-line diagnostic: `title` on its own line,
+/// then each line of `diagnostic` ANSI-stripped and control-escaped, the lines
+/// kept apart with `\n` so the toast splits them into rows. Shared by the
+/// herdr heal and the plugin install failure toasts.
+fn diagnostic_toast_body(title: &str, diagnostic: &str) -> String {
+    format!("{title}\n{}", stderr_display_lines(diagnostic).join("\n"))
+}
+
 /// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
 /// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so the modal shows
 /// text, not terminal escape bytes. Any byte outside those ranges before the
@@ -8474,6 +12143,19 @@ fn apply_service_fix(app: &mut App) {
                 choice: false,
                 scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::InstallPlugin,
+            }));
+        }
+        ServiceFix::Completions { shell, stale } => {
+            app.disarm_quit();
+            // The writer's own path builder names what the fix touches, so the
+            // confirm cannot drift onto a second spelling of it.
+            let verb = if stale { "update" } else { "install" };
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: format!("{verb} {shell} completions?"),
+                detail: crate::completions::install_summary(&shell).ok(),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::Completions { shell, stale },
             }));
         }
         ServiceFix::AdoptConfig(path) => {
@@ -8654,7 +12336,7 @@ fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
 
 /// Apply space/⏎ to the focused options row: cycle, toggle, open the tag
 /// editor, or confirm the delegate-row rewrite. Every change persists
-/// immediately through `save_app_state` (the `cycle_theme` shape).
+/// immediately through `update_app_state` (the `cycle_theme` shape).
 fn activate_herdr_option(app: &mut App, row: HerdrOption) {
     match row {
         HerdrOption::PopupWidth => cycle_herdr_popup_width(app),
@@ -8693,28 +12375,21 @@ fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
     if HERDR_OPTIONS[app.services.herdr_options_cursor] != HerdrOption::TagRefresh {
         return;
     }
-    {
-        let mut cfg = app.config();
-        let cur = cfg.state.herdr.tag_watch_secs;
-        cfg.state.herdr.tag_watch_secs = if delta > 0 {
-            cur.saturating_add(1)
-        } else {
-            cur.saturating_sub(1).max(1)
-        };
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let cur = app.config().state.herdr.tag_watch_secs;
+    let next = if delta > 0 {
+        cur.saturating_add(1)
+    } else {
+        cur.saturating_sub(1).max(1)
+    };
+    app.save_state_delta(|s, _held| s.herdr.tag_watch_secs = next);
+    app.apply_forgets();
 }
 
 /// Flip one herdr bool knob and persist immediately (the `cycle_theme` save
 /// shape — no separate save step).
 fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
-    {
-        let mut cfg = app.config();
-        flip(&mut cfg.state.herdr);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| flip(&mut s.herdr));
+    app.apply_forgets();
 }
 
 /// Push a `pane_tag`/`border_label` change onto the live herdr panes right
@@ -8790,17 +12465,14 @@ fn rerun_pane_report(script: &str, pane: &str) {
 /// Advance the popup-width knob to the next shape, wrapping past `split-top`
 /// back to `fit` — space always cycles forward, never clamps.
 fn cycle_herdr_popup_width(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.herdr.popup_width = match cfg.state.herdr.popup_width {
-            PopupWidth::Fit => PopupWidth::Half,
-            PopupWidth::Half => PopupWidth::SplitRight,
-            PopupWidth::SplitRight => PopupWidth::SplitTop,
-            PopupWidth::SplitTop => PopupWidth::Fit,
-        };
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = match app.config().state.herdr.popup_width {
+        PopupWidth::Fit => PopupWidth::Half,
+        PopupWidth::Half => PopupWidth::SplitRight,
+        PopupWidth::SplitRight => PopupWidth::SplitTop,
+        PopupWidth::SplitTop => PopupWidth::Fit,
+    };
+    app.save_state_delta(|s, _held| s.herdr.popup_width = next);
+    app.apply_forgets();
 }
 
 /// Open the inline typed editor for the tag-refresh stepper, seeded with the
@@ -8808,17 +12480,19 @@ fn cycle_herdr_popup_width(app: &mut App) {
 /// refresh-interval editor's mechanism.
 fn begin_herdr_tag_edit(app: &mut App) {
     let secs = app.config().state.herdr.tag_watch_secs;
-    app.services.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
+    app.services.herdr_tag_draft = Some(SeededInput::new(&secs.to_string()));
 }
 
 /// Keystrokes while the herdr tag-refresh editor is open: ⏎ saves, ⎋ discards.
 fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.services.herdr_tag_draft = None,
-        KeyCode::Enter => commit_herdr_tag_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_herdr_tag_edit(app);
+        }
         _ => {
-            if let Some(input) = app.services.herdr_tag_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.services.herdr_tag_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -8826,20 +12500,25 @@ fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
 
 /// Parse and persist the typed tag-refresh seconds. A value under 1s keeps the
 /// draft open so the inline Invalid-input treatment stays on screen — no toast.
-fn commit_herdr_tag_edit(app: &mut App) {
-    let Some(raw) = app.services.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// Returns whether the commit landed.
+fn commit_herdr_tag_edit(app: &mut App) -> bool {
+    let Some(raw) = app
+        .services
+        .herdr_tag_draft
+        .as_ref()
+        .map(|i| i.input.trimmed())
+    else {
+        return true;
     };
     let Some(secs) = parse_herdr_tag_secs(raw) else {
-        return;
+        return false;
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.herdr.tag_watch_secs = secs;
-        let _ = save_app_state(&cfg.state);
+    if !app.save_state_delta(|s, _held| s.herdr.tag_watch_secs = secs) {
+        return false;
     }
-    app.last_reload_fp = reload_fingerprint();
+    app.apply_forgets();
     app.services.herdr_tag_draft = None;
+    true
 }
 
 /// A typed tag-refresh value is valid only as a whole number of seconds, at
@@ -8927,7 +12606,7 @@ pub(crate) fn herdr_check(
 ) -> Check {
     let mut detail = Vec::new();
     let herdr_line = match &probe.version {
-        Some(version) => format!("herdr: {version}"),
+        Some(version) => format!("herdr: {}", escape_control(version)),
         None => "herdr: unknown".to_string(),
     };
 
@@ -8940,7 +12619,7 @@ pub(crate) fn herdr_check(
     let error_line = probe
         .error
         .as_ref()
-        .map(|error| format!("  {}", prose::mark_commands(error)));
+        .map(|error| format!("  {}", prose::mark_commands(&escape_control(error))));
     if error_line.is_some() {
         danger = true;
     }
@@ -8953,7 +12632,7 @@ pub(crate) fn herdr_check(
             danger = true;
         }
         if local && let Some(root) = &entry.plugin_root {
-            detail.push(format!("root: {root}"));
+            detail.push(format!("root: {}", escape_control(root)));
         }
         if !entry.enabled {
             warn = true;
@@ -8964,7 +12643,7 @@ pub(crate) fn herdr_check(
             detail.push("plugin: installed (github)".to_string());
         }
         for warning in &entry.warnings {
-            detail.push(format!("  {warning}"));
+            detail.push(format!("  {}", escape_control(warning)));
         }
         detail.push(herdr_line);
         detail.extend(error_line);
@@ -8972,7 +12651,7 @@ pub(crate) fn herdr_check(
             warn = true;
             detail.push(format!(
                 "plugin needs herdr {} or newer",
-                entry.min_herdr_version.as_deref().unwrap_or("unknown")
+                escape_control(entry.min_herdr_version.as_deref().unwrap_or("unknown"))
             ));
         }
 
@@ -8985,7 +12664,7 @@ pub(crate) fn herdr_check(
             }
             Some(c) => {
                 match &c.bound_key {
-                    Some(key) => detail.push(format!("key: {key}")),
+                    Some(key) => detail.push(format!("key: {}", escape_control(key))),
                     None => {
                         warn = true;
                         detail.push("key: not bound".to_string());
@@ -9055,6 +12734,18 @@ pub(crate) enum ShuntRefresh {
     /// Drop the plan/pool caches and restart their workers (respecting their
     /// gates), so "until it lands the card shows nothing for the plan" holds.
     Restart,
+}
+
+/// Set the gateway record the TUI holds, applying the record-changed rule the
+/// Services recompute used to inline: a record change (a re-adopt, a
+/// binary/env move) retires the last refusal's check output. The one writer
+/// every record reader routes through, so the Overview pool actions and the
+/// Services card always see the same adopted gateway.
+fn adopt_shunt_record(app: &mut App, record: Option<crate::gateway::GatewayRecord>) {
+    if record != app.services.shunt_record {
+        app.services.check_output = None;
+    }
+    app.services.shunt_record = record;
 }
 
 /// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
@@ -9147,12 +12838,7 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
         }
     }
     let record = crate::gateway::GatewayRecord::load().ok().flatten();
-    if record != app.services.shunt_record {
-        // The last refusal belonged to the record it edited against; a record
-        // change (a re-adopt, a binary/env move) retires it.
-        app.services.check_output = None;
-    }
-    app.services.shunt_record = record;
+    adopt_shunt_record(app, record);
     // The adopted config's editor view: a cheap local read on the recompute,
     // like the record and the admin need. `None` while no record exists (the
     // absent card shows no config section); a config read/parse failure keeps
@@ -9301,53 +12987,42 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     app.services.settle_delegates_selection();
     checks.push(delegates_check(&app.services.delegates, &rate_limited));
 
-    // plugin row — the folded readout, over the cached probes + the PATH read.
-    checks.push(plugin_check(
-        clauth_path.as_deref(),
-        app.services.cc_version.clone(),
-        app.services.mcp_boot.clone(),
-    ));
-
-    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
-    // The probe is cached (its worker lands it, above); the config read is a
-    // cheap `fs::read_to_string` that rides the tick, using the path the probe
-    // already resolved. No row when herdr does not resolve or its probe has not
-    // landed yet.
-    if let Some(Some(probe)) = &app.services.herdr {
-        let config = probe
-            .config_path
-            .as_deref()
-            .map(crate::herdr::read_config)
-            .and_then(Result::ok)
-            .map(|text| crate::herdr::config_status(&text));
-        checks.push(herdr_check(probe, config.as_ref()));
-        // The options section reads this verdict (writable vs inert) off the
-        // cache — recompute already paid for the file read, so neither the
-        // render nor the key handler re-reads per frame.
-        app.services.herdr_config = config;
-    } else {
-        // No herdr row renders without a probe, so its verdict must not
-        // outlive the probe (a stale writable verdict would arm the
-        // delegate-row confirm against a file that no longer resolves).
-        app.services.herdr_config = None;
-    }
+    // plugin + herdr rows — the folded readout, over the clauth binary path
+    // resolved above and the cached probes. The herdr probe is cached (its
+    // worker lands it, above); the config read is a cheap `fs::read_to_string`
+    // that rides the tick, using the config path the herdr probe resolved. No
+    // herdr row when herdr does not resolve or its probe has not landed yet.
+    let (plugin_check, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
+    let plugin_health = plugin_check.health;
+    checks.push(plugin_check);
+    let herdr_health = match herdr {
+        Some((herdr_check, config)) => {
+            let health = herdr_check.health;
+            checks.push(herdr_check);
+            // The options section reads this verdict (writable vs inert) off the
+            // cache — recompute already paid for the file read, so neither the
+            // render nor the key handler re-reads per frame.
+            app.services.herdr_config = config;
+            Some(health)
+        }
+        None => {
+            // No herdr row renders without a probe, so its verdict must not
+            // outlive the probe (a stale writable verdict would arm the
+            // delegate-row confirm against a file that no longer resolves).
+            app.services.herdr_config = None;
+            None
+        }
+    };
 
     app.services.checks = checks;
+    record_plugin_herdr_health(app, plugin_health, herdr_health);
 
     // Keep the cursors in range after the row/problem sets change.
     let max = app.services.row_count().saturating_sub(1);
     if app.services.cursor > max {
         app.services.cursor = max;
     }
-    let problems = app
-        .services
-        .selected_check()
-        .map(|c| c.problems.len())
-        .unwrap_or(0)
-        .saturating_sub(1);
-    if app.services.problem_cursor > problems {
-        app.services.problem_cursor = problems;
-    }
+    clamp_problem_cursor(app);
 
     // A delegates detail that emptied while descended has nothing left to
     // select: ascend to the selector so the footer and the pane focus cannot
@@ -9379,9 +13054,9 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     }
 
     // A card change keeps the shunt focus by identity while the kind still
-    // exists (a landed action can drop the line that held it); the render
-    // re-settles it (the descend rule) on the next frame when a change pushed
-    // the line out of view, over the freshly rendered geometry.
+    // exists; a landed action can drop the line that held it, so clear it here
+    // and let the render's re-settle pick the first stop in the padded band
+    // over the freshly rendered geometry.
     if let Some(kind) = app.services.shunt_focus_kind()
         && !app
             .services
@@ -9494,6 +13169,61 @@ fn refusal_row_visible(app: &App, on_row: bool) -> bool {
             .selected_check()
             .is_some_and(|c| c.label == "shunt")
         && on_row
+}
+
+/// Re-run the held trigger's own gate: a quit or the original switch/jump
+/// target, re-deriving changed work so it never lands over work opened during
+/// the hold.
+fn re_run_gate(app: &mut App, target: LossWarningTarget) {
+    match target {
+        LossWarningTarget::Quit => request_quit(app),
+        target => request_target(app, target),
+    }
+}
+
+/// Resolve (or cancel) the switch/quit a held field or `+ add` save is waiting
+/// on. A `RerunSave` hold (a field or `+ add` save already in flight) re-runs
+/// the save over the warned items still changed on its landing, or the gate
+/// when anything outside them changed, and re-runs the gate on a refusal. A
+/// `CancelOnRefusal` hold re-runs the gate on landing and cancels on refusal (a
+/// lone async save leaves the item open with its own `└` sentence). A direct
+/// hold (no warning shown) re-runs the gate on both outcomes, so a refused field
+/// warns over its open, red, changed self. A no-op when no save was held.
+fn settle_loss_pending(app: &mut App, success: bool) {
+    let Some(target) = app.loss_pending.take() else {
+        return;
+    };
+    match app.loss_pending_sync.take() {
+        Some(LossPendingSync::RerunSave(warned)) => {
+            if success {
+                let still = loss_dirty_for(app, &target);
+                if still.iter().any(|d| !warned.contains(d)) {
+                    re_run_gate(app, target);
+                } else if still.is_empty() {
+                    resolve_target(app, target);
+                } else {
+                    let _ = try_save_all(app, &still, target);
+                }
+            } else {
+                re_run_gate(app, target);
+            }
+        }
+        Some(LossPendingSync::CancelOnRefusal) => {
+            if success {
+                re_run_gate(app, target);
+            }
+        }
+        None => re_run_gate(app, target),
+    }
+}
+
+/// The changed work a held target's save covers: everything for a quit, the
+/// screen being left for a switch or jump.
+fn loss_dirty_for(app: &App, target: &LossWarningTarget) -> Vec<Dirty> {
+    match target {
+        LossWarningTarget::Quit => changed_work(app),
+        _ => changed_work_on(app, app.tab),
+    }
 }
 
 /// One shunt-card action's result: the toast, every error `Display` escaped
@@ -9736,6 +13466,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                     );
                 }
             }
+            settle_loss_pending(app, true);
         }
         ShuntActionOutcome::ConfigRefused { key, sentence } => {
             app.services.shunt_save = None;
@@ -9807,6 +13538,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                     unreachable!("the require never yields ConfigRefused")
                 }
             }
+            settle_loss_pending(app, false);
         }
         ShuntActionOutcome::ConfigCheckFailed {
             error,
@@ -9819,6 +13551,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 format!("save failed\n{}", escape_control(&error)),
             );
             hold_check_output(app, &config, CheckOutputSource::ConfigSave, check_output);
+            settle_loss_pending(app, false);
         }
         ShuntActionOutcome::ConfigFailed { error } => {
             app.services.shunt_save = None;
@@ -9826,6 +13559,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 ToastKind::Danger,
                 format!("save failed\n{}", escape_control(&error)),
             );
+            settle_loss_pending(app, false);
         }
         ShuntActionOutcome::TokenRemoved { profile, removed } => {
             app.services.shunt_save = None;
@@ -9848,6 +13582,10 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
         }
         ShuntActionOutcome::TokenRemoveRefused { profile, sentence } => {
             app.services.shunt_save = None;
+            // The sentence can carry config text off shunt's files, so it is
+            // escaped once, before the arms split: the stored `└` line and the
+            // toast take the same value.
+            let sentence = escape_control(&sentence);
             // The refusal sits on the `└` line under the token row only while
             // that row is on the focused card — the Services tab, the detail
             // pane, the `shunt` row, and the focus still on the token row.
@@ -9859,10 +13597,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                     .shunt_token_refusal
                     .replace(Some((profile, sentence)));
             } else {
-                app.toast(
-                    ToastKind::Danger,
-                    format!("remove failed\n{}", escape_control(&sentence)),
-                );
+                app.toast(ToastKind::Danger, format!("remove failed\n{sentence}"));
             }
         }
         ShuntActionOutcome::TokenRemoveFailed { error } => {
@@ -9879,12 +13614,12 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
         } => {
             app.services.shunt_save = None;
             // A repointed credential retires the old provider's verdict pill
-            // and throttle streak — the shared clear every credential-replacing
-            // path runs (the `commit_endpoint` precedent), and the token
-            // collection re-reads so the fetch leg schedules the re-keyed
-            // profile's first fetch same-frame.
+            // and throttle streak — the identity-conditional drain every
+            // credential-replacing path runs (the `commit_endpoint` precedent),
+            // and the token collection re-reads so the fetch leg schedules the
+            // re-keyed profile's first fetch same-frame.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &ProfileName::from(profile.as_str()));
+            app.apply_forgets();
             if require {
                 // The require flow's pick: no `uses the gateway` toast and no
                 // token-row focus — the card reads that it waits for the
@@ -10095,7 +13830,7 @@ fn confirm_shunt_remove_token(app: &mut App, profile: &str) {
     }));
 }
 
-/// `↵`/`space` on `+ add token`: open the profile picker — row 0 is
+/// `↵` on `+ add token`: open the profile picker — row 0 is
 /// `+ new profile`, then one row per claude profile in roster order (the
 /// Overview's roster; codex profiles live in their own store, never here).
 /// `require` = the picker serves the `require client tokens` flow, so its
@@ -10131,10 +13866,19 @@ fn open_token_picker(app: &mut App, require: bool) {
     }));
 }
 
-/// The `+ new profile` row: close the picker and open the new-account form
-/// through [`start_new_account`], seeded with the gateway's base url and the
-/// marker naming the record it mints for. A bind read failure opens no form.
+/// Whether a suspended `+ new` form holds typed work: the form's own home
+/// The `+ new profile` row: open a fresh new-account form seeded with the
+/// gateway's base url and the marker naming the record it mints for. The jump
+/// routes through the loss warning like every cross-screen jump: changed work
+/// on Services warns first, `discard` drops it and opens the mint form.
 fn open_new_profile_form(app: &mut App, require: bool) {
+    request_target(app, LossWarningTarget::MintForm(require));
+}
+
+/// The mint form's own open, after the warning's guard has passed: close the
+/// picker (already done by the caller) and stamp a fresh draft. A bind read
+/// failure opens no form.
+fn open_new_profile_form_inner(app: &mut App, require: bool) {
     let Some(record) = app.services.shunt_record.clone() else {
         app.toast(
             ToastKind::Danger,
@@ -10162,15 +13906,21 @@ fn open_new_profile_form(app: &mut App, require: bool) {
             return;
         }
     };
-    start_new_account(app);
-    if let Some(d) = app.config_draft.as_mut() {
-        d.base_url = InputState::new(&url);
-        d.mint_for = Some(TokenMint {
-            record,
-            bind,
-            require,
-        });
-    }
+    // The mint form replaces whatever `config_draft` holds and leaves a form
+    // suspended in `new_account_draft` where it is.
+    disarm_switch(app);
+    do_switch(app, Tab::Setup);
+    app.profile_cursor.set(app.profile_count());
+    app.config_action_cursor = 0;
+    let mut draft = build_draft_new();
+    draft.base_url = InputState::new(&url);
+    draft.mint_for = Some(TokenMint {
+        record,
+        bind,
+        require,
+    });
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
 }
 
 /// A picker pick: open the overwrite confirm naming what it replaces. The
@@ -10870,7 +14620,7 @@ pub(crate) fn shunt_card(
 
     // The failed check's output, after the admin fix lines (an admin edit's
     // sits right under the fix it came from; a config save's follows whatever
-    // fix line the card shows): an actionable line whose ↵/space opens the
+    // fix line the card shows): an actionable line whose ↵ opens the
     // read-only masked-stderr modal.
     if check_output {
         let line = check.detail.len();
@@ -11015,15 +14765,63 @@ fn token_read_reason(e: &anyhow::Error) -> String {
     }
 }
 
+/// The client-token store's profile names, in name order: the one reader of
+/// them, so the Services card's token rows and the Overview's active mark
+/// cannot drift apart.
+fn read_client_token_names() -> anyhow::Result<Vec<String>> {
+    Ok(crate::gateway_tokens::ClientTokens::load()?
+        .names()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Re-read the Overview active mark's names when the client-token store file
+/// itself changed since the cached read: the tick compares the store's write
+/// stamp and reads the contents only on a move. Every store write is one atomic
+/// write the tick sees as a new stamp, so the mark follows the file rather than
+/// a list of flows. A read failure leaves no name, so no `⥋` shows.
+fn refresh_shunt_mark(app: &mut App) {
+    let stamp = crate::gateway_tokens::store_path()
+        .ok()
+        .and_then(|path| store_stamp(&path));
+    if stamp == app.shunt_mark.stamp {
+        return;
+    }
+    app.shunt_mark = ShuntMark {
+        names: read_client_token_names().unwrap_or_default(),
+        stamp,
+    };
+}
+
+/// The store file's write stamp; a missing store answers `None`.
+fn store_stamp(path: &std::path::Path) -> Option<StoreStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(StoreStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+        #[cfg(unix)]
+        id: file_id(&meta),
+    })
+}
+
+/// The `(dev, ino)` of a file's metadata, the identity a fresh-inode write
+/// moves.
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
 /// The client-token section's data, read beside the config view: the store's
-/// names and the unmanaged client names (with their source) from
-/// [`crate::gateway::client_auth`]. A store read failure records its sentence
-/// in `error` (no stored rows); a client-auth read failure records its
-/// sentence in `unmanaged_error` (the stored rows stay, the unmanaged rows read
-/// `other clients  not read`). Each keeps the `+ add token` row.
+/// names (through [`read_client_token_names`]) and the unmanaged client names
+/// (with their source) from [`crate::gateway::client_auth`]. A store read
+/// failure records its sentence in `error` (no stored rows); a client-auth read
+/// failure records its sentence in `unmanaged_error` (the stored rows stay, the
+/// unmanaged rows read `other clients  not read`). Each keeps the
+/// `+ add token` row.
 fn read_shunt_tokens(record: &crate::gateway::GatewayRecord) -> ShuntTokens {
-    let stored: Vec<String> = match crate::gateway_tokens::ClientTokens::load() {
-        Ok(tokens) => tokens.names().map(str::to_string).collect(),
+    let stored = match read_client_token_names() {
+        Ok(names) => names,
         Err(e) => {
             return ShuntTokens {
                 error: Some(token_read_reason(&e)),
@@ -12037,6 +15835,828 @@ fn pool_probe() -> PoolOutcome {
     }
 }
 
+/// The Overview shunt section's prober: reload the record and read the typed
+/// pool listing. `Absent` with no adopted gateway, with a config whose admin
+/// entry clauth cannot read (no `[server.admin]`/clauth entry, or a missing
+/// admin token file: the Services card offers `f  add admin table` / `f  add
+/// admin key` for the first two and, while the gateway runs, reads
+/// `pool  no gateway admin token` for a missing token file — never an error
+/// heading), `NotRead("the gateway is not running")` when the status feed does
+/// not show it healthy (no request is made), else the listing or the error's
+/// `Display`.
+fn shunt_pool_probe() -> ShuntPool {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return ShuntPool::Absent;
+    };
+    // The admin-entry check comes first: it reads the config alone, so it holds
+    // even when the gateway is down. A config clauth has no admin entry in, or
+    // whose token file is missing, has no pool it can read.
+    match crate::gateway::admin_need(record.config()) {
+        Ok(crate::gateway::AdminNeed::Neither) => {}
+        Ok(_) => return ShuntPool::Absent,
+        Err(e) => return ShuntPool::NotRead(format!("{e}")),
+    }
+    match crate::gateway::read_admin_token() {
+        Ok(_) => {}
+        Err(e) => match e.downcast_ref::<crate::gateway::ChatgptOauthProvidersError>() {
+            Some(crate::gateway::ChatgptOauthProvidersError::NoAdminToken) => {
+                return ShuntPool::Absent;
+            }
+            _ => return ShuntPool::NotRead(format!("{e}")),
+        },
+    }
+    let (slot, _) = crate::daemon::gateway_slot(crate::daemon::daemon_health());
+    if slot.state != GatewayState::Healthy {
+        return ShuntPool::NotRead("the gateway is not running".to_string());
+    }
+    match crate::gateway_admin::list_pool(&record) {
+        Ok(providers) => ShuntPool::Read(providers),
+        Err(e) => ShuntPool::NotRead(format!("{e}")),
+    }
+}
+
+/// One pool remove/refresh the worker runs to completion. The slow calls — a
+/// refresh can block up to its 600 s bound — never hold a frame.
+enum PoolJob {
+    Remove {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::PoolFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        display: String,
+    },
+    Refresh {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::RefreshFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        display: String,
+    },
+    /// Test seam: a job that panics, so the unwind path's failure landing is
+    /// reachable without a real gateway panic.
+    #[cfg(test)]
+    Panic { operation: &'static str },
+}
+
+impl PoolJob {
+    /// The operation name a failure toast carries.
+    fn operation(&self) -> &'static str {
+        match self {
+            PoolJob::Remove { .. } => "remove",
+            PoolJob::Refresh { .. } => "refresh",
+            #[cfg(test)]
+            PoolJob::Panic { operation } => operation,
+        }
+    }
+
+    fn run(self) -> PoolMutationResult {
+        match self {
+            #[cfg(test)]
+            PoolJob::Panic { .. } => panic!("test seam: the pool job panicked"),
+            PoolJob::Remove {
+                record,
+                family,
+                name,
+                display,
+            } => match crate::gateway_admin::remove_pool_account(&record, family, &name) {
+                Ok(outcome) => PoolMutationResult::Removed {
+                    name: display,
+                    removed: outcome.removed,
+                    error: None,
+                },
+                Err(e) => PoolMutationResult::Removed {
+                    name: display,
+                    removed: false,
+                    error: Some(error_toast_detail(&e)),
+                },
+            },
+            PoolJob::Refresh {
+                record,
+                family,
+                name,
+                display,
+            } => match crate::gateway_admin::refresh_pool_account(&record, family, &name) {
+                Ok(outcome) => PoolMutationResult::Refreshed {
+                    name: display,
+                    needs_relogin: outcome.needs_relogin,
+                    error: None,
+                },
+                Err(e) => PoolMutationResult::Refreshed {
+                    name: display,
+                    needs_relogin: false,
+                    error: Some(error_toast_detail(&e)),
+                },
+            },
+        }
+    }
+}
+
+/// Start a pool mutation on a worker, one at a time. A second action while one
+/// runs toasts that it is still running. `marker` keys the in-flight spinner by
+/// the account's `(family, name)`, never a row index, so a reorder under a
+/// running mutation never moves the spinner onto another account.
+fn start_pool_mutation(
+    app: &mut App,
+    marker: (
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    ),
+    job: PoolJob,
+) {
+    if app.pool_mutation_row.is_some() {
+        app.toast(
+            ToastKind::Info,
+            "a pool action is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    let kind = match &job {
+        PoolJob::Remove { .. } => PoolMutationKind::Remove,
+        PoolJob::Refresh { .. } => PoolMutationKind::Refresh,
+        #[cfg(test)]
+        PoolJob::Panic { .. } => PoolMutationKind::Remove,
+    };
+    app.pool_mutation_row = Some(marker);
+    app.pool_mutation_kind = Some(kind);
+    let operation = job.operation();
+    let tx = app.pool_mutation_tx.clone();
+    spawn_worker(move || {
+        // A panic inside the job still lands a failure, so the busy marker
+        // never sticks (the `ShuntActionWorker::start` precedent).
+        let result = catch_unwind(AssertUnwindSafe(|| job.run()))
+            .unwrap_or(PoolMutationResult::Panicked { operation });
+        let _ = tx.send(result);
+    });
+}
+
+/// The pool row under the cursor, resolved for a mutation.
+type ResolvedPoolRow = (
+    crate::gateway::GatewayRecord,
+    crate::gateway_admin::PoolAuth,
+    crate::gateway_admin::ShuntAccountName,
+    String,
+);
+
+/// Resolve the pool row at `(provider, account)`: the record, the provider's
+/// auth, the account's validated name and its escaped display name. `None`
+/// when the snapshot or record vanished, or the name fails shunt's grammar.
+fn pool_row_at(app: &App, pi: usize, ai: usize) -> Option<ResolvedPoolRow> {
+    let record = app.services.shunt_record.clone()?;
+    let ShuntPool::Read(providers) = &app.shunt_pool else {
+        return None;
+    };
+    let provider = providers.get(pi)?;
+    let account = provider.accounts.get(ai)?;
+    let name = crate::gateway_admin::ShuntAccountName::new(&account.name)?;
+    Some((
+        record,
+        provider.auth.clone(),
+        name,
+        escape_control(&account.name),
+    ))
+}
+
+/// The `refresh` job behind both the Overview's action and Setup's detail row.
+fn start_pool_refresh_row(app: &mut App, (record, auth, name, display): ResolvedPoolRow) {
+    let Some(family) = auth.clone().family() else {
+        return;
+    };
+    let Some(refresh_family) = auth.refresh_family() else {
+        return;
+    };
+    start_pool_mutation(
+        app,
+        (family, name.clone()),
+        PoolJob::Refresh {
+            record,
+            family: refresh_family,
+            name,
+            display,
+        },
+    );
+}
+
+/// The `remove` job behind the Overview's confirm and Setup's inline 2-step —
+/// one build, never two (F21).
+fn start_pool_remove_row(app: &mut App, (record, auth, name, display): ResolvedPoolRow) {
+    let Some(family) = auth.family() else {
+        return;
+    };
+    start_pool_remove(app, record, family, name, display);
+}
+
+/// Build and start one pool `remove` job, shared by both remove callers.
+fn start_pool_remove(
+    app: &mut App,
+    record: crate::gateway::GatewayRecord,
+    family: crate::gateway_admin::PoolFamily,
+    name: crate::gateway_admin::ShuntAccountName,
+    display: String,
+) {
+    start_pool_mutation(
+        app,
+        (family, name.clone()),
+        PoolJob::Remove {
+            record,
+            family,
+            name,
+            display,
+        },
+    );
+}
+
+/// The toast for a pool pick whose account left the listing while the menu was
+/// open: the pick acts on nothing and says so.
+const POOL_ROW_GONE: &str = "that account is gone from the pool listing";
+
+/// Resolve a menu's stored pool identity `(family, name)` against the current
+/// listing at dispatch: the `pool_row_at` row whose provider maps to `family`
+/// and whose account name matches. `None` when the listing no longer holds the
+/// account (or the snapshot/record vanished), so a pick built for a dropped
+/// row acts on nothing rather than on a neighbour the cursor re-homed onto.
+fn pool_row_for_identity(app: &App, identity: Option<PoolRowIdentity>) -> Option<ResolvedPoolRow> {
+    let (family, name) = identity?;
+    let ShuntPool::Read(providers) = &app.shunt_pool else {
+        return None;
+    };
+    let (pi, ai) = providers.iter().enumerate().find_map(|(pi, p)| {
+        if p.auth.clone().family() != Some(family) {
+            return None;
+        }
+        p.accounts
+            .iter()
+            .position(|a| a.name == name.as_str())
+            .map(|ai| (pi, ai))
+    })?;
+    pool_row_at(app, pi, ai)
+}
+
+/// The stored pool identity of a menu's row, `None` for a claude row (or no
+/// row): the menu's pool picks always carry `RowIdentity::Pool`.
+fn pool_identity_of(identity: &Option<RowIdentity>) -> Option<PoolRowIdentity> {
+    match identity {
+        Some(RowIdentity::Pool(id)) => Some(id.clone()),
+        Some(RowIdentity::Profile(_)) | None => None,
+    }
+}
+
+/// `refresh` on a menu's pool pick: run the stored identity's row on a worker,
+/// or toast that the account left the listing when it no longer resolves.
+fn start_pool_refresh_identity(app: &mut App, identity: Option<RowIdentity>) {
+    let Some(resolved) = pool_row_for_identity(app, pool_identity_of(&identity)) else {
+        app.toast(ToastKind::Info, POOL_ROW_GONE);
+        return;
+    };
+    start_pool_refresh_row(app, resolved);
+}
+
+/// `remove` on a menu's pool pick: open the stored identity's `remove <name>?`
+/// confirm, or toast that the account left the listing when it no longer
+/// resolves. The target is read when the confirm opens, so confirming runs
+/// that account.
+fn open_pool_remove_confirm_identity(app: &mut App, identity: Option<RowIdentity>) {
+    let Some((record, auth, name, display)) =
+        pool_row_for_identity(app, pool_identity_of(&identity))
+    else {
+        app.toast(ToastKind::Info, POOL_ROW_GONE);
+        return;
+    };
+    let Some(family) = auth.family() else {
+        return;
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("remove {display}?"),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemovePoolAccount {
+            record,
+            family,
+            name: name.clone(),
+            display,
+        },
+    }));
+}
+
+/// Land a finished pool read into [`App::shunt_pool`], re-placing the cursor
+/// while the Overview shows (entering it re-places otherwise), and
+/// re-adopting the record the prober read so a re-adopt on the Overview reaches
+/// the pool actions.
+fn drain_shunt_pool_probe(app: &mut App) {
+    if let Some(pool) = app.shunt_pool_probe.drain() {
+        // The read-age stamp tracks the landing: only a successful read re-ages
+        // the pool listing; an error landing clears it, so a stale read never
+        // reads as fresh.
+        app.shunt_pool_read_at_ms = match &pool {
+            ShuntPool::Read(_) => Some(crate::usage::now_ms()),
+            ShuntPool::NotRead(_) | ShuntPool::Absent => None,
+        };
+        app.shunt_pool = pool;
+        land_pending_pool_add(app);
+        app.place_overview_cursor();
+        adopt_shunt_record(app, crate::gateway::GatewayRecord::load().ok().flatten());
+    }
+}
+
+/// Land a finished pool add on the new pool row once the re-read publishes it:
+/// Setup's stored identity becomes the new account's `(provider, account)`, and
+/// the Overview's remembered row moves onto it. Kept pending until a read
+/// listing actually holds the account (shunt's store rescan can lag the add).
+/// Land Setup and the Overview on one item after a create: Setup adopts the
+/// item (its selector index cleared; the claude case passes `None` so the
+/// selector lists profiles at `profile_cursor`), the Overview's remembered row
+/// moves onto it, and the create form closes. One tail for all three creates,
+/// so they cannot drift.
+fn land_created_item(app: &mut App, setup_item: Option<SetupItem>, overview: MainItemKind) {
+    land_created_selection(app, setup_item, overview);
+    app.config_focus = ConfigFocus::Profiles;
+    app.config_draft = None;
+}
+
+/// The shared "land Setup + Overview on one item" tail, split from
+/// [`land_created_item`] so the pool add can close its form conditionally: only
+/// the form that started the add closes, and only while it is still the open,
+/// unchanged shunt form.
+fn land_created_selection(app: &mut App, setup_item: Option<SetupItem>, overview: MainItemKind) {
+    app.setup.item = setup_item;
+    app.setup.index = None;
+    app.setup.clear();
+    app.overview_remembered = Some(overview);
+}
+
+/// Land a finished pool add on the new pool row once the re-read publishes it:
+/// Setup's stored identity becomes the new account's `(provider, account)`, and
+/// the Overview's remembered row moves onto it. Dropped by the first read that
+/// does not hold the `(family, name)` — the re-read a landed add triggers
+/// should have it, and a miss means the add did not land.
+fn land_pending_pool_add(app: &mut App) {
+    let Some((family, name)) = app.pending_pool_landing.clone() else {
+        return;
+    };
+    let ShuntPool::Read(providers) = &app.shunt_pool else {
+        return;
+    };
+    let Some((pi, ai, provider)) = providers.iter().enumerate().find_map(|(pi, p)| {
+        // The provider whose auth maps to the added family, never a same-named
+        // account in another family (the `pool_mutation_row` mapping).
+        if p.auth.clone().family() != Some(family) {
+            return None;
+        }
+        p.accounts
+            .iter()
+            .position(|a| a.name == name)
+            .map(|ai| (pi, ai, p.name.clone()))
+    }) else {
+        app.pending_pool_landing = None;
+        return;
+    };
+    app.pending_pool_landing = None;
+    let setup_item = Some(SetupItem::Pool {
+        provider,
+        account: name.clone(),
+    });
+    let overview = MainItemKind::Shunt(pi, ai);
+    // Only the form that started the add closes on success, and only while it
+    // is still the open, unchanged shunt form: the type not cycled away, the
+    // name unedited. Setup's selection moves onto the new pool row only while
+    // Setup's detail pane holds no open draft or edit — else the landing moves
+    // only the Overview's remembered row, leaving Setup, the draft and its
+    // focus untouched (a destructive pool row would otherwise hijack the keys).
+    if shunt_form_open_unchanged(app, &name) {
+        land_created_selection(app, setup_item, overview);
+        app.config_focus = ConfigFocus::Profiles;
+        app.config_draft = None;
+    } else if app.config_draft.is_none() && app.config_focus == ConfigFocus::Profiles {
+        land_created_selection(app, setup_item.clone(), overview);
+    } else {
+        app.overview_remembered = Some(overview);
+    }
+}
+
+/// Whether the open draft is still the shunt form that started the add: type
+/// `Shunt` and the same typed name. The add captured both at start, so a type
+/// cycle or a name edit makes the form a different one the success must not
+/// close.
+fn shunt_form_open_unchanged(app: &App, name: &str) -> bool {
+    app.config_draft
+        .as_ref()
+        .is_some_and(|d| d.account_type == NewAccountType::Shunt && d.name.trimmed() == name)
+}
+
+/// Drain pool remove/refresh results: the toast, then a fresh pool read.
+fn drain_pool_mutations(app: &mut App) {
+    while let Ok(result) = app.pool_mutation_rx.try_recv() {
+        app.pool_mutation_row = None;
+        app.pool_mutation_kind = None;
+        handle_pool_mutation_result(app, result);
+    }
+}
+
+/// The toast a pool mutation's result raises, then the re-read it triggers.
+fn handle_pool_mutation_result(app: &mut App, result: PoolMutationResult) {
+    match result {
+        PoolMutationResult::Removed {
+            name,
+            removed: true,
+            error: None,
+        } => {
+            app.toast(ToastKind::Success, format!("removed {name}"));
+        }
+        // `removed: false` is shunt's "it did not exist", never "gone": the
+        // account left the store behind the listing's back.
+        PoolMutationResult::Removed {
+            name,
+            removed: false,
+            error: None,
+        } => {
+            app.toast(ToastKind::Warning, format!("{name} was not in the pool"));
+        }
+        PoolMutationResult::Removed {
+            error: Some(error), ..
+        } => {
+            app.toast(ToastKind::Danger, escape_control(&error));
+        }
+        PoolMutationResult::Refreshed {
+            name,
+            needs_relogin: false,
+            error: None,
+        } => app.toast(ToastKind::Success, format!("refreshed {name}")),
+        PoolMutationResult::Refreshed {
+            name,
+            needs_relogin: true,
+            error: None,
+        } => app.toast(ToastKind::Warning, format!("{name} still needs a re-login")),
+        PoolMutationResult::Refreshed {
+            error: Some(error), ..
+        } => app.toast(ToastKind::Danger, escape_control(&error)),
+        PoolMutationResult::Panicked { operation } => {
+            app.toast(ToastKind::Danger, format!("{operation} failed"));
+        }
+    }
+    app.shunt_pool_probe.restart();
+}
+
+/// The shunt form's `+ login` disabled reason, in the lead's order: no adopted
+/// gateway, the gateway not running, the config (or the admin token file it
+/// names) unreadable, no clauth admin key in the config, no admin token file.
+/// Derived from the same reads as [`shunt_pool_probe`] and the card's
+/// `admin_need` / token read — never a second parser. Cached on
+/// [`App::shunt_add_disabled`] by the tick, never read on the render path.
+pub(crate) fn shunt_add_disabled_reason() -> Option<String> {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return Some("no shunt gateway is adopted".to_string());
+    };
+    let (slot, _) = crate::daemon::gateway_slot(crate::daemon::daemon_health());
+    if slot.state != GatewayState::Healthy {
+        return Some("the shunt gateway is not running".to_string());
+    }
+    match crate::gateway::admin_need(record.config()) {
+        Ok(crate::gateway::AdminNeed::Neither) => {}
+        Ok(_) => return Some("the shunt config has no clauth admin key".to_string()),
+        Err(e) => {
+            return Some(format!(
+                "the shunt config could not be read: {}",
+                escape_control(&format!("{e}"))
+            ));
+        }
+    }
+    match crate::gateway::read_admin_token() {
+        Ok(_) => None,
+        Err(e) => match e.downcast_ref::<crate::gateway::ChatgptOauthProvidersError>() {
+            Some(crate::gateway::ChatgptOauthProvidersError::NoAdminToken) => {
+                Some("no gateway admin token".to_string())
+            }
+            _ => Some(format!(
+                "the shunt config could not be read: {}",
+                escape_control(&format!("{e}"))
+            )),
+        },
+    }
+}
+
+/// Move the detail cursor onto the `name` row, so a refusal stored there (by a
+/// press on another row) renders its `└` line immediately.
+fn focus_name_row(app: &mut App) {
+    if let Some(idx) = config_rows(app).iter().position(|r| *r == ConfigRow::Name) {
+        app.config_action_cursor = idx;
+    }
+}
+
+/// Raise the one "already in progress" Warning toast for a running login.
+/// Every site with a login in flight calls this for its copy, so the text
+/// cannot drift between surfaces; each caller keeps its own control flow
+/// (some still open their modal).
+fn toast_login_in_progress(app: &mut App, name: String) {
+    app.toast(
+        ToastKind::Warning,
+        format!("a login for '{name}' is already in progress"),
+    );
+}
+
+/// The name of any login in flight other than this form's own add — a claude
+/// one in [`App::login`] or a codex one in [`App::codex_login`]. The shunt
+/// `+ login` calls it only after its own add is ruled out, so either field
+/// here names a foreign login (a `+ new` login a type change kept running,
+/// or a re-login).
+fn other_login_in_flight(app: &App) -> Option<String> {
+    app.login
+        .as_ref()
+        .map(|s| s.name.clone())
+        .or_else(|| app.codex_login.as_ref().map(|s| s.name.clone()))
+}
+
+/// The one answer to "the `+ new` draft": the descended form in
+/// `config_draft` (a `+ new` form has no `editing_name`, the marker
+/// `suspend_source` and `start_new_account` already use), else the at-rest
+/// `new_account_draft` while the selection rests on `+ new`, else none. Every
+/// reader of the form's type and rows goes through this, so the preview, the
+/// predicates and ⏎ can never read different drafts. Call it before any
+/// config guard: its fallback branch re-runs `setup_selection`.
+pub(crate) fn new_form_draft(app: &App) -> Option<&ConfigDraft> {
+    if let Some(d) = app.config_draft.as_ref()
+        && d.editing_name.is_none()
+    {
+        return Some(d);
+    }
+    if app.setup_selection() == SetupSelection::New {
+        return app.new_account_draft.as_ref();
+    }
+    None
+}
+
+/// Whether the `+ new` form's type is claude — the form a preset's endpoint
+/// and model fields stamp. The draft is [`new_form_draft`]'s; only a form
+/// with no draft is the fresh form, which opens on claude. The one predicate
+/// the action-menu offer and the apply's re-check share.
+fn new_account_type_is_claude(app: &App) -> bool {
+    new_form_draft(app).is_none_or(|d| d.apply_preset_armed())
+}
+
+/// Whether the `+ new` form is the shunt form — the form whose `+ login` is
+/// the pool create. The draft is [`new_form_draft`]'s and its `account_type`
+/// must be `Shunt`; a form with no draft is the fresh form, which opens on
+/// claude. The one check [`App::shunt_login_disabled`] adds, so the disabled
+/// state reaches only the shunt form.
+fn new_account_type_is_shunt(app: &App) -> bool {
+    new_form_draft(app).is_some_and(|d| d.account_type == NewAccountType::Shunt)
+}
+
+/// `+ login` on the shunt form — the create. `add_pool_account` runs on a
+/// worker; its authorize URL opens in the browser and the claude login modal
+/// opens with its paste door (`r` open again, `c` copy link, `p` paste code).
+/// The pasted string relays VERBATIM to `complete_pool_account` on the worker.
+/// The add holds the one-pool-action guard for its whole life: refused while a
+/// refresh/remove runs, and a running add refuses a refresh, remove or second
+/// add. Its busy marker is the new account's `(family, name)`, cleared on its
+/// result and on cancel.
+fn start_shunt_add(app: &mut App) {
+    let typed = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.name.trimmed().to_string())
+        .unwrap_or_default();
+    // (1) This form's own add in flight: ⏎ reopens its modal, ahead of every
+    // refusal — the disabled reason, the name check and the guard each refuse
+    // only a NEW add. The add's own state is its raw paste door, set by this
+    // add and cleared with it, so an edited name still reopens.
+    if app.shunt_paste.is_some() {
+        open_login_modal(app);
+        return;
+    }
+    // (2) The disabled row is inert: whatever reason holds, ⏎ sends nothing,
+    // no toast, no modal.
+    if app.shunt_login_disabled().is_some() {
+        return;
+    }
+    // (3) Any other login in flight — a claude one in `app.login` or a codex
+    // one in `app.codex_login` (a `+ new` login a type change kept running,
+    // or a re-login) — gets the "already in progress" toast naming it and
+    // opens nothing from this row.
+    if let Some(name) = other_login_in_flight(app) {
+        toast_login_in_progress(app, name);
+        return;
+    }
+    let Some(name) = crate::gateway_admin::ShuntAccountName::new(&typed) else {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name_refusal = Some("name: lowercase a-z, 0-9 and - only".to_string());
+        }
+        focus_name_row(app);
+        return;
+    };
+    if app.pool_mutation_row.is_some() {
+        app.toast(
+            ToastKind::Info,
+            "a pool action is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    let family = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.family)
+        .unwrap_or(crate::gateway_admin::PoolFamily::Claude);
+    // The disabled row's gate already holds; re-check defensively so an enabled
+    // row with a raced-away record sends nothing rather than panicking.
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return;
+    };
+    let (paste_tx, paste_rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.login_generation += 1;
+    let generation = app.login_generation;
+    app.login = Some(LoginSession {
+        name: typed.clone(),
+        account: None,
+        generation,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    app.shunt_paste = Some(ShuntPasteDoor {
+        tx: paste_tx,
+        cancel: cancel.clone(),
+        sent: false,
+        family,
+        name: name.clone(),
+    });
+    app.pool_mutation_row = Some((family, name.clone()));
+    let event_tx = app.login_event_tx.clone();
+    let result_tx = app.login_result_tx.clone();
+    #[cfg(test)]
+    let open_url = app.open_url_worker;
+    #[cfg(not(test))]
+    let open_url = crate::platform::open_url;
+    #[cfg(test)]
+    let log_capture = app.log_capture.clone();
+    #[cfg(test)]
+    let panic_plant = app.shunt_add_panic;
+    #[cfg(test)]
+    let paste_seam = app.shunt_add_paste_seam.take();
+    spawn_worker(move || {
+        #[cfg(test)]
+        let _log_guard = log_capture.as_ref().map(|capture| capture.capture_here());
+        // A panic inside the job still lands a failure, so the guard marker
+        // never sticks (the `start_pool_mutation` precedent).
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if panic_plant {
+                panic!("test seam: the shunt add panicked");
+            }
+            crate::gateway_admin::add_pool_account(&record, family, &name).and_then(|add| {
+                // A cancel drops the door, setting the cancel flag. Check it
+                // before the browser opens so a cancel before the paste opens
+                // nothing. The paste channel is never read here: the `recv`
+                // below is its only consumer, so a code pasted before the wait
+                // is not swallowed by a cancel probe.
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("login canceled"));
+                }
+                let _ = open_url(&add.authorize_url);
+                let _ = event_tx.send((generation, LoginEvent::Url(add.authorize_url)));
+                #[cfg(test)]
+                if let Some(seam) = paste_seam {
+                    // Park between the announce and the wait so a test can land
+                    // a paste in that window; the sender's drop releases this.
+                    let _ = seam.recv();
+                }
+                // A dropped door (cancel) disconnects the receiver.
+                let code = paste_rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("login canceled"))?;
+                // The pasted code is in flight: `ExchangingCode(Manual)` shows
+                // the "logging in with the code" stage while `complete` runs.
+                let _ = event_tx.send((
+                    generation,
+                    LoginEvent::Stage(LoginStage::ExchangingCode(LoginMethod::Manual)),
+                ));
+                // The commit point: `complete_pool_account` is sent next, so
+                // its outcome lands whatever the session does after (the codex
+                // N1 rule). The event carries the add's identity so a late
+                // result clears only its own guard marker.
+                let _ =
+                    event_tx.send((generation, LoginEvent::ShuntCommitted(family, name.clone())));
+                crate::gateway_admin::complete_pool_account(&record, family, &name, &code)
+                    .map(|_| ())
+            })
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("add failed")));
+        let _ = result_tx.send((
+            generation,
+            result
+                .map(|()| {
+                    LoginResult::Shunt(Box::new(ShuntLoginOutcome {
+                        name: typed.clone(),
+                        family,
+                    }))
+                })
+                .map_err(|e| error_toast_detail(&e)),
+        ));
+    });
+    open_login_modal(app);
+}
+
+/// The shunt add's outcome off the login result channel: a shunt add's worker
+/// only ever reports [`LoginResult::Shunt`] or an `Err`. Any other result kind
+/// is dropped with a named log line, never a panic (R4-1).
+fn shunt_add_outcome(
+    result: std::result::Result<LoginResult, String>,
+) -> Option<std::result::Result<ShuntLoginOutcome, String>> {
+    match result {
+        Ok(LoginResult::Shunt(outcome)) => Some(Ok(*outcome)),
+        Err(e) => Some(Err(e)),
+        Ok(other) => {
+            let kind = match other {
+                LoginResult::Oauth(_) => "oauth",
+                LoginResult::Console(_) => "console",
+                LoginResult::Shunt(_) => "shunt",
+            };
+            crate::logline::logline!("the shunt add drain dropped a {kind} login result");
+            None
+        }
+    }
+}
+
+/// Fold a finished shunt add into the app, success or committed-failure: clear
+/// the add's busy marker (only when it is still this add's own), then toast.
+/// Success also lands Setup + Overview on the new row once the re-read
+/// publishes it; a failure re-reads too, since the complete reached shunt and
+/// the listing may have moved either way.
+fn finish_shunt_add(
+    app: &mut App,
+    identity: &ShuntAddIdentity,
+    result: std::result::Result<ShuntLoginOutcome, String>,
+) {
+    // Clear the guard marker only when it is still this add's own: a late
+    // result must never wipe a later pool action's marker, and a committed
+    // failure after a cancel still releases the guard its add held.
+    if matches!(
+        &app.pool_mutation_row,
+        Some((family, name)) if *family == identity.family && name == &identity.name
+    ) {
+        app.pool_mutation_row = None;
+    }
+    if app
+        .shunt_add_committed
+        .as_ref()
+        .is_some_and(|committed| committed.generation == identity.generation)
+    {
+        app.shunt_add_committed = None;
+    }
+    match result {
+        Ok(outcome) => {
+            app.toast(ToastKind::Success, format!("added {}", outcome.name));
+            app.pending_pool_landing = Some((outcome.family, outcome.name.clone()));
+            // The re-read's result postdates the add; `land_pending_pool_add`
+            // then resolves the new row's (provider, account) and lands both.
+            // The draft itself closes there, only while it is still the form
+            // that started the add.
+            app.shunt_pool_probe.restart();
+        }
+        Err(e) => {
+            app.toast(ToastKind::Danger, escape_control(&e));
+            app.shunt_pool_probe.restart();
+        }
+    }
+}
+
+/// Re-read the pool listing at most once every 10 s while the Overview, Setup
+/// or Usage tab shows, so a Usage pool row's countdown and bars stay fresh. The
+/// read runs on a worker (it can block up to ~20 s), so the result lands
+/// through [`drain_shunt_pool_probe`]. The periodic poll uses
+/// [`ProbeWorker::start`] — a read slower than one gate lands, never
+/// discarded — while a landed mutation re-reads through
+/// [`ProbeWorker::restart`], whose result must postdate the mutation. `r` on a
+/// Usage pool row keeps its restart path.
+fn poll_shunt_pool(app: &mut App) {
+    const SHUNT_POOL_INTERVAL: Duration = Duration::from_secs(10);
+    if !matches!(app.tab, Tab::Overview | Tab::Setup | Tab::Usage) {
+        return;
+    }
+    if app
+        .last_shunt_pool_refresh
+        .is_some_and(|t| t.elapsed() < SHUNT_POOL_INTERVAL)
+    {
+        return;
+    }
+    app.last_shunt_pool_refresh = Some(Instant::now());
+    app.shunt_pool_probe.start();
+}
+
+/// Re-read the two form predicates the render path caches, at most once a
+/// second. They read config + small files on the tick, never per frame.
+fn poll_form_predicates(app: &mut App) {
+    const FORM_PREDICATES_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_form_predicates_refresh
+        .is_some_and(|t| t.elapsed() < FORM_PREDICATES_INTERVAL)
+    {
+        return;
+    }
+    app.last_form_predicates_refresh = Some(Instant::now());
+    app.refresh_form_predicates();
+}
+
 /// The production action prober: run one confirmed shunt-card action to
 /// completion. The slow calls — the `/health` probe, the store plan, `shunt
 /// check` — never hold a frame here. Every error keeps its cause chain as
@@ -12156,12 +16776,10 @@ fn run_add_client_token(
         }
     };
     let mut cfg = App::lock_config(&config.0);
-    match crate::actions::edit_profile_endpoint(
-        &mut cfg,
-        &profile_name,
-        Some(url.to_string()),
-        Some(token.expose().to_string()),
-    ) {
+    match crate::actions::edit_profile_endpoint(&mut cfg, &profile_name, |base_url, api_key| {
+        *base_url = Some(url.to_string());
+        *api_key = Some(token.expose().to_string());
+    }) {
         Ok(()) => ShuntActionOutcome::TokenAdded {
             profile: profile.to_string(),
             require,
@@ -12177,8 +16795,7 @@ fn run_add_client_token(
             // whose save then failed keeps its OLD key on disk, so it was not
             // changed even though its base url still matches the gateway. The
             // token only takes part in this comparison, never a message.
-            let points_at_gateway = crate::profile::load_profile(&profile_name)
-                .ok()
+            let points_at_gateway = crate::profile::stored_endpoint_identity(&profile_name)
                 .is_some_and(|saved| {
                     saved.base_url.as_deref() == Some(url)
                         && saved.api_key.as_deref() == Some(token.expose())
@@ -12550,20 +17167,36 @@ fn run_admin_edit(
     }
 }
 
-/// Every slot string the detail renders goes through here. A control character
-/// or a bidi formatting character is spelled as its visible `\u{…}` form so an
-/// untrusted string off the feed or the record can neither inject into the
-/// terminal nor reorder a line; every other character passes through unchanged.
+/// Escapes an untrusted value for a detail line or toast slot: a control
+/// character, a bidi formatting character, or a prose marker code point is
+/// spelled as its visible `\u{…}` form so an untrusted string off the feed, a
+/// tool's stdout or stderr, or a record read off another program's file can
+/// neither inject into the terminal, reorder a line, nor style the cells after
+/// it; every other character passes through unchanged. Applied at the producer
+/// where the untrusted value enters the copy.
 pub(crate) fn escape_control(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() || crate::jobs_cli::reorders_display(c) {
+            if c.is_control() || crate::format::reorders_display(c) || prose::is_marker(c) {
                 c.escape_default().to_string()
             } else {
                 c.to_string()
             }
         })
         .collect()
+}
+
+/// A pool provider's auth mode as the pool detail's `family` row reads it:
+/// the family name, or the unknown mode's own string (control-escaped).
+pub(crate) fn pool_auth_label(auth: &crate::gateway_admin::PoolAuth) -> String {
+    use crate::gateway_admin::PoolAuth;
+    match auth {
+        PoolAuth::Claude => "claude".to_string(),
+        PoolAuth::Codex => "codex".to_string(),
+        PoolAuth::Antigravity => "antigravity".to_string(),
+        PoolAuth::Kimi => "kimi".to_string(),
+        PoolAuth::Unknown(mode) => escape_control(mode),
+    }
 }
 
 /// A compact toast detail from an `anyhow::Error`: the root cause first (it
@@ -12589,16 +17222,19 @@ pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this clauth is";
 
 /// The `plugin` row: one detail holding the plugin install, the mcpServers
 /// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
-/// on PATH and the data dir, a blank line between the three groups. The
-/// install leads because installing is the fix a fresh box needs, and it also
-/// registers the server. Health is the worst of the four; the fixable problems
-/// walk in detail order, so list-level `f` lands on install first. `clauth_path` is
-/// passed in (the recompute also gates the start probe on it) so the verdict
-/// logic unit-tests without a live `PATH`.
-fn plugin_check(
+/// on PATH and the data dir, a blank line between the three groups, and the
+/// shell completion script's state last. The install leads because installing
+/// is the fix a fresh box needs, and it also registers the server. Health is
+/// the worst of the five, but a missing completion script offers its fix
+/// without moving it; the fixable problems walk in detail order, so
+/// list-level `f` lands on install first. `clauth_path` and `completions` are
+/// passed in (the recompute resolves both off the live box) so the verdict
+/// logic unit-tests without a live `PATH` or `$SHELL`.
+pub(crate) fn plugin_check(
     clauth_path: Option<&std::path::Path>,
     cc_version: Option<Option<String>>,
     mcp_boot: Option<crate::plugin_probe::McpProbe>,
+    completions: Option<crate::completions::InstalledScript>,
 ) -> Check {
     use crate::plugin_probe as probe;
 
@@ -12635,31 +17271,37 @@ fn plugin_check(
                 .version
                 .as_deref()
                 .is_some_and(|installed| crate::update::is_newer(this_version, installed));
-        detail.push(format!("installed: yes ({})", scope.unwrap_or("?")));
+        detail.push(format!(
+            "installed: yes ({})",
+            escape_control(scope.unwrap_or("?"))
+        ));
         if let Some(version) = &record.version {
             detail.push(if outdated {
-                format!("version: {version} ({OUTDATED_PLUGIN_MARK} {this_version})")
+                format!(
+                    "version: {} ({OUTDATED_PLUGIN_MARK} {this_version})",
+                    escape_control(version)
+                )
             } else {
-                format!("version: {version}")
+                format!("version: {}", escape_control(version))
             });
         }
         if let Some(sha) = &record.git_commit_sha {
             detail.push(format!(
                 "commit: {}",
-                sha.chars().take(7).collect::<String>()
+                escape_control(&sha.chars().take(7).collect::<String>())
             ));
         }
         if let Some(at) = &record.installed_at {
             detail.push(format!(
                 "installed at: {}",
-                at.split('T').next().unwrap_or(at)
+                escape_control(at.split('T').next().unwrap_or(at))
             ));
         }
         if let Some(project) = &record.project_path {
-            detail.push(format!("project: {project}"));
+            detail.push(format!("project: {}", escape_control(project)));
         }
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
-            detail.push(format!("marketplace: {repo}"));
+            detail.push(format!("marketplace: {}", escape_control(repo)));
         }
         if outdated {
             let line = detail.len();
@@ -12693,7 +17335,7 @@ fn plugin_check(
             }
         ));
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
-            detail.push(format!("marketplace: {repo}"));
+            detail.push(format!("marketplace: {}", escape_control(repo)));
         }
         detail.push("installs at user scope".to_string());
         let line = detail.len();
@@ -12776,7 +17418,7 @@ fn plugin_check(
     // Claude Code version, then clauth on PATH + the data dir.
     detail.push(String::new());
     match &cc_version {
-        Some(Some(version)) => detail.push(format!("claude: {version}")),
+        Some(Some(version)) => detail.push(format!("claude: {}", escape_control(version))),
         Some(None) => {
             detail.push("claude: not found".to_string());
             detail.push("claude --version failed or claude is not on PATH".to_string());
@@ -12806,8 +17448,45 @@ fn plugin_check(
             .unwrap_or_else(|_| "\u{2014}".to_string())
     ));
 
+    // The installed shell completion script. Its own group, last: a stale one
+    // is the least severe plugin problem, so it never displaces the fixes
+    // above it, and it warns. A missing one is an invitation, not a problem:
+    // it offers the install and moves no health. No line at all while the
+    // script is current or the shell is unknown (`completions` is `None`).
+    if let Some(script) = completions
+        && let Some((word, stale)) = match script.state {
+            crate::completions::ScriptState::Stale => Some(("stale", true)),
+            crate::completions::ScriptState::Missing => Some(("missing", false)),
+            crate::completions::ScriptState::Current => None,
+        }
+    {
+        detail.push(String::new());
+        detail.push(format!(
+            "completions: {word} ({})",
+            escape_control(&script.shell)
+        ));
+        detail.push(if stale {
+            format!(
+                "{} script differs from this clauth's",
+                escape_control(&script.shell)
+            )
+        } else {
+            format!("{} script not installed", escape_control(&script.shell))
+        });
+        let fix = ServiceFix::Completions {
+            shell: script.shell,
+            stale,
+        };
+        let line = detail.len();
+        detail.push(fix_line(&fix));
+        problems.push(Problem { line, fix });
+        if stale {
+            health = worst(health, Health::Warn);
+        }
+    }
+
     // The first fix line shown, in the order the detail walk presents them
-    // (install, then wire).
+    // (install, then wire, then completions).
     let fix = problems.first().map(|p| p.fix.clone());
 
     Check {
@@ -12880,6 +17559,7 @@ fn activate_main_item(app: &mut App) {
     match item {
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
         MainItemKind::Codex(_) => {}
+        MainItemKind::Shunt(_, _) => {}
     }
 }
 
@@ -12897,42 +17577,108 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         reorder_profile(&mut cfg, idx, new_idx)
     };
     if let Err(e) = result {
-        app.toast(ToastKind::Danger, format!("reorder failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!(
+                "reorder failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        );
         return;
     }
-    app.profile_cursor = new_idx;
-    app.overview_cursor = new_idx;
+    app.profile_cursor.set(new_idx);
+    app.move_overview_cursor(new_idx);
 }
 
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
 /// worker and drained by `drain_switch_gates`.
 pub(crate) struct SwitchGateResult {
     name: ProfileName,
-    gate: oauth::AuthGate,
+    gate: SwitchGate,
+}
+
+#[cfg(test)]
+impl SwitchGateResult {
+    /// An answered gate over a settle that changed nothing.
+    pub(crate) fn gated(name: ProfileName, gate: oauth::AuthGate) -> Self {
+        Self {
+            name,
+            gate: SwitchGate::Gated {
+                gate,
+                settled: crate::claude::BareItemSettled::default(),
+            },
+        }
+    }
+
+    /// The AUTH-1 answer, `None` for a switch the settle held.
+    pub(crate) fn auth_gate(&self) -> Option<&oauth::AuthGate> {
+        match &self.gate {
+            SwitchGate::Gated { gate, .. } => Some(gate),
+            SwitchGate::Held(_) => None,
+        }
+    }
+}
+
+/// What a switch gate's worker found: the bare item settled and the AUTH-1
+/// gate answered, or the settle held the switch before the gate ran.
+enum SwitchGate {
+    Gated {
+        gate: oauth::AuthGate,
+        settled: crate::claude::BareItemSettled,
+    },
+    Held(BareItemOutcome),
 }
 
 /// Switch the active profile to `name`. The AUTH-1 pre-install gate
 /// (`ensure_installable`) may refresh the target's token over HTTP, so it runs
 /// off the UI thread; `drain_switch_gates` completes the relink when it
-/// answers. The already-active target skips the gate — nothing new to install
-/// (`switch_profile` no-ops on `is_active`), and gating it races a live
-/// `claude` refreshing through the symlink — the same exemption as the
-/// CLI/MCP paths.
+/// answers. The disk-active target skips the gate only while the live slot
+/// serves no login another account stores (its own login, an unsaved login, or
+/// no login): then there is nothing to install, and gating it races a live
+/// `claude` refreshing through the symlink. When the live slot serves another
+/// account's saved login the switch installs the target's stored login, so it
+/// takes the gate like any other target. The exemption is decided on the disk
+/// read (the memory copy can lag a peer's switch) and re-checked under the
+/// switch's state hold, so a peer write that would make the switch install the
+/// stored login sends it back through `spawn_switch_gate`.
 fn perform_switch(app: &mut App, name: &ProfileName) {
-    let active = app.config().state.active_profile.as_ref().cloned();
-    if active.as_deref() == Some(name) {
-        finalize_switch(app, name);
+    // The mirror also moves the in-memory active account to disk's.
+    let disk = {
+        let mut cfg = app.config();
+        with_state_lock(|held| crate::actions::mirror_active_on_disk(&mut cfg, held))
+    };
+    let disk_active = match disk {
+        Ok(active) => active,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("switch failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            return;
+        }
+    };
+    if disk_active.as_deref() == Some(name) && !crate::claude::live_login_saved_elsewhere(name) {
+        #[cfg(test)]
+        crate::testutil::switch_race_seam::run();
+        finalize_switch(app, name, None, false);
         return;
     }
     spawn_switch_gate(app, name.clone(), oauth::refresh_result);
 }
 
-/// Run `ensure_installable` for `name` off the UI thread and post the answer
-/// to the switch-gate channel. The `Switching` activity mark is the pending
-/// state: it shows the spinner and blocks further switches until the drain
-/// clears it. `refresher` is injected so tests gate offline; under `cfg(test)`
-/// the gate runs synchronously — a detached worker would race the test's
-/// `HomeSandbox` (the gate persists `auth_broken` transitions to home paths).
+/// Settle the bare item, then run `ensure_installable` for `name`, off the UI
+/// thread, and post the answer to the switch-gate channel. The settle runs
+/// first: when the switch targets the item's owner, that owner's store holds
+/// the login Claude Code already spent, so the gate would refresh a spent
+/// token and quarantine the owner before the settle could save its live
+/// login. A settle the user must answer, or one that failed, holds the switch
+/// without running the gate. A resumed switch whose settle already answered
+/// ([`App::bare_item_ready`]) skips it. The `Switching` activity mark is the
+/// pending state: it shows the spinner and blocks further switches until the
+/// drain clears it. `refresher` is injected so tests gate offline; under
+/// `cfg(test)` the gate runs synchronously — a detached worker would race the
+/// test's `HomeSandbox` (the gate persists `auth_broken` transitions to home
+/// paths).
 fn spawn_switch_gate<F>(app: &mut App, name: ProfileName, refresher: F)
 where
     F: Fn(&str, Option<&str>) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>
@@ -12942,9 +17688,70 @@ where
     mark_activity(&app.activity, &name, ProfileActivity::Switching);
     let config = Arc::clone(&app.config);
     let sender = app.switch_gate_tx.clone();
+    let source = app.bare_item_source;
+    let ready = app.bare_item_ready.take();
     let gate = move || {
-        let gate = oauth::ensure_installable(&config, &name, refresher);
-        let _ = sender.send(SwitchGateResult { name, gate });
+        // Posts an answer on drop if the worker panicked before its own send,
+        // so a crashed worker never strands the `Switching` marker (and the
+        // exit wait that polls it). Mirrors `BootstrapDoneGuard`. A panic in
+        // the settle posts a failed settle, so the switch toasts its own
+        // failure rather than a refresh that never ran; one in the gate posts
+        // a `Transient` answer.
+        struct SwitchGateAnswerGuard {
+            name: ProfileName,
+            sender: std::sync::mpsc::Sender<SwitchGateResult>,
+            settling: bool,
+            sent: bool,
+        }
+        impl Drop for SwitchGateAnswerGuard {
+            fn drop(&mut self) {
+                if self.sent {
+                    return;
+                }
+                let gate = if self.settling {
+                    SwitchGate::Held(BareItemOutcome::Settled(Err(anyhow::anyhow!(
+                        BARE_ITEM_WORKER_PANICKED
+                    ))))
+                } else {
+                    SwitchGate::Gated {
+                        gate: oauth::AuthGate::Transient(crate::format::Transient::new(
+                            crate::format::Cause::InternalLock,
+                            crate::format::Retry::Stated,
+                        )),
+                        settled: crate::claude::BareItemSettled::default(),
+                    }
+                };
+                let _ = self.sender.send(SwitchGateResult {
+                    name: self.name.clone(),
+                    gate,
+                });
+            }
+        }
+        let mut answer = SwitchGateAnswerGuard {
+            name: name.clone(),
+            sender,
+            settling: true,
+            sent: false,
+        };
+        let settle = match ready {
+            Some(placed) => Ok(crate::claude::BareItemSettle::Settled(
+                crate::claude::BareItemSettled {
+                    notice: None,
+                    placed,
+                },
+            )),
+            None => settle_bare_keychain_item(source, crate::claude::BareItemWriter::Switch),
+        };
+        answer.settling = false;
+        let gate = match settle {
+            Ok(crate::claude::BareItemSettle::Settled(settled)) => SwitchGate::Gated {
+                gate: oauth::ensure_installable(&config, &name, refresher, None),
+                settled,
+            },
+            held => SwitchGate::Held(BareItemOutcome::Settled(held)),
+        };
+        let _ = answer.sender.send(SwitchGateResult { name, gate });
+        answer.sent = true;
     };
     if cfg!(test) {
         gate()
@@ -12981,6 +17788,8 @@ fn open_divergence_modal(app: &mut App, active: &str) {
     app.open_modal(Modal::Divergence(DivergenceForm {
         active: active.to_string(),
         sibling,
+        long_lived: crate::claude::has_session_token(&ProfileName::from(active)),
+        seen: live_creds_fingerprint(),
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -12990,11 +17799,528 @@ fn open_divergence_modal(app: &mut App, active: &str) {
     }));
 }
 
+/// The TUI's settle of the bare macOS Keychain item before a write replaces
+/// it, outside every lock the write takes: the source's settle, or a settled
+/// item where there is no source. Blocking (a `security` read, then
+/// `/profile` over HTTP), so only workers call it.
+fn settle_bare_keychain_item(
+    source: Option<BareItemSource>,
+    writer: crate::claude::BareItemWriter,
+) -> Result<crate::claude::BareItemSettle> {
+    match source {
+        Some(source) => (source.settle)(writer),
+        None => Ok(crate::claude::BareItemSettle::Settled(
+            crate::claude::BareItemSettled::default(),
+        )),
+    }
+}
+
+/// Hold `placed` for the writer guards on the calling thread, which must be
+/// the thread that runs the write: the placement is thread-local.
+fn enter_bare_item_placement(placed: Option<[u8; 32]>) -> crate::claude::BareItemPlacement {
+    let placement = crate::claude::BareItemPlacement::enter(placed);
+    #[cfg(test)]
+    probe_bare_item_placement();
+    placement
+}
+
+/// Before a UI-thread write that replaces the bare item: the placement to
+/// hold across the write, or `None` when the write is held. A resumed write
+/// takes what its settle or the user's answer left ([`App::bare_item_ready`]);
+/// a fresh one settles on a worker, and [`drain_bare_item_answers`] runs it
+/// again once the settle lets it write, or asks the user.
+fn bare_item_gate(app: &mut App, write: BareItemWrite) -> Option<crate::claude::BareItemPlacement> {
+    if let Some(placed) = app.bare_item_ready.take() {
+        return Some(enter_bare_item_placement(placed));
+    }
+    if app.bare_item_source.is_none() {
+        return Some(enter_bare_item_placement(None));
+    }
+    spawn_bare_item_settle(app, write);
+    None
+}
+
+/// The toast a non-switch write shows while a worker checks the item for it:
+/// a `security` read, and in a settle maybe a lookup of the login's owner
+/// over the network.
+const BARE_ITEM_CHECKING: &str = "checking the macOS Keychain login…";
+
+/// Settle the bare item for `write` on a worker and post the answer.
+fn spawn_bare_item_settle(app: &mut App, write: BareItemWrite) {
+    let check = begin_bare_item_check(app, &write);
+    let source = app.bare_item_source;
+    let tx = app.bare_item_tx.clone();
+    spawn_worker(move || {
+        let writer = write.writer();
+        let answer = BareItemAnswerGuard::new(tx, write);
+        let _check = check;
+        answer.send(BareItemOutcome::Settled(settle_bare_keychain_item(
+            source, writer,
+        )));
+    });
+}
+
+/// The second line of the toast a held write's panicked worker leaves.
+const BARE_ITEM_WORKER_PANICKED: &str = "clauth hit an internal error, restart clauth";
+
+/// A bare-item worker's answer for its held write. Dropped unsent, as a
+/// panicked worker drops it, it posts a failed settle, so the write the user
+/// asked for toasts its failure rather than vanishing. Declared before the
+/// worker's [`BareItemCheck`], so the check is down before this posts.
+struct BareItemAnswerGuard {
+    tx: std::sync::mpsc::Sender<BareItemAnswer>,
+    write: Option<BareItemWrite>,
+}
+
+impl BareItemAnswerGuard {
+    fn new(tx: std::sync::mpsc::Sender<BareItemAnswer>, write: BareItemWrite) -> Self {
+        Self {
+            tx,
+            write: Some(write),
+        }
+    }
+
+    fn send(mut self, outcome: BareItemOutcome) {
+        if let Some(write) = self.write.take() {
+            let _ = self.tx.send(BareItemAnswer { write, outcome });
+        }
+    }
+
+    /// The write ran on the worker itself, so there is nothing to post.
+    fn disarm(mut self) {
+        self.write = None;
+    }
+}
+
+impl Drop for BareItemAnswerGuard {
+    fn drop(&mut self) {
+        if let Some(write) = self.write.take() {
+            let _ = self.tx.send(BareItemAnswer {
+                write,
+                outcome: BareItemOutcome::Settled(Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED))),
+            });
+        }
+    }
+}
+
+/// The account a confirm about to open for `name` lands on, or a toast
+/// headed `failed` when none can be claimed.
+fn claim_or_toast(app: &mut App, name: &str, failed: &str) -> Option<ProfileId> {
+    match claim_profile_id(&ProfileName::from(name)) {
+        Ok(account) => Some(account),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("{failed}\n{e:#}"));
+            None
+        }
+    }
+}
+
+/// Show that a worker is about to check the item for `write` (a settle, or
+/// `replace`'s read): a switch keeps its row's `Switching` mark, the
+/// indicator its own gate shows, until its answer drains
+/// ([`drain_bare_item_answers`]); every other write counts the check, with
+/// [`BARE_ITEM_CHECKING`] up until every counted one answers. The worker
+/// holds the returned check until its settle or read returns (the startup
+/// relink's, until its relink does).
+/// Without a source there is no item to check.
+fn begin_bare_item_check(app: &mut App, write: &BareItemWrite) -> Option<BareItemCheck> {
+    app.bare_item_source?;
+    if let BareItemWrite::Switch(name) = write {
+        mark_activity(&app.activity, name, ProfileActivity::Switching);
+        return Some(BareItemCheck::Switch {
+            activity: Arc::clone(&app.activity),
+            name: name.clone(),
+        });
+    }
+    app.bare_item_checks.fetch_add(1, Ordering::AcqRel);
+    if !app
+        .toasts
+        .iter()
+        .any(|toast| toast.body == BARE_ITEM_CHECKING)
+    {
+        app.toast(ToastKind::Info, BARE_ITEM_CHECKING);
+    }
+    Some(BareItemCheck::Counted(Arc::clone(&app.bare_item_checks)))
+}
+
+/// One running check's indicator, held by its worker; a panicked check
+/// never leaves it up.
+enum BareItemCheck {
+    /// Counted in [`App::bare_item_checks`]; ends on drop.
+    Counted(Arc<AtomicUsize>),
+    /// A held switch's `Switching` mark. Its answer's drain clears it: a
+    /// worker clearing it after its send could wipe the mark of the gate that
+    /// answer resumes. A panicked worker's unwind clears it, before any
+    /// answer its [`BareItemAnswerGuard`] posts.
+    Switch {
+        activity: ActivityStore,
+        name: ProfileName,
+    },
+}
+
+impl Drop for BareItemCheck {
+    fn drop(&mut self) {
+        match self {
+            Self::Counted(checks) => {
+                checks.fetch_sub(1, Ordering::AcqRel);
+            }
+            Self::Switch { activity, name } => {
+                if std::thread::panicking() {
+                    clear_activity(activity, name);
+                }
+            }
+        }
+    }
+}
+
+/// Land the bare-item workers' answers for held writes. Waits while another
+/// modal is open, so a question never stacks under one; an exit wait drops
+/// them, since it starts no new write.
+fn drain_bare_item_answers(app: &mut App) {
+    loop {
+        if blocking_modal_open(app) && !app.exit_wait {
+            return;
+        }
+        let Ok(BareItemAnswer { write, outcome }) = app.bare_item_rx.try_recv() else {
+            return;
+        };
+        if let BareItemWrite::Switch(name) = &write {
+            clear_activity(&app.activity, name);
+        }
+        if !app.exit_wait {
+            land_bare_item_outcome(app, write, outcome);
+        }
+    }
+}
+
+/// A settle that lets the write go shows what it saved (its carry has
+/// landed) and runs the write again; one only the user can place asks; a
+/// failed one toasts the write's own failure.
+fn land_bare_item_outcome(app: &mut App, write: BareItemWrite, outcome: BareItemOutcome) {
+    match outcome {
+        BareItemOutcome::Settled(Ok(crate::claude::BareItemSettle::Settled(settled))) => {
+            if let Some(notice) = settled.notice {
+                app.toast(ToastKind::Warning, notice);
+            }
+            resume_bare_item_write(app, write, settled.placed);
+        }
+        BareItemOutcome::Settled(Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced))) => {
+            app.open_modal(Modal::BareItem(BareItemForm::new(unplaced, write)));
+        }
+        BareItemOutcome::Settled(Err(e)) => {
+            app.toast(ToastKind::Danger, format!("{}\n{e:#}", write.failed()));
+        }
+        BareItemOutcome::Replace(placed) => resume_bare_item_write(app, write, placed),
+        BareItemOutcome::NameNeeded { login, account } => {
+            app.bare_item_naming = Some(BareItemNaming {
+                login,
+                account,
+                write,
+            });
+            app.open_modal(Modal::NamePrompt(NamePromptForm {
+                input: InputState::new(""),
+                action: NamePromptAction::SaveBareItem,
+            }));
+        }
+        BareItemOutcome::OwnerNeeded(owners, accounts, login) => {
+            app.open_modal(Modal::BareItemOwner(BareItemOwnerForm::new(
+                owners, accounts, login, write,
+            )));
+        }
+    }
+}
+
+/// Run a held write again: its gate takes `placed` instead of settling.
+fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u8; 32]>) {
+    app.bare_item_ready = Some(placed);
+    match write {
+        BareItemWrite::BootRelink(name) => {
+            if app.config().is_active(&name)
+                && let Some(_placed) = bare_item_gate(app, BareItemWrite::BootRelink(name.clone()))
+            {
+                let _ = link_profile_credentials(&name);
+                app.refresh_unsaved_live_login();
+            }
+        }
+        BareItemWrite::Switch(name) => spawn_switch_gate(app, name, oauth::refresh_result),
+        BareItemWrite::SwitchOff => perform_switch_off(app),
+        BareItemWrite::ClearSessionToken(name) => perform_clear_session_token(app, &name),
+        BareItemWrite::Rename => {
+            commit_rename(app);
+        }
+        BareItemWrite::NewAccount => commit_new_account(app),
+        BareItemWrite::Delete { name, force } => finish_delete(app, &name, force),
+        BareItemWrite::CaptureOverwrite {
+            snapshot,
+            name,
+            account,
+            from_divergence,
+        } => run_confirm_action(
+            app,
+            ConfirmAction::CaptureOverwrite(snapshot, name, account, from_divergence),
+        ),
+        BareItemWrite::AdoptDivergence {
+            snapshot,
+            name,
+            account,
+            from,
+        } => {
+            run_confirm_action(
+                app,
+                ConfirmAction::AdoptDivergence(snapshot, name, account, from),
+            );
+        }
+        BareItemWrite::BlankCredentials(name) => {
+            run_confirm_action(app, ConfirmAction::BlankCredentials(name));
+        }
+        BareItemWrite::DiscardDivergence(name, seen) => run_discard_divergence(app, &name, seen),
+        BareItemWrite::DivergenceOverwrite(active, seen) => {
+            run_divergence_choice(app, &active, DivergenceChoice::Overwrite, seen);
+        }
+        BareItemWrite::CaptureName {
+            name,
+            snapshot,
+            from_divergence,
+        } => commit_capture_name(app, name, snapshot, from_divergence),
+        BareItemWrite::Login {
+            name,
+            account,
+            snapshot,
+        } => apply_login_snapshot(app, name, account, *snapshot),
+    }
+    app.bare_item_ready = None;
+}
+
+/// [`Modal::BareItem`]: `↑`/`↓` pick, `↵` answers the picked choice, `s`/`p`/`c`
+/// answer directly, `esc`/`q` cancel.
+fn handle_bare_item_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::BareItem(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = BareItemChoice::ALL.len() - 1;
+    let choice = match key.code {
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            };
+            return;
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            };
+            return;
+        }
+        KeyCode::PageUp => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+            return;
+        }
+        KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+            return;
+        }
+        KeyCode::Enter => BareItemChoice::ALL[form.cursor.min(last)],
+        KeyCode::Esc | KeyCode::Char('q') => BareItemChoice::Cancel,
+        KeyCode::Char(c) => {
+            let c = c.to_ascii_lowercase();
+            let Some(choice) = BareItemChoice::ALL.into_iter().find(|ch| ch.key() == c) else {
+                return;
+            };
+            choice
+        }
+        _ => return,
+    };
+    let Some(Modal::BareItem(form)) = app.pop_modal() else {
+        return;
+    };
+    answer_bare_item(app, form.write, choice);
+}
+
+/// `save` and `replace` read the item as the answer finds it, on a worker:
+/// `save` puts its login into the profile cached with its account (or asks
+/// for a new one's name) and settles again; `replace` hands the write the
+/// key its guards replace the item by. `cancel` writes nothing.
+fn answer_bare_item(app: &mut App, write: BareItemWrite, choice: BareItemChoice) {
+    let source = app.bare_item_source;
+    let tx = app.bare_item_tx.clone();
+    match choice {
+        BareItemChoice::Cancel => {}
+        BareItemChoice::Save => {
+            let check = begin_bare_item_check(app, &write);
+            spawn_worker(move || {
+                let writer = write.writer();
+                let answer = BareItemAnswerGuard::new(tx, write);
+                let _check = check;
+                let item = source.and_then(|source| (source.read)().map(|item| (source, item)));
+                let saved = match item {
+                    Some((source, item)) => match (source.save)(&item) {
+                        crate::claude::BareItemSave::Nothing => Ok(None),
+                        crate::claude::BareItemSave::Owner(owner) => {
+                            crate::claude::claim_bare_item_owner(&owner).and_then(|account| {
+                                crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+                            })
+                        }
+                        crate::claude::BareItemSave::Owners(first, second) => {
+                            // Claimed before the question: the pick lands only
+                            // on the account each name held when it was asked
+                            // about.
+                            match crate::claude::claim_bare_item_owner(&first).and_then(|a| {
+                                crate::claude::claim_bare_item_owner(&second).map(|b| [a, b])
+                            }) {
+                                Ok(accounts) => {
+                                    answer.send(BareItemOutcome::OwnerNeeded(
+                                        [first, second],
+                                        accounts,
+                                        crate::claude::bare_item_login_key(&item),
+                                    ));
+                                    return;
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        crate::claude::BareItemSave::NewProfile { login, account } => {
+                            answer.send(BareItemOutcome::NameNeeded { login, account });
+                            return;
+                        }
+                    },
+                    None => Ok(None),
+                };
+                answer.send(settle_after_save(source, writer, saved));
+            });
+        }
+        BareItemChoice::Replace => {
+            let check = begin_bare_item_check(app, &write);
+            spawn_worker(move || {
+                let answer = BareItemAnswerGuard::new(tx, write);
+                let _check = check;
+                let placed = source
+                    .and_then(|source| (source.read)())
+                    .as_ref()
+                    .and_then(crate::claude::bare_item_replacement);
+                answer.send(BareItemOutcome::Replace(placed));
+            });
+        }
+    }
+}
+
+/// [`Modal::BareItemOwner`]: `↑`/`↓` pick, `↵` saves the login into the
+/// picked profile on a worker and settles again, `esc`/`q` cancel the held
+/// write.
+fn handle_bare_item_owner_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::BareItemOwner(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Up | KeyCode::Down => form.cursor = 1 - form.cursor.min(1),
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.pop_modal();
+        }
+        KeyCode::Enter => {
+            let Some(Modal::BareItemOwner(form)) = app.pop_modal() else {
+                return;
+            };
+            let [first, second] = form.owners;
+            let [first_account, second_account] = form.accounts;
+            let (owner, account) = if form.cursor == 0 {
+                (first, first_account)
+            } else {
+                (second, second_account)
+            };
+            save_bare_item_into_owner(app, form.write, owner, account, form.login);
+        }
+        _ => {}
+    }
+}
+
+/// Carry the item's login into `owner` on a worker while the item still
+/// holds `login`, the one the question was about, then settle again for the
+/// held write. An item holding another login by now is never saved into
+/// `owner`, whose account it may not be: the settle asks about it afresh. The
+/// save lands only while `owner` still holds `account`, claimed when the
+/// question opened.
+fn save_bare_item_into_owner(
+    app: &mut App,
+    write: BareItemWrite,
+    owner: ProfileName,
+    account: ProfileId,
+    login: Option<[u8; 32]>,
+) {
+    let source = app.bare_item_source;
+    let tx = app.bare_item_tx.clone();
+    let check = begin_bare_item_check(app, &write);
+    spawn_worker(move || {
+        let writer = write.writer();
+        let answer = BareItemAnswerGuard::new(tx, write);
+        let _check = check;
+        let saved = match source.and_then(|source| (source.read)()) {
+            Some(item) if login.is_some() && crate::claude::bare_item_login_key(&item) == login => {
+                crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+            }
+            Some(_) | None => Ok(None),
+        };
+        answer.send(settle_after_save(source, writer, saved));
+    });
+}
+
+/// What a `save` posts once its carry ran: a store that kept a later login
+/// lets the held write go on over the item (`placed`), as the settle's own
+/// carry does, since settling again would ask the same question; otherwise
+/// the settle runs again.
+fn settle_after_save(
+    source: Option<BareItemSource>,
+    writer: crate::claude::BareItemWriter,
+    saved: Result<Option<[u8; 32]>>,
+) -> BareItemOutcome {
+    BareItemOutcome::Settled(saved.and_then(|kept| match kept {
+        Some(placed) => Ok(crate::claude::BareItemSettle::Settled(
+            crate::claude::BareItemSettled {
+                notice: None,
+                placed: Some(placed),
+            },
+        )),
+        None => settle_bare_keychain_item(source, writer),
+    }))
+}
+
 /// Complete a switch on the UI thread: divergence guard, relink via
-/// `switch_profile`, token-snapshot refresh. No HTTP — the AUTH-1 gate has
-/// already answered (or the target is the already-active exemption) by the
-/// time this runs.
-fn finalize_switch(app: &mut App, name: &ProfileName) {
+/// `switch_profile` holding the bare-item placement the gate's settle left,
+/// token-snapshot refresh. No HTTP — the bare item settled and the AUTH-1
+/// gate answered on the worker, or the target is the already-active account
+/// whose live slot holds no login another account stores (the exemption)
+/// before this runs. `gated` names whether the AUTH-1 gate ran for this
+/// switch: the worker path passes `true`, the exemption path `false`, and a
+/// `false` switch whose hold finds it would install the stored login is sent
+/// back through `spawn_switch_gate` instead.
+fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>, gated: bool) {
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
@@ -13008,16 +18334,26 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
         prompt_divergence(app, active.to_string(), "switching");
         return;
     }
-    let result = switch_profile(&app.config, name);
+    let _placed = enter_bare_item_placement(placed);
+    let result = switch_profile_gated(&app.config, name, gated);
     clear_activity(&app.activity, name);
     match result {
-        Ok(()) => {
+        Ok(_switched) => {
             app.refresh_tokens();
-            app.last_reload_fp = reload_fingerprint();
+            app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("switch failed\n{e}")),
+        Err(e) if !gated && e.downcast_ref::<crate::actions::GateNeeded>().is_some() => {
+            spawn_switch_gate(app, name.clone(), oauth::refresh_result);
+        }
+        Err(e) => match chain_held_skipped("switch", &e) {
+            Some(skipped) => app.toast(ToastKind::Warning, skipped),
+            None => app.toast(
+                ToastKind::Danger,
+                format!("switch failed\n{}", escape_control(&error_toast_detail(&e))),
+            ),
+        },
     }
 }
 
@@ -13032,30 +18368,47 @@ fn perform_switch_off(app: &mut App) {
         prompt_divergence(app, active.to_string(), "switching off");
         return;
     }
+    let Some(_placed) = bare_item_gate(app, BareItemWrite::SwitchOff) else {
+        return;
+    };
     let result = switch_off(&app.config);
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.last_reload_fp = reload_fingerprint();
+            app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(
                 ToastKind::Warning,
                 "all accounts spent\nswitched off to halt usage".to_string(),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("switch-off failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "switch-off failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
-/// Read the live login into a snapshot, or toast + `None` when there's nothing
-/// to capture. An all-empty snapshot would persist a credential-less profile
-/// behind a success toast (issue #1 — on macOS CC keeps its login in the
-/// Keychain, so the credentials file is absent).
+/// Read the diverged live credentials file into a snapshot, or toast + `None`
+/// when there's nothing to capture. A divergence names that file, so its
+/// prompts capture it and never the macOS Keychain item: the item may hold
+/// another account's unsaved login. A plain file read, fine on the UI thread.
 fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
-    let snapshot = match capture_snapshot() {
+    snapshot_or_toast(app, capture_live_file_snapshot())
+}
+
+/// `snapshot`, or toast + `None` when there's nothing to capture. An
+/// all-empty snapshot would persist a credential-less profile behind a
+/// success toast (issue #1 — on macOS CC keeps its login in the Keychain, so
+/// the credentials file is absent).
+fn snapshot_or_toast(app: &mut App, snapshot: Result<CaptureSnapshot>) -> Option<CaptureSnapshot> {
+    let snapshot = match snapshot {
         Ok(s) => s,
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("capture failed\n{e}"));
+            app.toast(ToastKind::Danger, format!("capture failed\n{e:#}"));
             return None;
         }
     };
@@ -13073,10 +18426,110 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
     Some(snapshot)
 }
 
-fn begin_capture(app: &mut App, from_divergence: bool) {
+/// The `+ new` form's `+ capture current login`: the login in use, the macOS
+/// Keychain item's first ([`capture_snapshot`]), a `security` call, so it
+/// runs on a worker and lands through [`drain_capture_login`]. A test reads
+/// it in place, the [`App::refresh_unsaved_live_login`] precedent.
+fn spawn_capture_login(app: &mut App) {
+    if cfg!(test) {
+        land_capture_login(app, capture_snapshot());
+        return;
+    }
+    let tx = app.capture_login_tx.clone();
+    spawn_worker(move || {
+        let _ = tx.send(capture_snapshot());
+    });
+}
+
+/// Land the capture row's worker answers. Waits while a modal is open, so
+/// the mint-replace confirm never stacks over another; an exit wait drops
+/// them.
+fn drain_capture_login(app: &mut App) {
+    loop {
+        if blocking_modal_open(app) && !app.exit_wait {
+            return;
+        }
+        let Ok(snapshot) = app.capture_login_rx.try_recv() else {
+            return;
+        };
+        if !app.exit_wait {
+            land_capture_login(app, snapshot);
+        }
+    }
+}
+
+/// Stash the captured login into the open `+ new` draft, refusing a login a
+/// profile owns and confirming before it replaces a stashed mint.
+fn land_capture_login(app: &mut App, snapshot: Result<CaptureSnapshot>) {
+    // The row only renders on the `+ new` form, where a draft is always
+    // open; the empty and owned states are what HIDE it, so hitting one
+    // here means the live login moved since the flag was computed.
+    let Some(snapshot) = snapshot_or_toast(app, snapshot) else {
+        // The login emptied since the flag was computed; drop the row.
+        app.refresh_unsaved_live_login();
+        return;
+    };
+    let owner = {
+        let cfg = app.config();
+        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
+    };
+    if let Some(owner) = owner {
+        // Refuse, not confirm: a NEW account over a login another
+        // profile owns is the duplicate `overwrite_captured_profile`
+        // exists to prevent, and this row's whole purpose is the
+        // unowned case.
+        app.toast(
+            ToastKind::Danger,
+            format!(
+                "these credentials already belong to '{owner}'\nswitch to it with:  {}",
+                prose::cmd(&format!("clauth {owner}"))
+            ),
+        );
+        app.refresh_unsaved_live_login();
+        return;
+    }
+    let mint_stashed = app.config_draft.as_ref().is_some_and(|d| {
+        d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
+    });
+    if mint_stashed {
+        // The browser round-trip a mint cost can't be redone for free;
+        // gate replacing it, mirroring the re-login gate.
+        app.open_modal(Modal::Confirm(ConfirmState {
+            message: "replace the logged-in mint?".to_string(),
+            detail: Some("the browser login you already captured will be dropped".to_string()),
+            choice: false,
+            scroll: ConfirmScroll::default(),
+            on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
+        }));
+        return;
+    }
+    if matches!(
+        stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))),
+        StashOutcome::Staged
+    ) {
+        app.toast(
+            ToastKind::Success,
+            "current login captured\ncreate account saves it",
+        );
+    }
+}
+
+/// Read the live login for a capture. From a divergence about
+/// `from_divergence`, the read must be the login the prompt showed (`seen`,
+/// its fingerprint), else nothing is captured.
+fn begin_capture(app: &mut App, from_divergence: Option<String>, seen: Option<u64>) {
     let Some(snapshot) = capture_live_or_toast(app) else {
         return;
     };
+    if let Some(from) = &from_divergence
+        && creds_fingerprint(snapshot.credentials.as_ref()) != seen
+    {
+        app.toast(
+            ToastKind::Warning,
+            DivergenceMoved::Login.skipped("capture", from),
+        );
+        return;
+    }
     let existing_match = {
         let cfg = app.config();
         find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
@@ -13098,30 +18551,63 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
     }));
 }
 
-/// Land a login stash in the live `+ new` draft (`+ login`'s finished mint, or
-/// `+ capture current login`'s snapshot) and park the cursor on `create
-/// account`, the one step left. Returns `false` when the form was closed in
-/// between, so the caller can warn about the dropped round-trip.
-fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> bool {
-    let stashed = match app
+/// The outcome of landing a finished login into the live `+ new` draft.
+enum StashOutcome {
+    /// The stash landed; the cursor parked on `create account`.
+    Staged,
+    /// The `+ new` form is closed; nothing landed.
+    FormClosed,
+    /// The form's type no longer matches the stash's harness; dropped unused.
+    WrongType,
+}
+
+/// Which harness a stash belongs to, so a late login result stages only into a
+/// form whose type still matches it (a claude mint never lands in a codex or
+/// shunt form, and the reverse).
+fn draft_login_harness(stash: &DraftLogin) -> NewAccountType {
+    match stash {
+        DraftLogin::Mint(_) | DraftLogin::LiveLogin(_) => NewAccountType::Claude,
+        DraftLogin::CodexMint(_) | DraftLogin::CodexCapture => NewAccountType::Codex,
+    }
+}
+
+/// Land a login stash in the `+ new` draft (`+ login`'s finished mint, or
+/// `+ capture current login`'s snapshot): the live form, else the form
+/// suspended in `new_account_draft`, which still owns the login it started.
+/// On the live form the cursor parks on `create account`, the one step left.
+/// [`StashOutcome::FormClosed`] when the form was closed in between;
+/// [`StashOutcome::WrongType`] when the form's type no longer matches the
+/// stash's harness — a late result the type cycle already moved past, dropped
+/// unused (the chain never written).
+fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> StashOutcome {
+    let harness = draft_login_harness(&stash);
+    let live = app
         .config_draft
-        .as_mut()
-        .filter(|d| d.editing_name.is_none())
-    {
-        Some(draft) => {
-            draft.captured_login = Some(stash);
-            true
-        }
-        None => false,
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none());
+    let slot = if live {
+        app.config_draft.as_mut()
+    } else {
+        app.new_account_draft.as_mut()
     };
-    if stashed
+    let Some(draft) = slot else {
+        return StashOutcome::FormClosed;
+    };
+    if draft.account_type != harness {
+        return StashOutcome::WrongType;
+    }
+    draft.captured_login = Some(stash);
+    // The stage it asked for lands: a stale "log in or capture first" refusal
+    // no longer describes the form.
+    draft.create_refusal = None;
+    if live
         && let Some(idx) = config_rows(app)
             .iter()
             .position(|r| *r == ConfigRow::Create)
     {
         app.config_action_cursor = idx;
     }
-    stashed
+    StashOutcome::Staged
 }
 
 // ── Chain screen ──────────────────────────────────────────────────────────────
@@ -13156,11 +18642,12 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 
 /// Detail rows for a chain member: threshold stepper, last-resort/preferred
 /// toggles, preferred-days presets + day picker, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 9] = [
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 10] = [
     FallbackRow::Threshold,
     FallbackRow::WeeklyAt,
     FallbackRow::CheckWeekly,
     FallbackRow::CheckScoped,
+    FallbackRow::CheckCreditCap,
     FallbackRow::LastResort,
     FallbackRow::Preferred,
     FallbackRow::PreferredDays,
@@ -13363,12 +18850,8 @@ fn cycle_theme(app: &mut App) {
         theme::Tier::Full => ThemeName::Full,
         theme::Tier::Compatible => ThemeName::Compatible,
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.theme = Some(name);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.theme = Some(name));
+    app.apply_forgets();
     theme::set_tier(next);
 }
 
@@ -13382,6 +18865,9 @@ fn cycle_theme(app: &mut App) {
 pub(crate) struct MemberEdit<T> {
     pub(crate) member: ProfileName,
     pub(crate) state: T,
+    /// The value a typed field opened from (its buffer's seed); `None` for the
+    /// day picker and the armed remove, which hold no buffer.
+    pub(crate) seed: Option<String>,
 }
 
 /// What is open on the member card. One at a time: every typed field and the
@@ -13447,6 +18933,7 @@ pub(crate) enum FallbackHint {
     DetailWeeklyAt,
     DetailCheckWeekly,
     DetailCheckScoped,
+    DetailCheckCreditCap,
     DetailLastResort,
     DetailPreferred,
     DetailPreferredDays,
@@ -13477,6 +18964,7 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
                 FallbackRow::WeeklyAt => FallbackHint::DetailWeeklyAt,
                 FallbackRow::CheckWeekly => FallbackHint::DetailCheckWeekly,
                 FallbackRow::CheckScoped => FallbackHint::DetailCheckScoped,
+                FallbackRow::CheckCreditCap => FallbackHint::DetailCheckCreditCap,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
                 FallbackRow::Preferred => FallbackHint::DetailPreferred,
                 FallbackRow::PreferredDays => FallbackHint::DetailPreferredDays,
@@ -13510,7 +18998,7 @@ fn chain_cursor_for_profile(app: &App) -> usize {
     let cfg = app.config();
     let selected_name = cfg
         .profiles
-        .get(app.profile_cursor)
+        .get(app.profile_cursor.read())
         .map(|p| p.name.as_str());
     if let Some(name) = selected_name
         && let Some(pos) = cfg.state.fallback_chain.iter().position(|c| c == name)
@@ -13533,7 +19021,7 @@ fn sync_profile_from_chain(app: &mut App) {
         }
     };
     if let Some(idx) = profile_idx {
-        app.profile_cursor = idx;
+        app.profile_cursor.set(idx);
     }
 }
 
@@ -13595,12 +19083,8 @@ pub(crate) fn next_reset_display(current: ResetDisplay) -> ResetDisplay {
 
 fn cycle_reset_display(app: &mut App) {
     let next = next_reset_display(app.config().state.reset_display());
-    {
-        let mut cfg = app.config();
-        cfg.state.reset_display = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.reset_display = Some(next));
+    app.apply_forgets();
 }
 
 fn cycle_clock_format(app: &mut App) {
@@ -13608,62 +19092,53 @@ fn cycle_clock_format(app: &mut App) {
         ClockFormat::H24 => ClockFormat::H12,
         ClockFormat::H12 => ClockFormat::H24,
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.clock_format = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.clock_format = Some(next));
+    app.apply_forgets();
 }
 
 fn cycle_home_tab(app: &mut App) {
     let next: Tab = app.config().state.home_tab().into();
     let next = next.next();
-    {
-        let mut cfg = app.config();
-        cfg.state.home_tab = Some(next.into());
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.home_tab = Some(next.into()));
+    app.apply_forgets();
 }
 
 fn cycle_divergence_default(app: &mut App) {
     let next = next_divergence_default(app.config().state.default_divergence);
-    {
-        let mut cfg = app.config();
-        cfg.state.default_divergence = next;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.default_divergence = next);
+    app.apply_forgets();
 }
 
 fn toggle_wrap_off(app: &mut App) {
-    {
+    let outcome = {
         let mut cfg = app.config();
         let next = !cfg.state.switch_off_when_spent;
-        let _ = set_wrap_off(&mut cfg, next);
+        set_wrap_off(&mut cfg, next)
+    };
+    if let Err(e) = outcome {
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
     }
-    app.last_reload_fp = reload_fingerprint();
+    app.apply_forgets();
 }
 
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
 /// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
-/// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
+/// `update_app_state`, drain forgets — no separate propagation to the
 /// scheduler is needed since `next_auto_switch_target` reads the flag straight
 /// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.burn_aware_switching;
+    app.save_state_delta(|s, _held| s.burn_aware_switching = next);
+    app.apply_forgets();
 }
 
 /// Cycle the walk-order mode (issue #86): `chain` → `soonest weekly reset` →
 /// `most weekly headroom` → `chain`.
 /// `cycle_reset_display`'s persistence shape exactly: mutate the shared
-/// `AppConfig`, `save_app_state`, bump `last_reload_fp` — no separate
+/// `AppConfig`, `update_app_state`, drain forgets — no separate
 /// propagation to the scheduler, since every walk reads the mode off the same
 /// shared `config` (`snapshot_chain` copies it into `ChainSnapshot` like
 /// `burn_aware`).
@@ -13673,12 +19148,8 @@ fn cycle_walk_order(app: &mut App) {
         WalkOrder::SoonestWeeklyReset => WalkOrder::MostWeeklyHeadroom,
         WalkOrder::MostWeeklyHeadroom => WalkOrder::Chain,
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.walk_order = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.walk_order = Some(next));
+    app.apply_forgets();
 }
 
 /// Step the burn-aware floor forward through [`BURN_FLOOR_PRESETS`] (space on
@@ -13693,12 +19164,8 @@ fn step_burn_floor(app: &mut App) {
         .copied()
         .find(|&p| p > current)
         .unwrap_or(BURN_FLOOR_PRESETS[0]);
-    {
-        let mut cfg = app.config();
-        cfg.state.burn_switch_floor_pct = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.burn_switch_floor_pct = Some(next));
+    app.apply_forgets();
 }
 
 /// Step the burn-aware horizon cap forward through [`BURN_HORIZON_PRESETS`].
@@ -13710,12 +19177,8 @@ fn step_burn_horizon(app: &mut App) {
         .copied()
         .find(|&p| p > current)
         .unwrap_or(BURN_HORIZON_PRESETS[0]);
-    {
-        let mut cfg = app.config();
-        cfg.state.burn_horizon_cap_ms = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.burn_horizon_cap_ms = Some(next));
+    app.apply_forgets();
 }
 
 /// Flip the master half of the real-money opt-in
@@ -13725,24 +19188,18 @@ fn step_burn_horizon(app: &mut App) {
 /// (`snapshot_chain` mirrors it into `ChainSnapshot`). Flipping this on alone
 /// still spends nothing — every member's ceiling defaults to $0.
 fn toggle_spend_budget_switching(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.spend_budget_switching = !cfg.state.spend_budget_switching;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.spend_budget_switching;
+    app.save_state_delta(|s, _held| s.spend_budget_switching = next);
+    app.apply_forgets();
 }
 
 /// Flip what happens once a billing account has spent its budget
 /// (`AppState.switch_off_when_budget_spent`). Same persistence shape as
 /// `toggle_spend_budget_switching`.
 fn toggle_budget_wrap_off(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.switch_off_when_budget_spent = !cfg.state.switch_off_when_budget_spent;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.switch_off_when_budget_spent;
+    app.save_state_delta(|s, _held| s.switch_off_when_budget_spent = next);
+    app.apply_forgets();
 }
 
 /// Flip preemptive rotation (on by default, and profile-wide — not per-account).
@@ -13750,12 +19207,9 @@ fn toggle_budget_wrap_off(app: &mut App) {
 /// the flag off the shared config each rotation-leg entry, so no separate
 /// propagation is needed.
 fn toggle_preemptive_rotation(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.preemptive_rotation;
+    app.save_state_delta(|s, _held| s.preemptive_rotation = next);
+    app.apply_forgets();
 }
 
 /// Flip the background self-update (`[update].auto_update`, default on). Same
@@ -13765,12 +19219,9 @@ fn toggle_preemptive_rotation(app: &mut App) {
 /// `CLAUTH_NO_UPDATE=1`: the persisted value is what the row edits, and the
 /// env var keeps overriding it until it goes.
 fn toggle_auto_update(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.update.auto_update = !cfg.state.update.auto_update;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.update.auto_update;
+    app.save_state_delta(|s, _held| s.update.auto_update = next);
+    app.apply_forgets();
 }
 
 /// Flip whether non-login keys stay with their account
@@ -13779,12 +19230,9 @@ fn toggle_auto_update(app: &mut App) {
 /// moment it relinks or rewrites a store (`claude::preserve_non_login_keys`),
 /// so the next relink in any process acts on the flip.
 fn toggle_preserve_non_login_keys(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.preserve_non_login_keys;
+    app.save_state_delta(|s, _held| s.preserve_non_login_keys = next);
+    app.apply_forgets();
 }
 
 /// Flip whether the background fetch polls spent (100%-capped) accounts
@@ -13792,51 +19240,36 @@ fn toggle_preserve_non_login_keys(app: &mut App) {
 /// `toggle_preemptive_rotation`; the scheduler reads the flag off the shared
 /// config each tick, so no separate propagation is needed.
 fn toggle_refresh_spent_accounts(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.refresh_spent_accounts = !cfg.state.refresh_spent_accounts;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.refresh_spent_accounts;
+    app.save_state_delta(|s, _held| s.refresh_spent_accounts = next);
+    app.apply_forgets();
 }
 
 /// Interleave the auto-start kick across accounts, or let every window reopen the
 /// instant it lapses (`usage::auto_start_queue`).
 fn toggle_auto_start_queue(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.auto_start_queue = !cfg.state.auto_start_queue;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.auto_start_queue;
+    app.save_state_delta(|s, _held| s.auto_start_queue = next);
+    app.apply_forgets();
 }
 
 fn toggle_show_estimates(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.show_estimates = !cfg.state.show_estimates;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.show_estimates;
+    app.save_state_delta(|s, _held| s.show_estimates = next);
+    app.apply_forgets();
 }
 
 /// Toggle whether the Tokens tab counts cache in its token figures (persisted).
 fn toggle_count_cache(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.count_cache = !cfg.state.count_cache;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.count_cache;
+    app.save_state_delta(|s, _held| s.count_cache = next);
+    app.apply_forgets();
 }
 
 fn toggle_show_pace(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.show_pace = !cfg.state.show_pace;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    let next = !app.config().state.show_pace;
+    app.save_state_delta(|s, _held| s.show_pace = next);
+    app.apply_forgets();
 }
 
 /// Advance the global refresh interval to the next-greater preset, wrapping
@@ -13851,12 +19284,10 @@ fn step_refresh_interval(app: &mut App) {
         .find(|&p| p > current)
         .unwrap_or(PRESETS[0]);
     app.refresh_interval.store(new_interval, Ordering::Relaxed);
-    {
-        let mut cfg = app.config();
-        cfg.state.refresh_interval_ms = new_interval;
-        let _ = save_app_state(&cfg.state);
+    if !app.save_state_delta(|s, _held| s.refresh_interval_ms = new_interval) {
+        app.refresh_interval.store(current, Ordering::Relaxed);
     }
-    app.last_reload_fp = reload_fingerprint();
+    app.apply_forgets();
 }
 
 /// Advance the context-nudge threshold to the next-greater preset, wrapping
@@ -13865,34 +19296,30 @@ fn step_refresh_interval(app: &mut App) {
 /// past the top preset it wraps to off, the cycle's first step.
 fn step_context_nudge(app: &mut App) {
     const PRESETS: [u64; 4] = [300_000, 400_000, 600_000, 900_000];
-    let current = app.config().state.context_nudge_threshold_tokens();
-    let next = match current {
+    let next = match app.config().state.context_nudge_threshold_tokens() {
         None => Some(PRESETS[0]),
         Some(v) => PRESETS.iter().copied().find(|&p| p > v),
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.context_nudge_threshold_tokens = next;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.context_nudge_threshold_tokens = next);
+    app.apply_forgets();
 }
 
 /// Open the inline custom-value editor for the global refresh interval, seeded
 /// with the current value in whole seconds. ⏎ commits, ⎋ discards.
 fn begin_refresh_interval_edit(app: &mut App) {
-    let secs = app.refresh_interval.load(Ordering::Relaxed) / 1000;
-    app.refresh_interval_draft = Some(InputState::new(&secs.to_string()));
+    app.refresh_interval_draft = Some(SeededInput::new(&refresh_interval_seed(app)));
 }
 
 /// Keystrokes while the refresh-interval field is open: ⏎ saves, ⎋ discards.
 fn handle_refresh_interval_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.refresh_interval_draft = None,
-        KeyCode::Enter => commit_refresh_interval_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_refresh_interval_edit(app);
+        }
         _ => {
-            if let Some(input) = app.refresh_interval_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.refresh_interval_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -13901,21 +19328,26 @@ fn handle_refresh_interval_edit_key(app: &mut App, key: KeyEvent) {
 /// Parse and persist the typed custom interval. Invalid input keeps the draft
 /// open so the Config card's inline Invalid-input treatment (DANGER value +
 /// `└ 10–3600 s` tooltip) stays on screen until corrected — no toast.
-fn commit_refresh_interval_edit(app: &mut App) {
-    let Some(raw) = app.refresh_interval_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// Returns whether the commit landed.
+fn commit_refresh_interval_edit(app: &mut App) -> bool {
+    let Some(raw) = app
+        .refresh_interval_draft
+        .as_ref()
+        .map(|i| i.input.trimmed())
+    else {
+        return true;
     };
     let Some(ms) = parse_refresh_secs(raw) else {
-        return;
+        return false;
     };
-    app.refresh_interval.store(ms, Ordering::Relaxed);
-    {
-        let mut cfg = app.config();
-        cfg.state.refresh_interval_ms = ms;
-        let _ = save_app_state(&cfg.state);
+    let previous = app.refresh_interval.swap(ms, Ordering::Relaxed);
+    if !app.save_state_delta(|s, _held| s.refresh_interval_ms = ms) {
+        app.refresh_interval.store(previous, Ordering::Relaxed);
+        return false;
     }
-    app.last_reload_fp = reload_fingerprint();
+    app.apply_forgets();
     app.refresh_interval_draft = None;
+    true
 }
 
 /// A typed custom interval is valid only as a whole number of **seconds** that
@@ -13934,25 +19366,19 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
 /// discards.
 fn begin_context_nudge_edit(app: &mut App) {
     let current = app.config().state.context_nudge_threshold_tokens();
-    let seed = match current {
-        None => String::from("300k"),
-        // Exact millions seed in k form (`2000k`), never `2M`: the parser's
-        // grammar takes digits or a single trailing k, so an M-form seed
-        // would open the editor in DANGER.
-        Some(v) if v.is_multiple_of(1_000_000) => format!("{}k", v / 1000),
-        Some(v) => format_threshold_tokens(v),
-    };
-    app.context_nudge_draft = Some(InputState::new(&seed));
+    app.context_nudge_draft = Some(SeededInput::new(&context_nudge_seed(current)));
 }
 
 /// Keystrokes while the context-nudge field is open: ⏎ saves, ⎋ discards.
 fn handle_context_nudge_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.context_nudge_draft = None,
-        KeyCode::Enter => commit_context_nudge_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_context_nudge_edit(app);
+        }
         _ => {
-            if let Some(input) = app.context_nudge_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.context_nudge_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -13961,20 +19387,20 @@ fn handle_context_nudge_edit_key(app: &mut App, key: KeyEvent) {
 /// Parse and persist the typed threshold. Invalid input keeps the draft open
 /// so the Config card's inline Invalid-input treatment (DANGER value +
 /// `└ 50k-2M tokens` tooltip) stays on screen until corrected — no toast.
-fn commit_context_nudge_edit(app: &mut App) {
-    let Some(raw) = app.context_nudge_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// Returns whether the commit landed.
+fn commit_context_nudge_edit(app: &mut App) -> bool {
+    let Some(raw) = app.context_nudge_draft.as_ref().map(|i| i.input.trimmed()) else {
+        return true;
     };
     let Some(tokens) = parse_context_nudge_tokens(raw) else {
-        return;
+        return false;
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.context_nudge_threshold_tokens = Some(tokens);
-        let _ = save_app_state(&cfg.state);
+    if !app.save_state_delta(|s, _held| s.context_nudge_threshold_tokens = Some(tokens)) {
+        return false;
     }
-    app.last_reload_fp = reload_fingerprint();
+    app.apply_forgets();
     app.context_nudge_draft = None;
+    true
 }
 
 /// A typed context-nudge threshold is valid only as whole tokens — a plain
@@ -14003,29 +19429,27 @@ fn step_weekly_threshold(app: &mut App) {
         .copied()
         .find(|&p| p > current)
         .unwrap_or(WEEKLY_PRESETS[0]);
-    {
-        let mut cfg = app.config();
-        cfg.state.weekly_switch_threshold = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.save_state_delta(|s, _held| s.weekly_switch_threshold = Some(next));
+    app.apply_forgets();
 }
 
 /// Open the inline custom-value editor for the weekly line, seeded with the
 /// current value. ⏎ commits, ⎋ discards.
 fn begin_weekly_threshold_edit(app: &mut App) {
     let current = app.config().state.weekly_switch_threshold_pct();
-    app.weekly_threshold_draft = Some(InputState::new(&format_weekly_pct(current)));
+    app.weekly_threshold_draft = Some(SeededInput::new(&format_weekly_pct(current)));
 }
 
 /// Keystrokes while the weekly-threshold field is open: ⏎ saves, ⎋ discards.
 fn handle_weekly_threshold_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.weekly_threshold_draft = None,
-        KeyCode::Enter => commit_weekly_threshold_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_weekly_threshold_edit(app);
+        }
         _ => {
-            if let Some(input) = app.weekly_threshold_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.weekly_threshold_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -14033,21 +19457,24 @@ fn handle_weekly_threshold_edit_key(app: &mut App, key: KeyEvent) {
 
 /// Parse and persist the typed custom weekly line. Invalid input keeps the
 /// draft open with the inline Invalid-input treatment, same as the refresh
-/// editor — no toast.
-fn commit_weekly_threshold_edit(app: &mut App) {
-    let Some(raw) = app.weekly_threshold_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// editor — no toast. Returns whether the commit landed.
+fn commit_weekly_threshold_edit(app: &mut App) -> bool {
+    let Some(raw) = app
+        .weekly_threshold_draft
+        .as_ref()
+        .map(|i| i.input.trimmed())
+    else {
+        return true;
     };
     let Some(pct) = parse_weekly_pct(raw) else {
-        return;
+        return false;
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.weekly_switch_threshold = Some(pct);
-        let _ = save_app_state(&cfg.state);
+    if !app.save_state_delta(|s, _held| s.weekly_switch_threshold = Some(pct)) {
+        return false;
     }
-    app.last_reload_fp = reload_fingerprint();
+    app.apply_forgets();
     app.weekly_threshold_draft = None;
+    true
 }
 
 /// A typed custom weekly line is valid as a finite percent (decimals allowed)
@@ -14069,7 +19496,8 @@ pub(crate) fn format_weekly_pct(pct: f64) -> String {
 }
 
 /// Right-pane keymap for a member: ↑↓ walks rows, `+`/`-` steps the threshold,
-/// ⏎/space on remove arms then confirms. Delegates to add picker on `+ add`.
+/// ⏎ on remove arms then confirms; space stays the state-control key.
+/// Delegates to add picker on `+ add`.
 fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     if selected_chain_member(app).is_none() {
         handle_fallback_add_key(app, key);
@@ -14134,11 +19562,32 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
         // opens the chip picker. Split here so `run_fallback_row` keeps its
         // single meaning for every other row.
         KeyCode::Char(' ') if row == FallbackRow::PreferredDays => step_preferred_days(app),
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        // `remove` is an action row and acts on `↵` alone; every other row's
+        // `space` stays a state control.
+        KeyCode::Char(' ') if row.is_state_control() => {
+            run_fallback_row(app, row);
+        }
+        KeyCode::Enter => {
             run_fallback_row(app, row);
         }
         _ => {}
     }
+}
+
+/// The `+ add` confirm's detail for a candidate clauth cannot measure: the
+/// hazard, then the way out. Two lines, because this dialog asks a question and
+/// the answer needs both the cost and the fix in one place.
+pub(crate) fn no_usage_confirm_detail(name: &str, active: bool) -> String {
+    // The period is added HERE, not in the shared fix line: this dialog speaks
+    // in sentences and its other two lines end in one, while the card's hint
+    // and the daemon's log line carry the same copy without a full stop, like
+    // every other hint and log line beside them.
+    format!(
+        "{}{}.\n{}.",
+        crate::fallback::no_usage_hazard_lead(active),
+        crate::fallback::no_usage_hazard(),
+        prose::mark_commands(&crate::fallback::no_usage_fix(&[name]))
+    )
 }
 
 /// `+ add` detail: a candidate picker. ↑↓ walks, ⏎ adds and re-homes focus.
@@ -14191,11 +19640,24 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_total.get(),
             );
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
-            let would_mix = {
+            // The sidecar fact from the cache, BEFORE the config guard: the
+            // predicate needs it, and reading `session-token.json` here would be
+            // a disk read under the lock (`collect_session_tokens` is built to
+            // keep those apart).
+            let session_token = app.installs_session_token(&name);
+            let (would_mix, no_usage, active) = {
                 let cfg = app.config();
-                chain_would_mix(&cfg, &name)
+                (
+                    chain_would_mix(&cfg, &name),
+                    cfg.find(&name)
+                        .is_some_and(|p| crate::fallback::no_usage_source(p, session_token)),
+                    // A candidate can already be the active account: it is the
+                    // chain it is missing from, not the active slot. Then the
+                    // hazard is not a future one.
+                    cfg.is_active(&name),
+                )
             };
             if would_mix {
                 app.open_modal(Modal::Confirm(ConfirmState {
@@ -14203,6 +19665,18 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                               api account."
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
+                    choice: false,
+                    scroll: ConfirmScroll::default(),
+                    on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
+                }));
+            } else if no_usage {
+                // The walk counts a member without a reading as having headroom
+                // and, once it is active, never moves off it. Said once here,
+                // where the operator still decides; the card's marker keeps
+                // saying it.
+                app.open_modal(Modal::Confirm(ConfirmState {
+                    message: "clauth can't read this account's usage.".into(),
+                    detail: Some(no_usage_confirm_detail(name.as_str(), active)),
                     choice: false,
                     scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
@@ -14216,9 +19690,13 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Add `name` to the chain, toast, and re-home focus. Shared by the direct
-/// add path and the `AddChainCandidate` confirm callback.
+/// add path and the `AddChainCandidate` confirm callback. A failed save
+/// reports the house `save failed` toast and skips the success toast and the
+/// focus re-homing: the chain is still without the member.
 fn commit_chain_add(app: &mut App, name: &ProfileName) {
-    add_chain_candidate(app, name);
+    if !add_chain_candidate(app, name) {
+        return;
+    }
     app.toast(ToastKind::Success, format!("added '{name}' to chain"));
     // When the picker empties, `+ add` disappears — land on the new member.
     let remaining = chain_candidates(app);
@@ -14324,9 +19802,10 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
     }
 }
 
-/// ⏎/space on a member detail row: a typed row opens its field and `preferred
+/// ⏎ on a member detail row: a typed row opens its field and `preferred
 /// days` its picker; remove arms, then removes on the second press. Each one
-/// pins the member under the cursor.
+/// pins the member under the cursor. Space reaches here for every row but
+/// `remove` and `preferred days` (the key handler splits both out).
 fn run_fallback_row(app: &mut App, row: FallbackRow) {
     match row {
         FallbackRow::Threshold => {
@@ -14346,8 +19825,9 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 open_card_edit(app, CardEdit::Weekly(InputState::new(&seed)));
             }
         }
-        FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::CheckWeekly),
-        FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::CheckScoped),
+        FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::Weekly),
+        FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::Scoped),
+        FallbackRow::CheckCreditCap => toggle_member_flag(app, MemberFlag::CreditCap),
         FallbackRow::LastResort => toggle_last_resort(app),
         FallbackRow::Preferred => toggle_preferred(app),
         // ⏎ only: space is the preset stepper and never reaches here for this row.
@@ -14365,17 +19845,21 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
             Some(MemberEdit {
                 member,
                 state: CardEdit::ArmedRemove,
+                ..
             }) => remove_chain_member(app, &member),
             _ => open_card_edit(app, CardEdit::ArmedRemove),
         },
     }
 }
 
-/// Open `edit` on the card, pinned to the member under the cursor.
+/// Open `edit` on the card, pinned to the member under the cursor. A typed
+/// field's seed is the value it was just constructed with.
 fn open_card_edit(app: &mut App, edit: CardEdit) {
+    let seed = edit.input().map(|i| i.value.clone());
     app.fallback_edit = selected_member_name(app).map(|member| MemberEdit {
         member,
         state: edit,
+        seed,
     });
 }
 
@@ -14383,7 +19867,9 @@ fn open_card_edit(app: &mut App, edit: CardEdit) {
 fn handle_member_field_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.fallback_edit = None,
-        KeyCode::Enter => commit_member_field(app),
+        KeyCode::Enter => {
+            let _ = commit_member_field(app);
+        }
         _ => {
             if let Some(input) = app.fallback_edit.as_mut().and_then(|e| e.state.input_mut()) {
                 apply_input_edit(input, key);
@@ -14396,33 +19882,36 @@ fn handle_member_field_key(app: &mut App, key: KeyEvent) {
 /// sits under the cursor now. Invalid input keeps the field open so the card's
 /// inline Invalid-input treatment (DANGER value + range tooltip) stays on
 /// screen until corrected — no toast.
-fn commit_member_field(app: &mut App) {
-    let Some(MemberEdit { member, state }) = app.fallback_edit.clone() else {
-        return;
+fn commit_member_field(app: &mut App) -> bool {
+    let Some(MemberEdit { member, state, .. }) = app.fallback_edit.clone() else {
+        return false;
     };
-    match state {
+    let landed = match state {
         CardEdit::Threshold(input) => {
             let Some(value) = parse_threshold(input.trimmed()) else {
-                return;
+                return false;
             };
-            write_threshold(app, &member, value);
+            write_threshold(app, &member, value)
         }
         // An EMPTY commit clears the override back to the chain-wide default.
         CardEdit::Weekly(input) => {
             let Some(value) = parse_weekly_override(input.trimmed()) else {
-                return;
+                return false;
             };
-            write_weekly_override(app, &member, value);
+            write_weekly_override(app, &member, value)
         }
         CardEdit::MaxSpend(input) => {
             let Some(value) = parse_max_spend(input.trimmed()) else {
-                return;
+                return false;
             };
-            write_max_spend(app, &member, value);
+            write_max_spend(app, &member, value)
         }
-        CardEdit::Days(_) | CardEdit::ArmedRemove => return,
+        CardEdit::Days(_) | CardEdit::ArmedRemove => return false,
+    };
+    if landed {
+        app.fallback_edit = None;
     }
-    app.fallback_edit = None;
+    landed
 }
 
 /// A typed override is a number in `0..=100`, or EMPTY — the explicit
@@ -14446,19 +19935,30 @@ fn selected_weekly_override(app: &App) -> Option<(Option<f64>, bool)> {
 }
 
 /// Write (or clear) `name`'s weekly-line override and persist.
-fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) {
+fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) -> bool {
     let save_err = {
         let mut cfg = app.config();
-        match cfg.find_mut(name) {
-            Some(profile) => {
+        update_profile_config(name, |p| {
+            p.weekly_threshold = value;
+            Ok(())
+        })
+        .map(|saved| {
+            if saved.is_some()
+                && let Some(profile) = cfg.find_mut(name)
+            {
                 profile.weekly_threshold = value;
-                save_profile_config(profile).err()
             }
-            None => None,
-        }
+        })
+        .err()
     };
     if let Some(e) = save_err {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+        );
+        false
+    } else {
+        true
     }
 }
 
@@ -14483,19 +19983,30 @@ fn selected_max_spend(app: &App) -> Option<f64> {
 }
 
 /// Write `name`'s ceiling and persist.
-fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) {
+fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) -> bool {
     let save_err = {
         let mut cfg = app.config();
-        match cfg.find_mut(name) {
-            Some(profile) => {
+        update_profile_config(name, |p| {
+            p.max_auto_spend = Some(value);
+            Ok(())
+        })
+        .map(|saved| {
+            if saved.is_some()
+                && let Some(profile) = cfg.find_mut(name)
+            {
                 profile.max_auto_spend = Some(value);
-                save_profile_config(profile).err()
             }
-            None => None,
-        }
+        })
+        .err()
     };
     if let Some(e) = save_err {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+        );
+        false
+    } else {
+        true
     }
 }
 
@@ -14564,6 +20075,7 @@ fn step_preferred_days(app: &mut App) {
             app.fallback_day_stop = Some(MemberEdit {
                 member: name.clone(),
                 state: shown,
+                seed: None,
             });
             preferred_days_at(0)
         }
@@ -14583,6 +20095,7 @@ fn open_day_picker(app: &mut App) {
         app.fallback_edit = Some(MemberEdit {
             member,
             state: CardEdit::Days(DayPicker::default()),
+            seed: None,
         });
     }
 }
@@ -14626,6 +20139,7 @@ fn toggle_picked_day(app: &mut App) {
     let Some(MemberEdit {
         member,
         state: CardEdit::Days(state),
+        ..
     }) = app.fallback_edit.clone()
     else {
         return;
@@ -14684,7 +20198,10 @@ fn write_preferred_days(
         Err(e) => {
             app.toast(
                 ToastKind::Danger,
-                format!("preferred days update failed\n{e}"),
+                format!(
+                    "preferred days update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
             );
             None
         }
@@ -14711,13 +20228,13 @@ fn selected_threshold(app: &App) -> Option<f64> {
 }
 
 /// Write `name`'s threshold and persist.
-fn write_threshold(app: &mut App, name: &ProfileName, value: f64) {
+fn write_threshold(app: &mut App, name: &ProfileName, value: f64) -> bool {
     let save_err = {
         let mut cfg = app.config();
         set_member_threshold(&mut cfg, name, value).err()
     };
     let Some(e) = save_err else {
-        return;
+        return true;
     };
     // A member whose roster row vanished inside the reload window is the
     // baseline's silent no-op: the account has already left, so there is
@@ -14727,9 +20244,13 @@ fn write_threshold(app: &mut App, name: &ProfileName, value: f64) {
         ..
     }) = e.downcast_ref::<ChainEditRefusal>()
     {
-        return;
+        return true;
     }
-    app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    app.toast(
+        ToastKind::Danger,
+        format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+    );
+    false
 }
 
 /// Step the threshold by `delta`, clamped to 0..=100, and persist.
@@ -14765,22 +20286,13 @@ fn adjust_weekly(app: &mut App, delta: f64) {
     write_weekly_override(app, &name, Some(next));
 }
 
-/// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
-/// The chain has ONE parking spot, so turning the mark on here clears it on
-/// every other profile (radio). The target saves first (the user's intent);
-/// each cleared profile then saves on its own, and a failed clear reverts only
-/// that profile — the chain walk tolerates a transiently double-marked chain
-/// (first marked member after the active wins), so nothing lies about disk.
-/// The `refresh_tokens()` kick is not load-bearing here (the chain snapshot
-/// reads the shared config directly, unlike `auto_start` which lives in the
-/// `TokenList`); it's kept so every per-profile toggle path re-derives the
-/// scheduler snapshot the same way.
-/// Which per-member usage gate a toggle row flips (`Profile::check_weekly` /
-/// `Profile::check_scoped`).
+/// A per-member usage gate a toggle row flips (`Profile::check_weekly` /
+/// `Profile::check_scoped` / `Profile::check_credit_cap`).
 #[derive(Clone, Copy)]
 enum MemberFlag {
-    CheckWeekly,
-    CheckScoped,
+    Weekly,
+    Scoped,
+    CreditCap,
 }
 
 /// Flip a per-member usage gate and persist it; rolls back in memory when the
@@ -14800,25 +20312,46 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
         };
         fn field(p: &mut crate::profile::Profile, flag: MemberFlag) -> &mut bool {
             match flag {
-                MemberFlag::CheckWeekly => &mut p.check_weekly,
-                MemberFlag::CheckScoped => &mut p.check_scoped,
+                MemberFlag::Weekly => &mut p.check_weekly,
+                MemberFlag::Scoped => &mut p.check_scoped,
+                MemberFlag::CreditCap => &mut p.check_credit_cap,
             }
         }
-        *field(profile, flag) = !*field(profile, flag);
-        match save_profile_config(profile) {
-            Ok(()) => None,
-            Err(e) => {
-                *field(profile, flag) = !*field(profile, flag);
-                Some(e)
+        // The flip is the value the row shows, turned over.
+        let next = !*field(profile, flag);
+        match update_profile_config(&name, |p| {
+            *field(p, flag) = next;
+            Ok(())
+        }) {
+            Ok(Some(_)) => {
+                if let Some(profile) = cfg.find_mut(&name) {
+                    *field(profile, flag) = next;
+                }
+                None
             }
+            Ok(None) => return,
+            Err(e) => Some(e),
         }
     };
     match failed {
         None => app.refresh_tokens(),
-        Some(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Some(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
+/// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
+/// The chain has ONE parking spot, so turning the mark on here clears it on
+/// every other profile (radio). The target saves first (the user's intent);
+/// each cleared profile then saves on its own, and a failed clear reverts only
+/// that profile — the chain walk tolerates a transiently double-marked chain
+/// (first marked member after the active wins), so nothing lies about disk.
+/// The `refresh_tokens()` kick is not load-bearing here (the chain snapshot
+/// reads the shared config directly, unlike `auto_start` which lives in the
+/// `TokenList`); it's kept so every per-profile toggle path re-derives the
+/// scheduler snapshot the same way.
 fn toggle_last_resort(app: &mut App) {
     enum Outcome {
         Missing,
@@ -14833,48 +20366,39 @@ fn toggle_last_resort(app: &mut App) {
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
+        match cfg.find(&name).map(|p| !p.last_resort) {
             None => Outcome::Missing,
-            Some(profile) => {
-                profile.last_resort = !profile.last_resort;
-                let now_on = profile.last_resort;
+            Some(now_on) => {
                 // Never both on one profile: "park here to the end" and "always
-                // come home here" are contradictory. Clear preferred before the
-                // single save so the pair persists atomically; remember the
-                // prior value so a save failure rolls back both.
-                let cleared_preferred = now_on && profile.preferred;
-                if now_on {
-                    profile.preferred = false;
-                }
-                match save_profile_config(profile) {
-                    Ok(()) => {
-                        let mut moved_from = None;
-                        if now_on {
-                            for p in cfg
-                                .profiles
-                                .iter_mut()
-                                .filter(|p| p.last_resort && p.name != name)
-                            {
-                                p.last_resort = false;
-                                match save_profile_config(p) {
-                                    Ok(()) => {
-                                        moved_from.get_or_insert_with(|| p.name.to_string());
-                                    }
-                                    Err(_) => p.last_resort = true,
-                                }
-                            }
-                        }
-                        Outcome::Saved { moved_from }
+                // come home here" are contradictory. Clear preferred in the
+                // same save so the pair persists atomically.
+                let saved = update_profile_config(&name, |p| {
+                    p.last_resort = now_on;
+                    if now_on {
+                        p.preferred = false;
                     }
-                    Err(e) => {
+                    Ok(())
+                });
+                match saved {
+                    Ok(None) => Outcome::Missing,
+                    Ok(Some(_)) => {
                         if let Some(p) = cfg.find_mut(&name) {
-                            p.last_resort = !now_on;
-                            if cleared_preferred {
-                                p.preferred = true;
+                            p.last_resort = now_on;
+                            if now_on {
+                                p.preferred = false;
                             }
                         }
-                        Outcome::SaveFailed(e)
+                        let moved_from = if now_on {
+                            clear_radio_elsewhere(&mut cfg, &name, |p| &mut p.last_resort)
+                        } else {
+                            Ok(None)
+                        };
+                        match moved_from {
+                            Ok(moved_from) => Outcome::Saved { moved_from },
+                            Err(e) => Outcome::SaveFailed(e),
+                        }
                     }
+                    Err(e) => Outcome::SaveFailed(e),
                 }
             }
         }
@@ -14887,7 +20411,10 @@ fn toggle_last_resort(app: &mut App) {
             }
             app.refresh_tokens();
         }
-        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Outcome::SaveFailed(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
@@ -14910,46 +20437,38 @@ fn toggle_preferred(app: &mut App) {
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
+        match cfg.find(&name).map(|p| !p.preferred) {
             None => Outcome::Missing,
-            Some(profile) => {
-                profile.preferred = !profile.preferred;
-                let now_on = profile.preferred;
+            Some(now_on) => {
                 // Reciprocal of the clear in `toggle_last_resort` — the two
                 // flags never coexist on one profile.
-                let cleared_last_resort = now_on && profile.last_resort;
-                if now_on {
-                    profile.last_resort = false;
-                }
-                match save_profile_config(profile) {
-                    Ok(()) => {
-                        let mut moved_from = None;
-                        if now_on {
-                            for p in cfg
-                                .profiles
-                                .iter_mut()
-                                .filter(|p| p.preferred && p.name != name)
-                            {
-                                p.preferred = false;
-                                match save_profile_config(p) {
-                                    Ok(()) => {
-                                        moved_from.get_or_insert_with(|| p.name.to_string());
-                                    }
-                                    Err(_) => p.preferred = true,
-                                }
-                            }
-                        }
-                        Outcome::Saved { moved_from }
+                let saved = update_profile_config(&name, |p| {
+                    p.preferred = now_on;
+                    if now_on {
+                        p.last_resort = false;
                     }
-                    Err(e) => {
+                    Ok(())
+                });
+                match saved {
+                    Ok(None) => Outcome::Missing,
+                    Ok(Some(_)) => {
                         if let Some(p) = cfg.find_mut(&name) {
-                            p.preferred = !now_on;
-                            if cleared_last_resort {
-                                p.last_resort = true;
+                            p.preferred = now_on;
+                            if now_on {
+                                p.last_resort = false;
                             }
                         }
-                        Outcome::SaveFailed(e)
+                        let moved_from = if now_on {
+                            clear_radio_elsewhere(&mut cfg, &name, |p| &mut p.preferred)
+                        } else {
+                            Ok(None)
+                        };
+                        match moved_from {
+                            Ok(moved_from) => Outcome::Saved { moved_from },
+                            Err(e) => Outcome::SaveFailed(e),
+                        }
                     }
+                    Err(e) => Outcome::SaveFailed(e),
                 }
             }
         }
@@ -14962,32 +20481,88 @@ fn toggle_preferred(app: &mut App) {
             }
             app.refresh_tokens();
         }
-        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Outcome::SaveFailed(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
-/// Add a profile to the chain (seeding default threshold if unset) and persist.
-fn add_chain_candidate(app: &mut App, name: &ProfileName) {
-    let mut cfg = app.config();
-    if let Some(profile) = cfg.find_mut(name)
-        && profile.fallback_threshold.is_none()
-    {
-        profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-        let _ = save_profile_config(profile);
-    }
-    cfg.state.fallback_chain.push(name.clone());
-    let _ = save_app_state(&cfg.state);
-}
-
-/// Remove `name` from the chain, persist, and return focus to the list.
-fn remove_chain_member(app: &mut App, name: &ProfileName) {
-    {
-        let mut cfg = app.config();
-        if !cfg.state.fallback_chain.contains(name) {
-            return;
+/// Clear one chain radio (`last_resort` or `preferred`) on every account but
+/// `keep`, deciding off each account's `config.toml` re-read under one state
+/// flock hold, so a mark a peer set after this app's read is cleared too. Each
+/// clear saves on its own, and a failed one leaves only that account marked.
+/// Memory mirrors every clear; the first account cleared, in roster order,
+/// comes back. A hold or roster read that fails clears nothing and is the
+/// error.
+fn clear_radio_elsewhere(
+    cfg: &mut AppConfig,
+    keep: &ProfileName,
+    flag: fn(&mut Profile) -> &mut bool,
+) -> Result<Option<String>> {
+    let cleared = with_state_lock(|_held| {
+        let mut cleared = Vec::new();
+        for name in crate::profile::claude_roster_names()? {
+            if name == *keep {
+                continue;
+            }
+            if let Ok(Some((_, true))) =
+                update_profile_config(&name, |p| Ok(std::mem::replace(flag(p), false)))
+            {
+                cleared.push(name);
+            }
         }
-        cfg.state.fallback_chain.retain(|n| n != name);
-        let _ = save_app_state(&cfg.state);
+        Ok(cleared)
+    })?;
+    for name in &cleared {
+        if let Some(p) = cfg.find_mut(name) {
+            *flag(p) = false;
+        }
+    }
+    Ok(cleared.first().map(ToString::to_string))
+}
+
+/// Add a profile to the chain (seeding default threshold if unset) and
+/// persist, onto a fresh state read under the flock; returns whether the chain
+/// now holds it. A failed chain save leaves memory and both files as they
+/// were and raises the house `save failed` toast; an account a peer deleted
+/// meanwhile is not added, and the toast says it is gone. The threshold is seeded after the push, on the
+/// profile re-read off disk: a threshold a peer set meanwhile is kept, and a
+/// failed seed leaves the member added with memory mirroring the disk it
+/// failed to write.
+fn add_chain_candidate(app: &mut App, name: &ProfileName) -> bool {
+    if !app.save_state_delta(|s, _held| {
+        if !s.fallback_chain.contains(name) && s.profiles.contains(name) {
+            s.fallback_chain.push(name.clone());
+        }
+    }) {
+        return false;
+    }
+    if !app.config().state.fallback_chain.contains(name) {
+        app.toast(ToastKind::Danger, format!("'{name}' is gone"));
+        return false;
+    }
+    let mut cfg = app.config();
+    if let Ok(Some((fresh, ()))) = update_profile_config(name, |p| {
+        p.fallback_threshold.get_or_insert(DEFAULT_THRESHOLD);
+        Ok(())
+    }) && let Some(profile) = cfg.find_mut(name)
+    {
+        profile.fallback_threshold = fresh.fallback_threshold;
+    }
+    true
+}
+
+/// Remove `name` from the chain, persist, and return focus to the list. On a
+/// failed save the member rolls back into the in-memory chain, the focus and
+/// cursor stay put, and the error surfaces on the house `save failed` toast —
+/// never the removal toast.
+fn remove_chain_member(app: &mut App, name: &ProfileName) {
+    if !app.config().state.fallback_chain.contains(name) {
+        return;
+    }
+    if !app.save_state_delta(|s, _held| s.fallback_chain.retain(|n| n != name)) {
+        return;
     }
     leave_fallback_detail(app);
     let items_len = chain_items(app).len();
@@ -15037,11 +20612,12 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 ) as u16;
             }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q') => {
-                app.modals.pop();
+                app.pop_modal();
             }
             _ => {}
         },
         Modal::Confirm(_) => handle_confirm_key(app, key),
+        Modal::LossWarning(_) => handle_loss_warning_key(app, key),
         // The read-only `check output` modal scrolls, pages and closes like the
         // help modal, bar `?`: the body may hold one, so it is no close key here.
         Modal::CheckOutput(_) => match key.code {
@@ -15070,7 +20646,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 ) as u16;
             }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                app.modals.pop();
+                app.pop_modal();
             }
             _ => {}
         },
@@ -15084,6 +20660,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
+        Modal::CodexLogin => handle_codex_login_modal_key(app, key),
+        Modal::Rebind(_) => handle_rebind_key(app, key),
+        Modal::BareItem(_) => handle_bare_item_key(app, key),
+        Modal::BareItemOwner(_) => handle_bare_item_owner_key(app, key),
     }
 }
 
@@ -15113,11 +20693,14 @@ fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
         }
         // OSC 52 lands the link on the LOCAL terminal's clipboard, even over ssh.
         KeyCode::Char('c' | 'C') => {
-            let link = app
-                .login
-                .as_ref()
-                .and_then(LoginSession::open_door)
-                .map(|door| door.links.hosted_url.clone());
+            let link = if app.shunt_paste.is_some() {
+                app.login.as_ref().and_then(|s| s.url.clone())
+            } else {
+                app.login
+                    .as_ref()
+                    .and_then(LoginSession::open_door)
+                    .map(|door| door.links.hosted_url.clone())
+            };
             if let Some(link) = link {
                 match (app.clipboard)(&link) {
                     Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
@@ -15129,14 +20712,54 @@ fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('p' | 'P') => {
+            let door_open = app.login.as_ref().is_some_and(|s| s.open_door().is_some())
+                || app.shunt_paste.as_ref().is_some_and(|s| {
+                    // The paste door opens only once the URL is announced (no
+                    // code can exist before the link) and no paste went down it
+                    // yet.
+                    !s.sent && app.login.as_ref().is_some_and(|l| l.url.is_some())
+                });
             if let Some(session) = app.login.as_mut()
-                && session.open_door().is_some()
+                && door_open
             {
                 session.paste_field = Some(InputState::new(""));
             }
         }
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
+        }
+        _ => {}
+    }
+}
+
+/// Keys on the codex login modal: `r` re-opens the authorize URL once the
+/// worker announced it, `c` copies it (OSC 52, as the claude modal's `c`
+/// does); no `p` — codex's callback answers on this machine alone, so there is
+/// no paste door. esc/q/⏎ collapse to the footer indicator; the login keeps
+/// running (a real cancel is the top-level esc once collapsed).
+fn handle_codex_login_modal_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('r' | 'R') => {
+            if let Some(url) = app.codex_login.as_ref().and_then(|s| s.url.clone()) {
+                match crate::platform::open_url(&url) {
+                    Ok(()) => app.toast(ToastKind::Info, "opening your browser…"),
+                    Err(_) => app.toast(ToastKind::Danger, "couldn't open the browser"),
+                }
+            }
+        }
+        KeyCode::Char('c' | 'C') => {
+            if let Some(link) = app.codex_login.as_ref().and_then(|s| s.url.clone()) {
+                match (app.clipboard)(&link) {
+                    Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
+                    Err(e) => app.toast(
+                        ToastKind::Danger,
+                        format!("couldn't copy the link to clipboard\n{e}"),
+                    ),
+                }
+            }
+        }
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            app.pop_modal();
         }
         _ => {}
     }
@@ -15173,13 +20796,27 @@ fn submit_paste_code(app: &mut App) {
     let Some(session) = app.login.as_mut() else {
         return;
     };
-    let Some(raw) = session
-        .paste_field
-        .as_ref()
-        .map(|field| field.trimmed().to_string())
-    else {
+    let Some(field) = session.paste_field.as_ref() else {
         return;
     };
+    // The shunt add relays the pasted string VERBATIM (never parsed, never
+    // trimmed): a bad paste is shunt's to refuse on the exchange.
+    if let Some(shunt) = app.shunt_paste.as_mut() {
+        if field.value.is_empty() {
+            return;
+        }
+        // The door accepts a submit only once the URL is announced: no code can
+        // exist before the link. The `p` key gates the same way; this re-checks
+        // so a field opened before the announce can never send.
+        if session.url.is_none() {
+            return;
+        }
+        let _ = shunt.tx.send(field.value.clone());
+        shunt.sent = true;
+        session.paste_field = None;
+        return;
+    }
+    let raw = field.trimmed().to_string();
     if raw.is_empty() {
         return;
     }
@@ -15211,17 +20848,47 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
     let mut scoped: Vec<ActionMenuAction> = Vec::new();
     let mut actions: Vec<ActionMenuAction> = Vec::new();
     let mut context: Option<String> = None;
+    let mut row_identity: Option<RowIdentity> = None;
 
     match app.tab {
         Tab::Overview => {
-            if matches!(app.current_main_item(), Some(MainItemKind::Profile(_))) {
-                context = push_account_scope(app, &mut scoped);
+            match app.current_main_item() {
+                Some(MainItemKind::Profile(_)) => {
+                    if let Some((name, display)) = push_account_scope(app, &mut scoped) {
+                        context = Some(display);
+                        row_identity = Some(RowIdentity::Profile(name));
+                    }
+                }
+                Some(MainItemKind::Shunt(_, _)) => {
+                    if let Some((name, identity)) = push_pool_scope(app, &mut scoped) {
+                        context = Some(name);
+                        row_identity = Some(RowIdentity::Pool(identity));
+                    }
+                }
+                Some(MainItemKind::Codex(_)) | None => {}
             }
             actions.push(RefreshAll);
             actions.push(NewAccount);
         }
         Tab::Usage => {
-            context = push_account_scope(app, &mut scoped);
+            // The scoped group reuses the Overview's per-row builders, so a
+            // pool row offers exactly the Overview's pool actions and a codex
+            // row offers none (its detail rows carry re-login / delete).
+            match app.usage_selection() {
+                SetupSelection::Item(MainItemKind::Profile(_)) => {
+                    if let Some((name, display)) = push_account_scope(app, &mut scoped) {
+                        context = Some(display);
+                        row_identity = Some(RowIdentity::Profile(name));
+                    }
+                }
+                SetupSelection::Item(item @ MainItemKind::Shunt(..)) => {
+                    if let Some((name, identity)) = push_pool_scope_for(app, item, &mut scoped) {
+                        context = Some(name);
+                        row_identity = Some(RowIdentity::Pool(identity));
+                    }
+                }
+                SetupSelection::Item(MainItemKind::Codex(_)) | SetupSelection::New => {}
+            }
             actions.push(RefreshAll);
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
@@ -15259,26 +20926,33 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         // endpoint + models as a template, stamp one back onto it. On `+ new`
         // there is no source account to duplicate or save, but a preset can
         // still stamp the draft's endpoint + model fields.
-        Tab::Setup => {
-            if let Some((name, _, _)) = focused_account(app) {
-                context = Some(name.to_string());
-                scoped.push(Duplicate);
-                scoped.push(SaveAsPreset);
-                scoped.push(ApplyPreset);
-                // The api-key row is on this tab, so the page that key comes
-                // from belongs next to it.
-                if focused_provider_console(app).is_some() {
-                    scoped.push(OpenProviderConsole);
+        Tab::Setup => match app.setup_selection() {
+            SetupSelection::Item(MainItemKind::Profile(_)) => {
+                if let Some((name, _, _)) = focused_account(app) {
+                    context = Some(name.to_string());
+                    row_identity = Some(RowIdentity::Profile(name.clone()));
+                    scoped.push(Duplicate);
+                    scoped.push(SaveAsPreset);
+                    scoped.push(ApplyPreset);
+                    // The api-key row is on this tab, so the page that key comes
+                    // from belongs next to it.
+                    if focused_provider_console(app).is_some() {
+                        scoped.push(OpenProviderConsole);
+                    }
                 }
-            } else if app.profile_cursor >= app.profile_count() {
-                // `+ new` only: its draft is what a preset stamps.
-                context = app
-                    .config_draft
-                    .as_ref()
-                    .and_then(|d| d.name.trimmed_some());
-                scoped.push(ApplyPreset);
             }
-        }
+            // `+ new` only: its draft is what a preset stamps, and the offer
+            // gates on the one predicate the apply's re-check shares.
+            SetupSelection::New => {
+                context = new_form_draft(app).and_then(|d| d.name.trimmed_some());
+                if new_account_type_is_claude(app) {
+                    scoped.push(ApplyPreset);
+                }
+            }
+            // A codex or pool row gains nothing: its detail rows carry the
+            // actions (re-login / delete account; refresh / remove).
+            SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {}
+        },
         // Fallback: every action the chain and its detail rows carry is bound to
         // a key of its own (⏎, ⇧↑↓, space, +/-).
         Tab::Fallback => {}
@@ -15306,7 +20980,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         actions.push(verb.action());
     }
 
-    ActionMenuState::new(scoped, actions, context)
+    ActionMenuState::new(scoped, actions, context, row_identity)
 }
 
 /// What the action menu's shunt verb does, decided once by [`shunt_verb`] for
@@ -15413,10 +21087,14 @@ const GATEWAY_LEFT_RUNNING: &str = concat!(
     " → start daemon"
 );
 
-/// Push what the account under the cursor can be told to do, returning the name
-/// the menu titles that group with. Nothing to push when the cursor sits past
-/// the accounts (an empty Overview), which is also what leaves the title bare.
-fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<String> {
+/// Push what the account under the cursor can be told to do, returning the
+/// account's identity and the name the menu titles that group with. Nothing to
+/// push when the cursor sits past the accounts (an empty Overview), which is
+/// also what leaves the title bare.
+fn push_account_scope(
+    app: &App,
+    scoped: &mut Vec<ActionMenuAction>,
+) -> Option<(ProfileName, String)> {
     let (name, _, _) = focused_account(app)?;
     scoped.push(ActionMenuAction::RefreshUsage);
     scoped.push(ActionMenuAction::RotateTokens);
@@ -15424,7 +21102,43 @@ fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<S
     if focused_provider_console(app).is_some() {
         scoped.push(ActionMenuAction::OpenProviderConsole);
     }
-    Some(name.to_string())
+    Some((name.clone(), name.to_string()))
+}
+
+/// The scoped items a pool row offers: `refresh` where shunt has a refresh
+/// route (claude and antigravity) and `remove` where it has any admin route
+/// (every family but kimi and unknown auth). Returns the account's display
+/// name and its `(family, name)` identity, which the menu drops when the group
+/// stays empty. The gate is the same `pool_row_at` lookup the handlers run, so
+/// the menu never offers a key the pick cannot run (no record, unread pool, or
+/// an unparseable name offers nothing). The Overview passes its cursor's row;
+/// the Usage arm passes the row its own selection resolved to.
+fn push_pool_scope(
+    app: &App,
+    scoped: &mut Vec<ActionMenuAction>,
+) -> Option<(String, PoolRowIdentity)> {
+    push_pool_scope_for(app, app.current_main_item()?, scoped)
+}
+
+/// [`push_pool_scope`] for an explicit pool row, shared by the Overview (its
+/// cursor's row) and the Usage tab (its identity-held selection's row).
+fn push_pool_scope_for(
+    app: &App,
+    item: MainItemKind,
+    scoped: &mut Vec<ActionMenuAction>,
+) -> Option<(String, PoolRowIdentity)> {
+    let MainItemKind::Shunt(pi, ai) = item else {
+        return None;
+    };
+    let (_, auth, name, display) = pool_row_at(app, pi, ai)?;
+    let identity = (auth.clone().family()?, name.clone());
+    if auth.clone().refresh_family().is_some() {
+        scoped.push(ActionMenuAction::RefreshPoolAccount);
+    }
+    if auth.family().is_some() {
+        scoped.push(ActionMenuAction::RemovePoolAccount);
+    }
+    Some((display, identity))
 }
 
 /// The console page the focused account's endpoint mints its api key on.
@@ -15432,13 +21146,25 @@ fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<S
 /// provider claims. Both the menu's gate and the handler resolve through this
 /// one function, so what is offered and what opens cannot drift apart.
 fn focused_provider_console(app: &App) -> Option<&'static str> {
-    app.config().profiles.get(app.profile_cursor)?.console_url()
+    let name = app.profile_name_at(app.profile_cursor.read())?;
+    provider_console_by_name(app, &name)
 }
 
-/// Open the focused account's provider console in the default browser
-/// (detached), mirroring [`open_incident_link`].
-fn open_provider_console(app: &mut App) {
-    let Some(url) = focused_provider_console(app) else {
+/// [`focused_provider_console`] for a named account — the menu's per-row pick
+/// resolves its stored claude identity through this.
+fn provider_console_by_name(app: &App, name: &ProfileName) -> Option<&'static str> {
+    app.config()
+        .profiles
+        .iter()
+        .find(|p| p.name == *name)?
+        .console_url()
+}
+
+/// Open the named account's provider console in the default browser
+/// (detached), mirroring [`open_incident_link`]. The menu's per-row pick
+/// resolves its stored claude identity through this.
+fn open_console_account(app: &mut App, name: &ProfileName) {
+    let Some(url) = provider_console_by_name(app, name) else {
         app.toast(ToastKind::Info, "no console page for this endpoint");
         return;
     };
@@ -15454,7 +21180,7 @@ fn disabled_toggle_action(app: &App) -> ActionMenuAction {
     let currently_disabled = app
         .config()
         .profiles
-        .get(app.profile_cursor)
+        .get(app.profile_cursor.read())
         .is_some_and(Profile::is_disabled);
     if currently_disabled {
         ActionMenuAction::EnableProfile
@@ -15475,15 +21201,16 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
             .find(|item| item.hotkey == Some(ch_lower))
             .map(|item| item.action.clone());
         if let Some(action) = action {
-            app.modals.pop();
-            dispatch_action_menu_action(app, action);
+            let row_identity = state.row_identity.clone();
+            app.pop_modal();
+            dispatch_menu_pick(app, action, row_identity);
             return;
         }
     }
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Up => {
             let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
@@ -15554,13 +21281,30 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
                 .items
                 .get(state.cursor)
                 .map(|item| item.action.clone());
-            app.modals.pop();
+            let row_identity = state.row_identity.clone();
+            app.pop_modal();
             if let Some(action) = action {
-                dispatch_action_menu_action(app, action);
+                dispatch_menu_pick(app, action, row_identity);
             }
         }
         _ => {}
     }
+}
+
+/// The account named `name` as `(name, has_oauth_login,
+/// usage_cache_is_third_party)`; `None` when the roster no longer holds it.
+/// The same triple [`focused_account`] yields, looked up by name instead of the
+/// cursor's index — the menu's per-row picks resolve their stored claude
+/// identity through this.
+fn account_by_name(app: &App, name: &ProfileName) -> Option<(ProfileName, bool, bool)> {
+    let cfg = app.config();
+    cfg.profiles.iter().find(|p| p.name == *name).map(|p| {
+        (
+            p.name.clone(),
+            p.login_is_oauth(),
+            p.usage_cache_is_third_party(),
+        )
+    })
 }
 
 /// The account under the cursor as `(name, has_oauth_login,
@@ -15578,24 +21322,18 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 /// third-party leg fetches generic api-key endpoints too — `is_third_party`
 /// would refuse a litellm row the scheduler refreshes every cadence.
 fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
-    let cfg = app.config();
-    cfg.profiles.get(app.profile_cursor).map(|p| {
-        (
-            p.name.clone(),
-            p.login_is_oauth(),
-            p.usage_cache_is_third_party(),
-        )
-    })
+    let name = app.profile_name_at(app.profile_cursor.read())?;
+    account_by_name(app, &name)
 }
 
-/// Queue a usage refetch for the account under the cursor, or toast why not.
-/// One shape for both entry points (Usage `r`, the action menu's refresh
-/// entry): the OAuth arm and the third-party-cache arm both queue
-/// [`App::manual_refresh_one`] — the same refetch the cadence legs would run —
-/// and only an endpoint-only account with no credential either leg can use
-/// falls through to the nothing-to-refresh toast.
-fn queue_focused_usage_refresh(app: &mut App) {
-    match focused_account(app) {
+/// Queue a usage refetch for the named account, or toast why not. One shape
+/// for every entry point (Usage `r` and the menu's identity-resolved pick):
+/// the OAuth arm and the third-party-cache arm
+/// both queue [`App::manual_refresh_one`] — the same refetch the cadence legs
+/// would run — and only an endpoint-only account with no credential either leg
+/// can use falls through to the nothing-to-refresh toast.
+fn refresh_usage_account(app: &mut App, name: &ProfileName) {
+    match account_by_name(app, name) {
         Some((name, true, _)) | Some((name, _, true)) => {
             app.manual_refresh_one(&name);
             app.toast(ToastKind::Info, format!("refreshing '{name}'"));
@@ -15607,53 +21345,180 @@ fn queue_focused_usage_refresh(app: &mut App) {
     }
 }
 
-/// Dispatch a selected action menu item to its handler.
-fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
-    match action {
-        ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshUsage => queue_focused_usage_refresh(app),
-        ActionMenuAction::RotateTokens => match focused_account(app) {
-            // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
-            // say why up front instead of arming a confirm that no-ops.
-            Some((name, true, _)) if crate::runtime::rotation_blocked_for(&name) => {
+/// Queue a usage refetch for the account under the cursor, or toast why not.
+fn queue_focused_usage_refresh(app: &mut App) {
+    let Some(name) = app.profile_name_at(app.profile_cursor.read()) else {
+        return;
+    };
+    refresh_usage_account(app, &name);
+}
+
+/// `r` on the Usage tab, routed by row: a claude row refreshes that account, a
+/// pool row re-reads the pool listing through the probe restart path, and a
+/// codex row is inert (no per-account codex poll trigger exists in the TUI or
+/// the scheduler's public surface).
+fn usage_refresh(app: &mut App) {
+    match app.usage_selection() {
+        SetupSelection::Item(MainItemKind::Profile(_)) => queue_focused_usage_refresh(app),
+        SetupSelection::Item(MainItemKind::Shunt(..)) => {
+            app.shunt_pool_probe.restart();
+            app.toast(ToastKind::Info, "re-reading the pool listing");
+        }
+        SetupSelection::Item(MainItemKind::Codex(_)) | SetupSelection::New => {}
+    }
+}
+
+/// The toast for a claude pick whose account left the roster while the menu
+/// was open: the pick acts on nothing and says so.
+const CLAUDE_ROW_GONE: &str = "that account is gone";
+
+/// Resolve a menu's stored claude row identity at dispatch: the stored name if
+/// the roster still holds it. A name that left the roster raises one info toast
+/// and returns `None`; a pool identity (or none) — impossible for the claude
+/// actions that call this — returns `None` without a toast.
+fn claude_name_at_pick(app: &mut App, identity: Option<RowIdentity>) -> Option<ProfileName> {
+    match identity {
+        Some(RowIdentity::Profile(name)) if account_by_name(app, &name).is_some() => Some(name),
+        Some(RowIdentity::Profile(_)) => {
+            app.toast(ToastKind::Info, CLAUDE_ROW_GONE);
+            None
+        }
+        Some(RowIdentity::Pool(_)) | None => None,
+    }
+}
+
+/// The menu's `refresh usage` pick: refresh the stored claude row, or toast
+/// that the account left the roster.
+fn refresh_usage_identity(app: &mut App, identity: Option<RowIdentity>) {
+    let Some(name) = claude_name_at_pick(app, identity) else {
+        return;
+    };
+    refresh_usage_account(app, &name);
+}
+
+/// The `rotate access token` action on the named account — the shared body
+/// the menu's identity pick resolves into.
+fn rotate_account(app: &mut App, name: &ProfileName) {
+    match account_by_name(app, name) {
+        // macOS refuses this rotation (`runtime::rotation_block_for`), so
+        // say why up front instead of arming a confirm that no-ops.
+        Some((name, true, _)) => {
+            if let Some(block) = crate::runtime::rotation_block_for(&name) {
                 app.open_modal(Modal::Confirm(ConfirmState {
-                    message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
+                    message: rotate_blocked_message(name.as_str(), block),
                     detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
                     choice: true,
                     scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::Acknowledge,
                 }));
+                return;
             }
-            Some((name, true, _)) => {
-                app.open_modal(Modal::Confirm(ConfirmState {
-                    message: format!("rotate access token for '{name}'?"),
-                    detail: None,
-                    choice: false,
-                    scroll: ConfirmScroll::default(),
-                    on_confirm: ConfirmAction::RotateOne(name.to_string()),
-                }));
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: format!("rotate access token for '{name}'?"),
+                detail: None,
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::RotateOne(name.to_string()),
+            }));
+        }
+        Some((name, _, _)) => {
+            app.toast(ToastKind::Info, format!("'{name}' has no tokens to rotate"));
+        }
+        None => {}
+    }
+}
+
+/// The menu's `rotate access token` pick.
+fn rotate_tokens_identity(app: &mut App, identity: Option<RowIdentity>) {
+    let Some(name) = claude_name_at_pick(app, identity) else {
+        return;
+    };
+    rotate_account(app, &name);
+}
+
+/// The menu's disable/enable pick: run the direction the item's label named
+/// against the stored claude row, or toast that the account left the roster.
+fn toggle_disabled_identity(
+    app: &mut App,
+    identity: Option<RowIdentity>,
+    direction: DisableDirection,
+) {
+    let Some(name) = claude_name_at_pick(app, identity) else {
+        return;
+    };
+    toggle_account_disabled(app, &name, direction);
+}
+
+/// The menu's `open provider console` pick.
+fn open_console_identity(app: &mut App, identity: Option<RowIdentity>) {
+    let Some(name) = claude_name_at_pick(app, identity) else {
+        return;
+    };
+    open_console_account(app, &name);
+}
+
+/// The menu's `duplicate account` pick.
+fn duplicate_identity(app: &mut App, identity: Option<RowIdentity>) {
+    let Some(name) = claude_name_at_pick(app, identity) else {
+        return;
+    };
+    duplicate_account(app, &name);
+}
+
+/// The menu's `save as preset` pick.
+fn save_preset_identity(app: &mut App, identity: Option<RowIdentity>) {
+    let Some(name) = claude_name_at_pick(app, identity) else {
+        return;
+    };
+    save_preset_account(app, &name);
+}
+
+/// The menu's `apply preset` pick: on a claude row it stamps the stored
+/// account, on the `+ new` row (which carries no claude identity) it stamps
+/// the draft through the cursor path, and a gone account toasts.
+fn apply_preset_identity(app: &mut App, identity: Option<RowIdentity>) {
+    match identity {
+        None => open_preset_picker(app),
+        Some(_) => {
+            if let Some(name) = claude_name_at_pick(app, identity) {
+                apply_preset_account(app, &name);
             }
-            Some((name, _, _)) => {
-                app.toast(ToastKind::Info, format!("'{name}' has no tokens to rotate"));
-            }
-            None => {}
-        },
+        }
+    }
+}
+
+/// Dispatch a menu pick. Every per-row action resolves the row identity the
+/// menu was built for (never the cursor re-read at pick time, which a roster or
+/// listing change between open and pick could have moved onto a neighbour);
+/// the tab-global actions ignore the row identity and run their handlers.
+fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Option<RowIdentity>) {
+    match action {
+        // Per-row actions: the identity the menu stored.
+        ActionMenuAction::RefreshPoolAccount => start_pool_refresh_identity(app, row_identity),
+        ActionMenuAction::RemovePoolAccount => open_pool_remove_confirm_identity(app, row_identity),
+        ActionMenuAction::RefreshUsage => refresh_usage_identity(app, row_identity),
+        ActionMenuAction::RotateTokens => rotate_tokens_identity(app, row_identity),
+        ActionMenuAction::DisableProfile => {
+            toggle_disabled_identity(app, row_identity, DisableDirection::Disable);
+        }
+        ActionMenuAction::EnableProfile => {
+            toggle_disabled_identity(app, row_identity, DisableDirection::Enable);
+        }
+        ActionMenuAction::OpenProviderConsole => open_console_identity(app, row_identity),
+        ActionMenuAction::Duplicate => duplicate_identity(app, row_identity),
+        ActionMenuAction::SaveAsPreset => save_preset_identity(app, row_identity),
+        ActionMenuAction::ApplyPreset => apply_preset_identity(app, row_identity),
+        // Tab-global actions: no row identity.
+        ActionMenuAction::NewAccount => start_new_account(app),
         ActionMenuAction::RefreshAll => {
             app.manual_refresh();
             app.toast(ToastKind::Info, "refreshing every account");
         }
-        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
-            toggle_focused_account_disabled(app);
-        }
-        ActionMenuAction::OpenProviderConsole => open_provider_console(app),
         ActionMenuAction::StartDaemon => open_daemon_start_confirm(app),
         ActionMenuAction::StopDaemon => stop_daemon(app),
         ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
             dispatch_shunt_verb(app, action);
         }
-        ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
-        ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
-        ActionMenuAction::ApplyPreset => open_preset_picker(app),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
@@ -15785,12 +21650,23 @@ fn profiles_naming_bind<'a>(
 /// offer leaves the focus to the descend rule (the first line in view, else
 /// none).
 fn jump_to_shunt_card(app: &mut App, focus: ShuntFocusLine) {
-    switch_tab(app, Tab::Services);
+    request_target(app, LossWarningTarget::ShuntCard(focus));
+}
+
+/// `jump_to_shunt_card`'s landing: switch to Services and settle the card.
+/// Move the Services selector cursor onto the `shunt` row, the one place every
+/// cross-surface jump to the card lands.
+fn select_shunt_check(app: &mut App) {
     if let Some(idx) = app.services.checks.iter().position(|c| c.label == "shunt") {
         app.services.cursor = idx;
     }
+}
+
+fn land_shunt_card(app: &mut App, focus: ShuntFocusLine) {
+    do_switch(app, Tab::Services);
+    select_shunt_check(app);
     app.services.focus = ServicesFocus::Detail;
-    app.services.detail_scroll = 0;
+    app.services.shunt_scroll.set(0);
     app.services.set_shunt_focus(
         app.services
             .selected_check()
@@ -15951,6 +21827,7 @@ fn drain_daemon_control(app: &mut App) {
 fn reprobe_daemon(app: &mut App) {
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
+    sync_daemon_binary_change(app);
     app.last_daemon_probe = Instant::now();
 }
 
@@ -15973,25 +21850,37 @@ fn set_token_period(app: &mut App, period: TokenPeriod) {
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
 /// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    let sel_len = app.profile_count() + 1; // includes trailing `+ new` row
-    app.profile_cursor = app.profile_cursor.min(sel_len - 1);
+    let sel_len = app.setup_items().len() + 1; // includes trailing `+ new` row
 
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
-            KeyCode::Up => step_profile_cursor(app, -1, sel_len),
-            KeyCode::Down => step_profile_cursor(app, 1, sel_len),
+            KeyCode::Up => step_setup_cursor(app, -1, sel_len),
+            KeyCode::Down => step_setup_cursor(app, 1, sel_len),
             KeyCode::PageUp => {
-                app.profile_cursor = selector_page_up(app.profile_cursor, &app.setup_selector);
-                app.reload_selected_note();
+                let next = selector_page_up(app.setup_position(), &app.setup_selector);
+                app.step_selection(SelectionSlotKind::Setup, next);
             }
             KeyCode::PageDown => {
-                app.profile_cursor = selector_page_down(app.profile_cursor, &app.setup_selector);
-                app.reload_selected_note();
+                let next = selector_page_down(app.setup_position(), &app.setup_selector);
+                app.step_selection(SelectionSlotKind::Setup, next);
             }
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
         ConfigFocus::Actions => {
+            // The codex and pool detail panes run their own row lists and
+            // actions; the claude path (and the `+ new` form) keep `config_rows`.
+            match app.setup_selection() {
+                SetupSelection::Item(MainItemKind::Codex(_)) => {
+                    handle_codex_detail_key(app, key);
+                    return;
+                }
+                SetupSelection::Item(MainItemKind::Shunt(..)) => {
+                    handle_pool_detail_key(app, key);
+                    return;
+                }
+                _ => {}
+            }
             let rows = config_rows(app);
             if rows.is_empty() {
                 app.config_focus = ConfigFocus::Profiles;
@@ -16045,7 +21934,16 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         app.setup_detail_total.get(),
                     );
                 }
-                KeyCode::Enter => run_config_row(app, rows[app.config_action_cursor]),
+                KeyCode::Enter => {
+                    let row = rows[app.config_action_cursor];
+                    // ⏎ mirrors space on the cycle rows: the `type` and `family`
+                    // rows advance; the `model` row keeps ⏎ for its custom field.
+                    match row {
+                        ConfigRow::Type => cycle_account_type(app),
+                        ConfigRow::Family => cycle_family(app),
+                        _ => run_config_row(app, row),
+                    }
+                }
                 KeyCode::Char('+' | '=')
                     if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
                 {
@@ -16056,18 +21954,403 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                 {
                     step_bell_threshold(app, -5.0);
                 }
+                KeyCode::Char('+' | '=')
+                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
+                {
+                    step_usage_probe_interval(app, USAGE_PROBE_STEP_MS);
+                }
+                KeyCode::Char('-' | '_')
+                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
+                {
+                    step_usage_probe_interval(app, -USAGE_PROBE_STEP_MS);
+                }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
-                    // Space cycles the `model` alias in place; ⏎ opens its custom
-                    // field instead. Every other row treats space like ⏎.
-                    if row == ConfigRow::Model {
-                        cycle_model(app);
-                    } else {
-                        run_config_row(app, row);
+                    // `space` drives state controls only; action rows and text
+                    // fields act on `↵` alone.
+                    if row.is_state_control() {
+                        match row {
+                            ConfigRow::Model => cycle_model(app),
+                            ConfigRow::Type => cycle_account_type(app),
+                            ConfigRow::Family => cycle_family(app),
+                            _ => run_config_row(app, row),
+                        }
                     }
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+/// Keys on the Setup codex detail pane: ↑↓ walk its action rows (wrapping),
+/// page keys page them, ⏎ runs the row — `re-login` starts the codex
+/// browser flow, `delete account` arms the inline 2-step then deletes.
+/// Clear the codex detail's armed 2-step (flag + identity together, so neither
+/// can outlive the other and re-arm on a stale name).
+fn disarm_codex_2step(app: &mut App) {
+    app.codex_detail_armed = false;
+}
+
+/// Clear the pool detail's armed 2-step.
+fn disarm_pool_2step(app: &mut App) {
+    app.pool_detail_armed = false;
+}
+
+fn handle_codex_detail_key(app: &mut App, key: KeyEvent) {
+    let rows = CodexDetailRow::ALL;
+    let last = rows.len() - 1;
+    app.config_action_cursor = app.config_action_cursor.min(last);
+    match key.code {
+        KeyCode::Up => {
+            disarm_codex_2step(app);
+            app.config_action_cursor = if app.config_action_cursor == 0 {
+                last
+            } else {
+                app.config_action_cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            disarm_codex_2step(app);
+            app.config_action_cursor = if app.config_action_cursor >= last {
+                0
+            } else {
+                app.config_action_cursor + 1
+            };
+        }
+        KeyCode::PageUp => {
+            disarm_codex_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            let tips = app.setup_detail_tips.borrow();
+            app.config_action_cursor = page_up_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            disarm_codex_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            app.config_action_cursor = page_down_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::Enter => {
+            let Some(i) = app.setup_codex_index() else {
+                return;
+            };
+            let Some(name) = app.codex_rows.get(i).map(|r| r.name.clone()) else {
+                return;
+            };
+            match rows[app.config_action_cursor] {
+                CodexDetailRow::ReLogin => start_codex_login(app, name.as_str()),
+                CodexDetailRow::Delete => {
+                    if app.codex_detail_armed {
+                        // The second ⏎ acts on the identity the SELECTION
+                        // still holds: any path that moved it while armed
+                        // disarmed first, so it IS the armed account.
+                        app.codex_detail_armed = false;
+                        let Some(name) = app
+                            .setup_codex_index()
+                            .and_then(|i| app.codex_rows.get(i).map(|r| r.name.clone()))
+                        else {
+                            return;
+                        };
+                        perform_codex_delete(app, name.as_str());
+                    } else {
+                        app.codex_detail_armed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The provider `pi`'s name in the read listing.
+fn pool_provider_name(app: &App, pi: usize) -> Option<String> {
+    match &app.shunt_pool {
+        ShuntPool::Read(providers) => providers.get(pi).map(|p| p.name.clone()),
+        ShuntPool::NotRead(_) | ShuntPool::Absent => None,
+    }
+}
+
+/// Keys on the Setup pool detail pane: ↑↓ walk its action rows, ⏎ runs
+/// them — `refresh` on a worker, `remove` behind the inline 2-step (never the
+/// Overview's confirm modal). The 2-step acts on the selection's own pool pair.
+fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
+    let rows = app.pool_detail_rows();
+    if rows.is_empty() {
+        return;
+    }
+    let last = rows.len() - 1;
+    app.config_action_cursor = app.config_action_cursor.min(last);
+    match key.code {
+        KeyCode::Up => {
+            disarm_pool_2step(app);
+            app.config_action_cursor = if app.config_action_cursor == 0 {
+                last
+            } else {
+                app.config_action_cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            disarm_pool_2step(app);
+            app.config_action_cursor = if app.config_action_cursor >= last {
+                0
+            } else {
+                app.config_action_cursor + 1
+            };
+        }
+        KeyCode::PageUp => {
+            disarm_pool_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            let tips = app.setup_detail_tips.borrow();
+            app.config_action_cursor = page_up_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            disarm_pool_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            app.config_action_cursor = page_down_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::Enter => {
+            let Some((pi, ai)) = app.setup_pool_pair() else {
+                return;
+            };
+            let Some(resolved) = pool_row_at(app, pi, ai) else {
+                return;
+            };
+            match rows[app.config_action_cursor] {
+                PoolDetailRow::Refresh => start_pool_refresh_row(app, resolved),
+                PoolDetailRow::Remove => {
+                    if app.pool_detail_armed {
+                        // The second ⏎ acts on the identity the selection still
+                        // holds, re-resolved against the current listing (a
+                        // re-read may have moved the row).
+                        app.pool_detail_armed = false;
+                        if let Some((pi, ai)) = app.setup_pool_pair()
+                            && let Some(resolved) = pool_row_at(app, pi, ai)
+                        {
+                            start_pool_remove_row(app, resolved);
+                        }
+                    } else {
+                        app.pool_detail_armed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Delete a codex account from the Setup detail pane, behind the same
+/// rotation guard, live-session gate and store write the CLI's
+/// `clauth delete <name>` runs. The selection follows the drop-placement rule:
+/// ascend to the selector, then land on the row now at the deleted row's flat
+/// index, clamped to the last item row (`+ new` only when none exists) — never
+/// wherever `profile_cursor` happened to sit.
+fn perform_codex_delete(app: &mut App, name: &str) {
+    // The deleted row's codex-band index, for the flat drop placement (the row
+    // now at `profile_count() + old_index`, clamped, across bands).
+    let old_index = app
+        .codex_rows
+        .iter()
+        .position(|row| row.name.as_str() == name);
+    let result = rotation_guard_for_mutation(&ProfileName::from(name))
+        .and_then(|rotation| crate::actions::delete_codex_profile(name, false, &rotation));
+    match result {
+        Ok(detached) => {
+            // The flat index the deleted row held, for the drop placement: the
+            // row now at that index, clamped (across bands), the `+ new` row
+            // only when no item row exists.
+            let flat = app.profile_count() + old_index.unwrap_or(0);
+            app.codex_rows = codex_rows();
+            disarm_codex_2step(app);
+            app.config_focus = ConfigFocus::Profiles;
+            app.config_action_cursor = 0;
+            let items = app.setup_items();
+            let pos = if items.is_empty() {
+                0
+            } else {
+                flat.min(items.len() - 1)
+            };
+            app.place_setup_selection(pos);
+            app.toast(ToastKind::Success, format!("deleted '{name}'"));
+            // The CLI's postscript: a delete that detached the operator's own
+            // `~/.codex/auth.json` slot logs their codex out from that moment.
+            if let Some(slot) = detached {
+                app.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "{} followed that profile's chain and is detached now, so your own \
+                         codex has no login; run `codex login` to mint a fresh one",
+                        slot.display()
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            disarm_codex_2step(app);
+            app.toast(ToastKind::Danger, format!("delete failed\n{e:#}"));
+        }
+    }
+}
+
+/// Start the codex browser re-login: preflight the name, then run the browser
+/// flow on a worker — it binds codex's registered loopback ports and opens the
+/// browser, never on the UI thread — and show the codex login modal. The worker
+/// LANDS the minted chain itself (behind the blocking rotation flock) and sends
+/// the canonical name or error sentence down the result channel; the UI drains
+/// only that outcome through [`drain_codex_login`].
+fn start_codex_login(app: &mut App, name: &str) {
+    if let Some(session) = app.codex_login.as_ref() {
+        // A second ⏎ on `re-login` while one runs reopens its modal (the claude
+        // precedent); only a different account names the running one.
+        if session.name != name {
+            toast_login_in_progress(app, session.name.clone());
+        }
+        open_codex_login_modal(app);
+        return;
+    }
+    // A TUI re-login never recreates a deleted account: it lands only on the
+    // one the roster holds now (the CLI keeps its create-or-reauth).
+    let (trimmed, account) = match crate::actions::codex_browser_preflight(name) {
+        Ok((trimmed, Some(account))) => (trimmed, account),
+        Ok((trimmed, None)) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("login failed\ncodex profile '{trimmed}' no longer exists"),
+            );
+            return;
+        }
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("login failed\n{e:#}"));
+            return;
+        }
+    };
+    app.codex_login_generation += 1;
+    let generation = app.codex_login_generation;
+    let cancel = crate::codex_login::LoginCancel::new();
+    app.codex_login = Some(CodexLoginSession {
+        name: trimmed.clone(),
+        generation,
+        url: None,
+        cancel: cancel.clone(),
+        is_new: false,
+    });
+    #[cfg(test)]
+    let worker_fn = app.codex_login_worker;
+    let url_tx = app.codex_login_url_tx.clone();
+    let result_tx = app.codex_login_result_tx.clone();
+    spawn_worker(move || {
+        let announce = move |url: &str| {
+            let _ = url_tx.send((generation, url.to_string()));
+        };
+        #[cfg(test)]
+        let outcome = worker_fn(&announce, &cancel);
+        #[cfg(not(test))]
+        let outcome =
+            crate::codex_login::login_with_cancel(&announce, &cancel).map_err(|e| format!("{e:#}"));
+        // A cancel seen here, BEFORE the landing, drops the minted chain
+        // unwritten (it was never used, so the account's current chain stays
+        // valid) — the cancel toast already said "login canceled". Once the
+        // landing starts it is the commit point: its outcome always reaches a
+        // toast, even when a cancel arrives during it.
+        let res = if cancel.is_canceled() {
+            Err("login canceled".to_string())
+        } else {
+            outcome.and_then(|o| {
+                crate::actions::land_codex_login(&trimmed, &o, Some(&account))
+                    .map_err(|e| format!("{e:#}"))
+            })
+        };
+        let _ = result_tx.send((generation, trimmed.clone(), res));
+    });
+    open_codex_login_modal(app);
+}
+
+/// Cancel an in-flight codex re-login: signal the worker's listener wait (its
+/// registered ports free), drop the session, and toast. The worker's own
+/// pre-landing cancel check drops the minted chain unwritten; a landing that
+/// already started is the commit point and still toasts its outcome.
+fn cancel_codex_login(app: &mut App) {
+    if let Some(session) = app.codex_login.take() {
+        session.cancel.cancel();
+    }
+    close_codex_login_modal(app);
+    app.toast(ToastKind::Info, "login canceled");
+}
+
+fn open_codex_login_modal(app: &mut App) {
+    if !app.modals.iter().any(|m| matches!(m, Modal::CodexLogin)) {
+        app.open_modal(Modal::CodexLogin);
+    }
+}
+
+fn close_codex_login_modal(app: &mut App) {
+    app.retain_modals(|m| !matches!(m, Modal::CodexLogin));
+}
+
+/// Fold a finished codex login into the app on the UI thread: the worker
+/// already landed the minted chain (rename guard, live-session refusal,
+/// account-swap refusal, store write), so the UI drains only the outcome — the
+/// canonical name on success (re-reading the codex snapshot), or the refusal /
+/// failure sentence, which toasts and leaves the store unchanged.
+fn drain_codex_login(app: &mut App) {
+    while let Ok((generation, url)) = app.codex_login_url_rx.try_recv() {
+        if app
+            .codex_login
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
+            && let Some(session) = app.codex_login.as_mut()
+        {
+            session.url = Some(url);
+        }
+    }
+    while let Ok((generation, name, result)) = app.codex_login_result_rx.try_recv() {
+        if app.codex_login.as_ref().map(|s| s.generation) == Some(generation) {
+            app.codex_login = None;
+            close_codex_login_modal(app);
+        } else if matches!(&result, Err(e) if e == "login canceled") {
+            // A cancel took the session before the landing: the cancel toast
+            // already reported it. A landing that had started is the commit
+            // point, so any other outcome falls through and toasts.
+            continue;
+        }
+        match result {
+            Ok(canonical) => {
+                app.codex_rows = codex_rows();
+                app.toast(ToastKind::Success, format!("logged in '{canonical}'"));
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("login for '{name}' failed\n{e}")),
         }
     }
 }
@@ -16108,35 +22391,76 @@ fn push_override_rows(
     }
 }
 
+/// The `+ new` create-form rows, per the draft's account type. Claude keeps
+/// today's rows; codex offers `name`, `+ login`, `+ capture current login`
+/// (while the operator's codex login is capturable) and `create account`;
+/// shunt offers `family`, `name` and `+ login` (the create) — no `create
+/// account` row.
+fn new_account_rows(app: &App, draft: Option<&ConfigDraft>) -> Vec<ConfigRow> {
+    let account_type = draft.map(|d| d.account_type).unwrap_or_default();
+    let mut rows = vec![ConfigRow::Type];
+    match account_type {
+        NewAccountType::Claude => {
+            rows.push(ConfigRow::Name);
+            rows.push(ConfigRow::BaseUrl);
+            // The api key only means something once a base url makes this an API
+            // account, so it stays hidden until one is typed.
+            if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
+                rows.push(ConfigRow::ApiKey);
+            }
+            // Env rows stay existing-account-only.
+            rows.push(ConfigRow::Model);
+            push_override_rows(&mut rows, draft, None);
+            if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
+                rows.push(ConfigRow::Login);
+            }
+            // The live-login capture row sits right below `+ login` and survives
+            // into api mode (`+ login` doesn't): a live setup can be an endpoint
+            // too. Hidden while the live login is saved or absent — nothing to
+            // capture.
+            if app.unsaved_live_login {
+                rows.push(ConfigRow::CaptureLogin);
+            }
+            rows.push(ConfigRow::Create);
+        }
+        NewAccountType::Codex => {
+            rows.push(ConfigRow::Name);
+            rows.push(ConfigRow::Login);
+            // Read off the tick's cache, never the capture's disk reads on the
+            // render path (the `unsaved_live_login` precedent).
+            if app.codex_operator_capturable {
+                rows.push(ConfigRow::CaptureLogin);
+            }
+            rows.push(ConfigRow::Create);
+        }
+        NewAccountType::Shunt => {
+            rows.push(ConfigRow::Family);
+            rows.push(ConfigRow::Name);
+            rows.push(ConfigRow::Login);
+        }
+    }
+    rows
+}
+
 /// Detail rows for the current selection. `+ new` → create form; account →
 /// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
+    // Resolve the selection and the `+ new` draft BEFORE the config guard (see
+    // `build_snap`): both re-run `setup_selection` under their own short guard.
+    let selection = app.setup_selection();
+    let new_draft = new_form_draft(app);
     let cfg = app.config();
+    let profile_idx = match selection {
+        SetupSelection::New => return new_account_rows(app, new_draft),
+        SetupSelection::Item(MainItemKind::Profile(i)) => i,
+        // The codex and pool detail panes render their own row lists; this is
+        // never called for them.
+        SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {
+            return Vec::new();
+        }
+    };
     let draft = app.config_draft.as_ref();
-    if app.profile_cursor >= cfg.profiles.len() {
-        // `+ new` create form. The api key only means something once a base url
-        // makes this an API account, so it stays hidden until one is typed.
-        let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
-        if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
-            rows.push(ConfigRow::ApiKey);
-        }
-        // Env rows stay existing-account-only.
-        rows.push(ConfigRow::Model);
-        push_override_rows(&mut rows, draft, None);
-        if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
-            rows.push(ConfigRow::Login);
-        }
-        // The live-login capture row sits right below `+ login` and survives
-        // into api mode (`+ login` doesn't): a live setup can be an endpoint
-        // too. Hidden while the live login is saved or absent — nothing to
-        // capture.
-        if app.unsaved_live_login {
-            rows.push(ConfigRow::CaptureLogin);
-        }
-        rows.push(ConfigRow::Create);
-        return rows;
-    }
-    let profile = cfg.profiles.get(app.profile_cursor);
+    let profile = cfg.profiles.get(profile_idx);
     // `is_api` tracks the base-url buffer live (draft wins): api key shows only
     // in API mode, auto-start (OAuth-only) only when it's empty, so both flip the
     // instant a base url is typed.
@@ -16148,6 +22472,18 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
     if !is_api {
         rows.push(ConfigRow::AutoStart);
+        // The probe below it, only where `/usage` has nothing to read and a
+        // setup token is stored: beside a pair the switch would do nothing,
+        // and with no token the probe has nothing to send.
+        if profile
+            .is_some_and(|p| crate::usage::usage_poll_pair(p).is_none() && p.has_long_lived_sidecar)
+        {
+            rows.push(ConfigRow::UsageProbe);
+            // Its cadence, only while it runs: the row edits nothing else.
+            if profile.is_some_and(|p| p.usage_probe) {
+                rows.push(ConfigRow::UsageProbeInterval);
+            }
+        }
     }
     rows.push(ConfigRow::BellThreshold);
     rows.push(ConfigRow::BaseUrl);
@@ -16176,6 +22512,10 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
             .and_then(|p| p.api_key.as_deref())
             .is_some_and(|k| !k.trim().is_empty())
     };
+    // A torn `credentials.json` loads logged out but is still a login on disk:
+    // only a log out clears it, so the row shows over it too (beside, never in
+    // place of, the typed credential above).
+    let has_creds = has_creds || profile.is_some_and(|p| p.unreadable_credentials_store.is_some());
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
     }
@@ -16205,23 +22545,187 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
 /// Enter the detail pane, seeding a draft for the current selection.
 fn enter_config_detail(app: &mut App) {
     app.config_action_cursor = 0;
-    if app.profile_cursor >= app.profile_count() {
-        app.config_draft = Some(build_draft_new());
-    } else if let Some(name) = app.profile_name_at(app.profile_cursor) {
-        app.config_draft = Some(build_draft_existing(app, &name));
-    } else {
+    // Descending into the shown row adopts it: a held-but-hidden identity is
+    // replaced, never restored over the pane the user is now editing.
+    app.setup.clear();
+    // A suspended `+ new` form keeps its home before any arm reaches
+    // `config_draft`: the claude arm replaces it and the codex/pool arms drop
+    // it. The slot holds forms at rest, so an open field closes first (its
+    // typed text stays). When the slot already holds typed work the writer
+    // hands the form back; no key path reaches this descend with both forms
+    // held, so this one stays on its own pane and row, and the target never
+    // opens.
+    if let Some(field) = app
+        .config_draft
+        .as_ref()
+        .filter(|d| d.editing_name.is_none())
+        .and_then(|d| d.active)
+    {
+        cancel_config_edit(app, field);
+    }
+    if app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none())
+        && let Some(draft) = app.config_draft.take()
+        && let Some(draft) = set_new_account_draft(app, draft)
+    {
+        app.config_draft = Some(draft);
+        app.setup.item = None;
+        app.setup.index = None;
+        app.profile_cursor.set(app.profile_count());
+        app.config_focus = ConfigFocus::Actions;
         return;
+    }
+    match app.setup_selection() {
+        SetupSelection::New => {
+            // Restore the suspended `+ new` form, else build a fresh one.
+            app.config_draft = app
+                .new_account_draft
+                .take()
+                .or_else(|| Some(build_draft_new()));
+        }
+        SetupSelection::Item(MainItemKind::Profile(i)) => {
+            if let Some(name) = app.profile_name_at(i) {
+                app.config_draft = Some(build_draft_existing(app, &name));
+            } else {
+                return;
+            }
+        }
+        // Codex and pool detail panes have no draft: drop a suspended
+        // existing-account field draft, or it would keep the keyboard over this
+        // pane (`e`'s landing arrives with a suspended edit still in
+        // `config_draft`). A `+ new` form never reaches here — it moved to its
+        // own slot above.
+        SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {
+            leave_config_detail(app);
+        }
     }
     app.config_focus = ConfigFocus::Actions;
 }
 
-/// Jump to the `+ new` create form (global `n`).
+/// Jump to the `+ new` create form (global `n`): disarm, suspend and switch
+/// like any other switch, then land on the `+ new` row restoring a
+/// suspended form instead of building over it.
 fn start_new_account(app: &mut App) {
-    switch_tab(app, Tab::Setup);
-    app.profile_cursor = app.profile_count();
+    request_target(app, LossWarningTarget::NewAccount);
+}
+
+/// `start_new_account`'s landing: switch to Setup and open (or restore) the
+/// `+ new` form.
+fn land_new_account(app: &mut App) {
+    // `n` presets the type from the Overview cursor's section; with nothing
+    // under the cursor it falls back on the visible filter (shunt → shunt,
+    // codex → codex, else claude); any other tab (Setup included) opens on
+    // claude. Read before the switch.
+    let preset = if app.tab == Tab::Overview {
+        match app.current_main_item() {
+            Some(item) => NewAccountType::from_main_item(Some(item)),
+            None => match app.harness_filter {
+                HarnessFilter::Shunt => NewAccountType::Shunt,
+                HarnessFilter::Codex => NewAccountType::Codex,
+                HarnessFilter::All | HarnessFilter::Claude => NewAccountType::Claude,
+            },
+        }
+    } else {
+        NewAccountType::Claude
+    };
+    do_switch(app, Tab::Setup);
+    app.setup.item = None;
+    app.setup.index = None;
+    app.setup.clear();
+    app.profile_cursor.set(app.profile_count());
     app.config_action_cursor = 0;
-    app.config_draft = Some(build_draft_new());
+    // Restore a suspended `+ new` form: an open-field one still sits in
+    // `config_draft` (the suspend kept it), an at-rest one in its own home.
+    if app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none())
+    {
+        // Keep the suspended form, field open or not.
+    } else if let Some(draft) = app.new_account_draft.take() {
+        // A suspended form restores exactly as suspended: type, name and stage
+        // all kept (a switch suspends what it leaves). The section preset below
+        // applies only to a fresh form.
+        app.config_draft = Some(draft);
+    } else {
+        let mut draft = build_draft_new();
+        draft.account_type = preset;
+        app.config_draft = Some(draft);
+    }
     app.config_focus = ConfigFocus::Actions;
+}
+
+/// Jump to the focused Overview row's Setup editor (global `e`): the same
+/// loss-warning route as `n`, landing on the row that fixes the account's dead
+/// credential (or the editor's first row for a healthy account).
+fn start_edit_selected(app: &mut App, item: MainItemKind) {
+    let target = match item {
+        MainItemKind::Profile(idx) => app.profile_name_at(idx).map(EditTarget::Profile),
+        other => app.setup_item_for(other).map(EditTarget::Item),
+    };
+    if let Some(target) = target {
+        request_target(app, LossWarningTarget::EditAccount(target));
+    }
+}
+
+/// `start_edit_selected`'s landing: switch to Setup, select the item the way an
+/// Overview pick does, open its editor, then put the action cursor on the row
+/// the dead-credential ladder names. An identity the current roster or listing
+/// no longer holds lands nowhere.
+fn land_edit_account(app: &mut App, target: EditTarget) {
+    let item = match &target {
+        EditTarget::Profile(name) => app
+            .config()
+            .profiles
+            .iter()
+            .position(|p| p.name == *name)
+            .map(MainItemKind::Profile),
+        EditTarget::Item(item) => app.resolve_setup_item(item),
+    };
+    let Some(item) = item else { return };
+    do_switch(app, Tab::Setup);
+    let pos = app.flat_index_of(item);
+    app.place_setup_selection(pos);
+    enter_config_detail(app);
+    // A refused move keeps the `+ new` form on its own row: the target's
+    // landing row is not that form's.
+    if app.setup_selection() != SetupSelection::Item(item) {
+        return;
+    }
+    app.config_action_cursor = match &target {
+        EditTarget::Profile(name) => edit_landing_row(app, name),
+        // The codex and pool panes open on their first row.
+        EditTarget::Item(_) => 0,
+    };
+}
+
+/// The Setup action row `e` lands a claude account on: the dead-credential
+/// ladder's row, else the editor's first row.
+fn edit_landing_row(app: &App, name: &ProfileName) -> usize {
+    // `key_rejected_names` locks the config internally, so read it before the
+    // config guard below is held.
+    let key_rejected = app.key_rejected_names();
+    let target = {
+        let cfg = app.config();
+        let Some(profile) = cfg.find(name) else {
+            return 0;
+        };
+        match crate::fallback::dead_credential_reason(&cfg, profile, &key_rejected) {
+            Some(crate::fallback::BlockedReason::KeyRejected) => ConfigRow::ApiKey,
+            Some(
+                crate::fallback::BlockedReason::AuthBroken
+                | crate::fallback::BlockedReason::LoggedOut,
+            ) => ConfigRow::Login,
+            // A refused setup token (`TokenRejected`), with or without a stored
+            // pair: no row mints a new token (`clauth login <name> --setup-token`
+            // does), so it opens on the first row, above which the token row
+            // shows that fix.
+            _ => return 0,
+        }
+    };
+    config_row_index(app, target).unwrap_or(0)
 }
 
 pub(crate) fn build_draft_new() -> ConfigDraft {
@@ -16237,16 +22741,22 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         fable_model: InputState::new(""),
         subagent_model: InputState::new(""),
         bell_threshold: InputState::new(""),
+        usage_probe_interval: InputState::new(""),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
         active: None,
+        field_seed: None,
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
         overrides_shown: Vec::new(),
         captured_login: None,
         mint_for: None,
+        account_type: NewAccountType::Claude,
+        family: crate::gateway_admin::PoolFamily::Claude,
+        name_refusal: None,
+        create_refusal: None,
     }
 }
 
@@ -16270,16 +22780,26 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
             name,
             ConfigRow::BellThreshold,
         )),
+        usage_probe_interval: InputState::new(&row_committed_value(
+            profile,
+            name,
+            ConfigRow::UsageProbeInterval,
+        )),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
         active: None,
+        field_seed: None,
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
         overrides_shown: Vec::new(),
         captured_login: None,
         mint_for: None,
+        account_type: NewAccountType::Claude,
+        family: crate::gateway_admin::PoolFamily::Claude,
+        name_refusal: None,
+        create_refusal: None,
     };
     draft.overrides_shown = draft.filled_overrides();
     draft
@@ -16295,6 +22815,10 @@ fn leave_config_detail(app: &mut App) {
     });
     app.config_focus = ConfigFocus::Profiles;
     app.config_draft = None;
+    // An armed codex/pool 2-step disarms on esc/ascend: the label restores and
+    // no stale identity outlives the pane (the Inline 2-step rule).
+    disarm_codex_2step(app);
+    disarm_pool_2step(app);
     if mint_dropped {
         app.toast(
             ToastKind::Warning,
@@ -16310,10 +22834,10 @@ fn disarm_armed_action(app: &mut App) {
     }
 }
 
-/// ⏎/space on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
+/// ⏎ on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
 fn run_config_row(app: &mut App, row: ConfigRow) {
     // The mint-seeded api key row is a Disabled row: focusable but inert, so
-    // ⏎/space open no editor while the base url still names the gateway.
+    // ⏎ opens no editor while the base url still names the gateway.
     if row == ConfigRow::ApiKey
         && app
             .config_draft
@@ -16359,8 +22883,24 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 d.bell_threshold = InputState::new(&saved);
             }
         }
+        // As the alert buffer: `+`/`-` or a reload may have moved the interval.
+        if row == ConfigRow::UsageProbeInterval {
+            let saved = app
+                .config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.clone())
+                .map(ProfileName::from)
+                .map(|name| {
+                    let cfg = app.config();
+                    row_committed_value(cfg.find(&name), &name, row)
+                });
+            if let (Some(saved), Some(d)) = (saved, app.config_draft.as_mut()) {
+                d.usage_probe_interval = InputState::new(&saved);
+            }
+        }
         if let Some(d) = app.config_draft.as_mut() {
             d.active = Some(row);
+            d.field_seed = d.field(row).map(|i| i.value.clone());
             if let Some(input) = d.field_mut(row) {
                 input.end();
             }
@@ -16390,7 +22930,12 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 // polling/status mid-flight), so it reuses Delete's
                 // press-to-arm → confirm class instead of firing on one ⏎.
                 if currently_disabled || armed {
-                    toggle_profile_disabled(app, &name);
+                    let direction = if currently_disabled {
+                        DisableDirection::Enable
+                    } else {
+                        DisableDirection::Disable
+                    };
+                    toggle_profile_disabled(app, &name, direction);
                     // Clear rather than leave a stale arm: unlike Delete (whose
                     // confirm removes the row entirely), this row survives its
                     // own toggle, so a later disable must re-arm from scratch.
@@ -16405,6 +22950,11 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 toggle_auto_start(app, &name);
             }
         }
+        ConfigRow::UsageProbe => {
+            if let Some(name) = name {
+                toggle_usage_probe(app, &name);
+            }
+        }
         ConfigRow::Delete => {
             let armed = app
                 .config_draft
@@ -16415,8 +22965,35 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 _ => arm_action(app, ConfigRow::Delete),
             }
         }
-        ConfigRow::Create => commit_new_account(app),
+        ConfigRow::Create => {
+            let account_type = app
+                .config_draft
+                .as_ref()
+                .map(|d| d.account_type)
+                .unwrap_or_default();
+            match account_type {
+                NewAccountType::Claude => commit_new_account(app),
+                NewAccountType::Codex => commit_codex_account(app),
+                NewAccountType::Shunt => {}
+            }
+        }
         ConfigRow::Login => {
+            // The `+ new` form's type through the one lookup, so this dispatcher
+            // and the inert gate in `start_shunt_add` read the same draft.
+            let account_type = new_form_draft(app)
+                .map(|d| d.account_type)
+                .unwrap_or_default();
+            match account_type {
+                NewAccountType::Codex => {
+                    start_codex_new_login(app);
+                    return;
+                }
+                NewAccountType::Shunt => {
+                    start_shunt_add(app);
+                    return;
+                }
+                NewAccountType::Claude => {}
+            }
             // New-form draft has no editing_name → validate the typed name now and
             // create-on-mint; an existing draft re-logs in place.
             let editing = app
@@ -16440,66 +23017,37 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             }
         }
         ConfigRow::CaptureLogin => {
-            // The row only renders on the `+ new` form, where a draft is always
-            // open; the empty and owned states are what HIDE it, so hitting one
-            // here means the live file moved since the flag was computed.
-            let Some(snapshot) = capture_live_or_toast(app) else {
-                // The file emptied since the flag was computed; drop the row.
-                app.refresh_unsaved_live_login();
-                return;
-            };
-            let owner = {
-                let cfg = app.config();
-                find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
-            };
-            if let Some(owner) = owner {
-                // Refuse, not confirm: a NEW account over a login another
-                // profile owns is the duplicate `overwrite_captured_profile`
-                // exists to prevent, and this row's whole purpose is the
-                // unowned case.
-                app.toast(
-                    ToastKind::Danger,
-                    format!(
-                        "these credentials already belong to '{owner}'\nswitch to it with:  {}",
-                        prose::cmd(&format!("clauth {owner}"))
-                    ),
-                );
-                app.refresh_unsaved_live_login();
+            let account_type = app
+                .config_draft
+                .as_ref()
+                .map(|d| d.account_type)
+                .unwrap_or_default();
+            if account_type == NewAccountType::Codex {
+                stage_codex_capture(app);
                 return;
             }
-            let mint_stashed = app.config_draft.as_ref().is_some_and(|d| {
-                d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
-            });
-            if mint_stashed {
-                // The browser round-trip a mint cost can't be redone for free;
-                // gate replacing it, mirroring the re-login gate above.
-                app.open_modal(Modal::Confirm(ConfirmState {
-                    message: "replace the logged-in mint?".to_string(),
-                    detail: Some(
-                        "the browser login you already captured will be dropped".to_string(),
-                    ),
-                    choice: false,
-                    scroll: ConfirmScroll::default(),
-                    on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
-                }));
-                return;
-            }
-            if stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))) {
-                app.toast(
-                    ToastKind::Success,
-                    "current login captured\ncreate account saves it",
-                );
-            }
+            spawn_capture_login(app);
         }
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
-                let is_api = {
+                let (is_api, has_unreadable_store, has_api_key) = {
                     let cfg = app.config();
-                    cfg.find(&name)
-                        .map(|p| !p.login_is_oauth())
-                        .unwrap_or(false)
+                    let profile = cfg.find(&name);
+                    (
+                        profile.map(|p| !p.login_is_oauth()).unwrap_or(false),
+                        profile.is_some_and(|p| p.unreadable_credentials_store.is_some()),
+                        profile
+                            .and_then(|p| p.api_key.as_deref())
+                            .is_some_and(|k| !k.trim().is_empty()),
+                    )
                 };
-                let detail = if is_api {
+                let detail = if is_api && has_unreadable_store {
+                    if has_api_key {
+                        "blanks the api key and deletes the unreadable credentials.json; keeps the base url, model, and env. re-login any time."
+                    } else {
+                        "deletes the unreadable credentials.json; keeps the base url, model, and env. re-login any time."
+                    }
+                } else if is_api {
                     "blanks the api key; keeps the base url, model, and env. re-login any time."
                 } else {
                     "blanks the login; keeps the account, model, env, and chain slot. re-login any time."
@@ -16580,15 +23128,30 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// relink then removes the live slot and, on macOS, signs the Keychain out
 /// rather than installing anything. Both were reported as "relinked its own
 /// login". The refusal is re-checked from DISK under the guard: the in-memory
-/// gate in `run_config_row` reads a snapshot `reload_fingerprint` can never
-/// invalidate (it does not stat `credentials.json`), so an out-of-band log-out
-/// would otherwise slip past it forever.
+/// gate in `run_config_row` reads a tick-stale snapshot. `reload_fingerprint`
+/// stats `credentials.json`, so an out-of-band log-out moves the fingerprint
+/// and the next reload corrects the snapshot; the under-guard re-read closes
+/// the sub-tick window between that reload and this action.
 ///
-/// Deliberately does NOT stamp `last_reload_fp`: `reload_fingerprint` folds each
-/// sidecar's write time in, so leaving it stale is what makes the next tick
-/// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
-/// local `remove` below only spares that marker one tick of staleness.
+/// Like every in-TUI save, the write is left unadopted, so the next tick's
+/// reload re-reads disk and rebuilds `session_tokens` (the Overview `⊘`
+/// marker's cache). The local `remove` below only spares that marker one tick
+/// of staleness.
 fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
+    // The active account's clear relinks its live slot over the bare item, so
+    // it settles before anything is cleared: a held clear has changed nothing.
+    let relinks = crate::profile::load_app_state()
+        .map(|state| state.active_profile.as_ref() == Some(name))
+        .unwrap_or_else(|_| app.config().is_active(name));
+    let _placed = if relinks {
+        let Some(placed) = bare_item_gate(app, BareItemWrite::ClearSessionToken(name.clone()))
+        else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     let guard = match crate::runtime::RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
@@ -16606,7 +23169,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             return;
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
             return;
         }
     };
@@ -16621,14 +23187,17 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     }
     // Everything the ACTIONS key off is re-read under the guard — the CLI's
     // own rule, and stricter here: the TUI's config is a tick-stale snapshot,
-    // and `reload_fingerprint` does not stat `credentials.json` at all, so an
-    // out-of-band log-out leaves the snapshot claiming a stored login
-    // INDEFINITELY, not for one tick. `run_config_row`'s gate fed the row's
-    // rendering and nothing else.
+    // and `reload_fingerprint` stats `credentials.json`, so an out-of-band
+    // log-out is corrected on the next reload — but only the under-guard read
+    // closes the window between that reload and this action. `run_config_row`'s
+    // gate fed the row's rendering and nothing else.
     let on_disk = match crate::profile::load_profile(name) {
         Ok(p) => p,
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
             return;
         }
     };
@@ -16643,19 +23212,28 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     }
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
-        // The PERSIST is written from the same under-guard disk read, never
-        // the in-memory snapshot — another process's config edit may have
-        // landed since the last reload, and `save_profile_config` writes the
-        // whole config back. The renderer's in-memory flag flips only AFTER that
+        // The PERSIST is written onto a fresh disk read, never the in-memory
+        // snapshot — another process's config edit may have landed since the
+        // last reload. The renderer's in-memory flag flips only AFTER that
         // write lands: flipped first, a failed save leaves the config lying
         // (`reload_fingerprint` never corrects it — config mtime did not move)
         // until an unrelated save makes the lie durable, and the end state is
         // a live rolling sidecar nothing re-stamps.
-        let mut disarmed = on_disk.clone();
-        disarmed.rolling_token = false;
-        if let Err(e) = save_profile_config(&disarmed) {
-            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
-            return;
+        match update_profile_config(name, |p| {
+            p.rolling_token = false;
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            // The account left the roster since the app's read: nothing of
+            // it is left to clear.
+            Ok(None) => return,
+            Err(e) => {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
+                return;
+            }
         }
         let mut cfg = app.config();
         if let Some(p) = cfg.find_mut(name) {
@@ -16665,7 +23243,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     if let Err(e) = crate::claude::quarantine_misfilled_sidecar(name)
         .and_then(|_| crate::claude::clear_session_token(name))
     {
-        app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+        );
         return;
     }
     app.session_tokens.remove(name.as_str());
@@ -16687,7 +23268,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
         .map(|c| c.is_active(name))
         .unwrap_or_else(|_| app.config().is_active(name));
     if active && let Err(e) = force_link_profile_credentials(name) {
-        app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("relink failed\n{}", escape_control(&error_toast_detail(&e))),
+        );
         return;
     }
     // No `refresh_tokens()`: `collect_tokens` reads `Profile::credentials`, which
@@ -16730,7 +23314,8 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
                 ToastKind::Danger,
                 format!(
                     "cleared the long-lived token for '{name}'{tail}{rolled}, but the preserved \
-                     mint remains\n{e}"
+                     mint remains\n{}",
+                    escape_control(&error_toast_detail(&e))
                 ),
             );
             return;
@@ -16775,6 +23360,7 @@ fn start_api_relogin(app: &mut App) {
         d.base_url.end();
         d.relogin_chain = true;
         d.active = Some(ConfigRow::BaseUrl);
+        d.field_seed = d.field(ConfigRow::BaseUrl).map(|i| i.value.clone());
     }
     if let Some(pos) = config_row_index(app, ConfigRow::BaseUrl) {
         app.config_action_cursor = pos;
@@ -16792,6 +23378,14 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
     if login_in_flight(app, &name, is_new) {
         return;
     }
+    let account = if is_new {
+        None
+    } else {
+        let Some(account) = claim_or_toast(app, &name, "login failed") else {
+            return;
+        };
+        Some(account)
+    };
     let pending = match crate::oauth_login::begin_login() {
         Ok(pending) => pending,
         Err(e) => {
@@ -16808,7 +23402,7 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
     let generation = app.login_generation;
     app.login = Some(LoginSession {
         name,
-        is_new,
+        account,
         generation,
         url: Some(links.browser_url.clone()),
         stage: LoginStage::WaitingBrowser,
@@ -16899,7 +23493,7 @@ fn oauth_login_target(app: &mut App, editing: Option<String>) -> Option<(String,
             match validation {
                 Ok(()) => Some((typed, true)),
                 Err(e) => {
-                    app.toast(ToastKind::Danger, format!("{e}"));
+                    app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                     None
                 }
             }
@@ -16940,11 +23534,8 @@ fn login_in_flight(app: &mut App, name: &str, is_new: bool) -> bool {
     let Some(session) = app.login.as_ref() else {
         return false;
     };
-    if session.name != name || session.is_new != is_new {
-        app.toast(
-            ToastKind::Warning,
-            format!("a login for '{}' is already in progress", session.name),
-        );
+    if session.name != name || session.account.is_none() != is_new {
+        toast_login_in_progress(app, session.name.clone());
     }
     open_login_modal(app);
     true
@@ -16963,30 +23554,30 @@ fn login_event(progress: crate::oauth_login::LoginProgress) -> LoginEvent {
 /// the same progress modal as [`start_login`], capturing that account's usage
 /// session instead of an Anthropic credential.
 ///
-/// Never `is_new`: the console site and region are read off the profile's
+/// Never a `+ new` draft's: the console site and region are read off the profile's
 /// endpoint, so an account without one has no console to open, and the create
 /// form has no endpoint yet. That is why the CLI's own route is
 /// create-with-preset, then log in.
 fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &'static str) {
     if let Some(session) = app.login.as_ref() {
-        // Same shape as `start_login`'s guard, `is_new` included: a `+ new`
+        // Same shape as `start_login`'s guard, the draft check included: a `+ new`
         // draft's login is a different session even when the typed name matches,
         // so re-showing its modal without a word would read as this row's own
         // login having started.
-        if session.name != name || session.is_new {
-            app.toast(
-                ToastKind::Warning,
-                format!("a login for '{}' is already in progress", session.name),
-            );
+        if session.name != name || session.account.is_none() {
+            toast_login_in_progress(app, session.name.clone());
         }
         open_login_modal(app);
         return;
     }
+    let Some(account) = claim_or_toast(app, &name, "console login failed") else {
+        return;
+    };
     app.login_generation += 1;
     let generation = app.login_generation;
     app.login = Some(LoginSession {
         name,
-        is_new: false,
+        account: Some(account),
         generation,
         url: None,
         stage: LoginStage::WaitingBrowser,
@@ -17023,7 +23614,7 @@ fn open_login_modal(app: &mut App) {
 
 /// Drop the login progress modal (login finished, failed, or was canceled).
 fn close_login_modal(app: &mut App) {
-    app.modals.retain(|m| !matches!(m, Modal::Login));
+    app.retain_modals(|m| !matches!(m, Modal::Login));
 }
 
 /// Arm an account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
@@ -17041,7 +23632,9 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
     };
     match key.code {
         KeyCode::Esc => cancel_config_edit(app, active),
-        KeyCode::Enter => commit_config_field(app, active),
+        KeyCode::Enter => {
+            let _ = commit_config_field(app, active);
+        }
         _ => {
             if let Some(d) = app.config_draft.as_mut()
                 && let Some(input) = d.field_mut(active)
@@ -17116,15 +23709,7 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
 /// active profile's live settings lose the key too. On a failed persist the
 /// editor and the flag stay, so a retry still removes the row.
 fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
-    let new_env = {
-        let cfg = app.config();
-        cfg.find(name).map(|p| {
-            let mut env = p.env.clone();
-            env.remove(key);
-            env
-        })
-    };
-    let Some(new_env) = new_env else {
+    if app.config().find(name).is_none() {
         // The profile vanished from the in-memory config (an out-of-band
         // delete/rename); disarm the cancel and end the edit instead of
         // leaving the editor stuck open with a zombie flag.
@@ -17133,10 +23718,12 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
             d.active = None;
         }
         return;
-    };
+    }
     let result = {
         let mut cfg = app.config();
-        edit_profile_env(&mut cfg, name, new_env)
+        edit_profile_env(&mut cfg, name, |env| {
+            env.remove(key);
+        })
     };
     match result {
         Ok(()) => {
@@ -17146,20 +23733,13 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
                 d.active = None;
             }
         }
-        Err(e) => {
-            // `edit_profile_env` mutates the in-memory profile BEFORE its
-            // disk writes, so a failed persist leaves memory without the key
-            // while the placeholder stays on disk — put it back so memory
-            // matches disk and a retry's index lookup finds the same row it
-            // cancelled.
-            {
-                let mut cfg = app.config();
-                if let Some(p) = cfg.find_mut(name) {
-                    p.env.insert(key.to_string(), String::new());
-                }
-            }
-            app.toast(ToastKind::Danger, format!("env update failed\n{e}"))
-        }
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "env update failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -17192,11 +23772,17 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
             .and_then(|p| p.bell_threshold)
             .map(format_weekly_pct)
             .unwrap_or_default(),
+        ConfigRow::UsageProbeInterval => profile
+            .map(|p| (p.usage_probe_interval_ms / 1000).to_string())
+            .unwrap_or_default(),
         // The saved value of the i-th sorted env entry; reverts a value edit on ⎋.
         ConfigRow::EnvEntry(i) => profile
             .and_then(|p| p.env.values().nth(i).cloned())
             .unwrap_or_default(),
         ConfigRow::AutoStart
+        | ConfigRow::UsageProbe
+        | ConfigRow::Type
+        | ConfigRow::Family
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
@@ -17210,7 +23796,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
 }
 
 /// ⏎ inside a field: new draft buffers; existing accounts persist per field.
-fn commit_config_field(app: &mut App, field: ConfigRow) {
+fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
     let is_new = app
         .config_draft
         .as_ref()
@@ -17219,39 +23805,54 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
     if is_new {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
+            // A name edit retires the refusals the old name carried.
+            if field == ConfigRow::Name {
+                d.name_refusal = None;
+                d.create_refusal = None;
+            }
         }
-        return;
+        return CommitResult::Landed;
     }
     match field {
-        ConfigRow::Name => commit_rename(app),
-        ConfigRow::BaseUrl | ConfigRow::ApiKey => commit_endpoint(app),
+        ConfigRow::Name => CommitResult::from(commit_rename(app)),
+        ConfigRow::BaseUrl | ConfigRow::ApiKey => CommitResult::from(commit_endpoint(app, field)),
         ConfigRow::Model
         | ConfigRow::OpusModel
         | ConfigRow::SonnetModel
         | ConfigRow::HaikuModel
         | ConfigRow::FableModel
-        | ConfigRow::SubagentModel => commit_model_field(app, field),
-        ConfigRow::EnvEntry(i) => commit_env_value(app, i),
+        | ConfigRow::SubagentModel => CommitResult::from(commit_model_field(app, field)),
+        ConfigRow::EnvEntry(i) => CommitResult::from(commit_env_value(app, i)),
         ConfigRow::EnvAdd => commit_env_new_key(app),
-        ConfigRow::BellThreshold => commit_bell_threshold(app),
+        ConfigRow::BellThreshold => CommitResult::from(commit_bell_threshold(app)),
+        ConfigRow::UsageProbeInterval => CommitResult::from(commit_usage_probe_interval(app)),
         _ => {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
             }
+            CommitResult::Landed
         }
+    }
+}
+
+/// `true` = a synchronous commit landed; `false` = refused (the editor stays
+/// open with its own refusal treatment).
+impl From<bool> for CommitResult {
+    fn from(landed: bool) -> Self {
+        if landed { Self::Landed } else { Self::Refused }
     }
 }
 
 /// ⏎ on a model field: fold the trimmed buffer into the profile's
 /// [`ModelSettings`], persist, then reseed the buffer from the saved value.
-fn commit_model_field(app: &mut App, field: ConfigRow) {
+fn commit_model_field(app: &mut App, field: ConfigRow) -> bool {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return false;
     };
     let raw = app
         .config_draft
@@ -17259,16 +23860,11 @@ fn commit_model_field(app: &mut App, field: ConfigRow) {
         .and_then(|d| d.field(field))
         .map(|i| i.trimmed().to_string())
         .unwrap_or_default();
-    let mut models = {
-        let cfg = app.config();
-        cfg.find(&name)
-            .map(|p| p.models.clone())
-            .unwrap_or_default()
-    };
-    apply_model_field(&mut models, field, &raw);
     let result = {
         let mut cfg = app.config();
-        edit_profile_model(&mut cfg, &name, models)
+        edit_profile_model(&mut cfg, &name, |models| {
+            apply_model_field(models, field, &raw);
+        })
     };
     match result {
         Ok(()) => {
@@ -17282,24 +23878,34 @@ fn commit_model_field(app: &mut App, field: ConfigRow) {
                 }
                 d.active = None;
             }
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("model update failed\n{e}")),
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "model update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            false
+        }
     }
 }
 
 /// ⏎ on the `alert at` field: a value in `0..=100` sets the bell, an empty one
 /// turns it off; anything else keeps the editor open, as the Fallback card's
 /// threshold editor does.
-fn commit_bell_threshold(app: &mut App) {
+fn commit_bell_threshold(app: &mut App) -> bool {
     let raw = app
         .config_draft
         .as_ref()
         .map(|d| d.bell_threshold.trimmed().to_string())
         .unwrap_or_default();
     let Some(value) = parse_bell_threshold(&raw) else {
-        return;
+        return false;
     };
-    write_bell_threshold(app, value);
+    write_bell_threshold(app, value)
 }
 
 /// A typed `alert at` value: a number in `0..=100`, or EMPTY, which turns the
@@ -17341,32 +23947,34 @@ const DEFAULT_BELL_THRESHOLD: f64 = 95.0;
 
 /// Persist the drafted account's alert threshold, rolling memory back on a
 /// failed save, then reseed the row's buffer from what was saved.
-fn write_bell_threshold(app: &mut App, value: Option<f64>) {
+fn write_bell_threshold(app: &mut App, value: Option<f64>) -> bool {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return false;
     };
     // `-0` saves as `0`, the value a reload reads back.
     let value = value.map(|v| v + 0.0);
     let result = {
         let mut cfg = app.config();
-        match cfg.find_mut(&name) {
+        match cfg.find(&name) {
             None => None,
-            Some(profile) => {
-                let before = profile.bell_threshold;
-                profile.bell_threshold = value;
-                let saved = save_profile_config(profile);
-                if saved.is_err()
-                    && let Some(p) = cfg.find_mut(&name)
-                {
-                    p.bell_threshold = before;
+            Some(_) => match update_profile_config(&name, |p| {
+                p.bell_threshold = value;
+                Ok(())
+            }) {
+                Ok(None) => None,
+                Ok(Some(_)) => {
+                    if let Some(p) = cfg.find_mut(&name) {
+                        p.bell_threshold = value;
+                    }
+                    Some(Ok(()))
                 }
-                Some(saved)
-            }
+                Err(e) => Some(Err(e)),
+            },
         }
     };
     match result {
@@ -17376,6 +23984,7 @@ fn write_bell_threshold(app: &mut App, value: Option<f64>) {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
             }
+            true
         }
         Some(Ok(())) => {
             let shown = {
@@ -17386,8 +23995,18 @@ fn write_bell_threshold(app: &mut App, value: Option<f64>) {
                 d.bell_threshold = InputState::new(&shown);
                 d.active = None;
             }
+            true
         }
-        Some(Err(e)) => app.toast(ToastKind::Danger, format!("alert update failed\n{e}")),
+        Some(Err(e)) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "alert update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            false
+        }
     }
 }
 
@@ -17407,6 +24026,10 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         // `ConfigRow` variant fails the build instead of a silent no-op.
         ConfigRow::Name
         | ConfigRow::AutoStart
+        | ConfigRow::UsageProbe
+        | ConfigRow::UsageProbeInterval
+        | ConfigRow::Type
+        | ConfigRow::Family
         | ConfigRow::BellThreshold
         | ConfigRow::BaseUrl
         | ConfigRow::ApiKey
@@ -17441,16 +24064,11 @@ fn cycle_model(app: &mut App) {
         }
         return;
     };
-    let mut models = {
-        let cfg = app.config();
-        cfg.find(&name)
-            .map(|p| p.models.clone())
-            .unwrap_or_default()
-    };
-    models.default = next_model_preset(models.default.as_deref());
     let result = {
         let mut cfg = app.config();
-        edit_profile_model(&mut cfg, &name, models)
+        edit_profile_model(&mut cfg, &name, |models| {
+            models.default = next_model_preset(models.default.as_deref());
+        })
     };
     match result {
         Ok(()) => {
@@ -17464,7 +24082,13 @@ fn cycle_model(app: &mut App) {
                 d.model = InputState::new(&value);
             }
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("model update failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "model update failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -17479,6 +24103,316 @@ fn next_model_preset(current: Option<&str>) -> Option<String> {
             _ => None,
         },
     }
+}
+
+/// Whether the `+ new` draft holds a staged login (a claude mint or capture, a
+/// codex mint or capture) — or an in-flight login this `+ new` form started —
+/// that cycling the type would drop or strand. Only a login the form started
+/// counts: the unrelated re-login of an existing account never does. A shunt
+/// add past its commit point has nothing left to drop (its result lands the
+/// pool row whatever the form does), so it never asks.
+fn staged_login_held(app: &App) -> bool {
+    app.config_draft
+        .as_ref()
+        .and_then(|d| d.captured_login.as_ref())
+        .is_some()
+        || app.login.as_ref().is_some_and(|s| {
+            s.account.is_none() && !app.shunt_paste.as_ref().is_some_and(|door| door.sent)
+        })
+        || app.codex_login.as_ref().is_some_and(|s| s.is_new)
+}
+
+/// `space` on the `type` cycle: advance claude → codex → shunt → claude. A
+/// staged login is gated on a confirm first — the change drops it — and a
+/// cancel leaves both the type and the stage as they were.
+fn cycle_account_type(app: &mut App) {
+    let Some(d) = app.config_draft.as_ref() else {
+        return;
+    };
+    let next = d.account_type.next();
+    if staged_login_held(app) {
+        app.open_modal(Modal::Confirm(ConfirmState {
+            message: "change the account type?".to_string(),
+            detail: Some("the login you already captured will be dropped".to_string()),
+            choice: false,
+            scroll: ConfirmScroll::default(),
+            on_confirm: ConfirmAction::CycleAccountType(next),
+        }));
+        return;
+    }
+    set_account_type(app, next);
+}
+
+/// Land a type change: swap the type, drop the staged login and any refusal the
+/// old type's rows held, and keep the cursor on the type row.
+fn set_account_type(app: &mut App, next: NewAccountType) {
+    if let Some(d) = app.config_draft.as_mut() {
+        d.account_type = next;
+        d.captured_login = None;
+        d.name_refusal = None;
+        d.create_refusal = None;
+    }
+    app.config_action_cursor = 0;
+}
+
+/// Cancel the open claude/shunt login, applying the shunt add's commit-point
+/// rule. BEFORE the commit point (no paste sent) a cancel cancels the add:
+/// the door drops (its sender disconnects the worker's paste wait) and the
+/// add's identity is remembered so the worker's report releases the guard
+/// (R3-3) — the guard stays held until then. AFTER the paste is sent (the
+/// commit point) only the login line closes: the door drops too (the paste
+/// already went down it), the guard marker and the committed slot stay, and
+/// the complete runs to its result (the codex N1 rule). A claude login has no
+/// shunt door; `cancel_claude` says whether this cancel drops it (esc/q) or
+/// leaves it running for the harness check (a confirmed type change, F3).
+fn cancel_open_login(app: &mut App, cancel_claude: bool) {
+    let committed = app.shunt_paste.as_ref().is_some_and(|door| door.sent);
+    if committed {
+        // The paste is already in flight, so the door has no further use:
+        // drop it now, and keep only the committed add's identity
+        // (`shunt_add_committed`) and its guard marker. The complete's result
+        // routes by that identity, never through the door; a login started
+        // afterwards gets its own door and modal (R4-1).
+        app.shunt_paste = None;
+        app.login = None;
+        close_login_modal(app);
+        return;
+    }
+    if let Some(door) = app.shunt_paste.take() {
+        let generation = app.login.as_ref().map(|s| s.generation).unwrap_or_default();
+        app.shunt_add_cancelled = Some(ShuntAddIdentity {
+            generation,
+            family: door.family,
+            name: door.name.clone(),
+        });
+        app.login = None;
+    } else if cancel_claude {
+        app.login = None;
+    }
+    close_login_modal(app);
+}
+
+/// Cancel the in-flight login a confirmed type change must drop, without the
+/// "login canceled" toast — the confirm already said the stage would be
+/// dropped. Only a PRE-commit shunt add is cancelled here: its success would
+/// otherwise close whatever draft is open later. A claude or codex mint is
+/// NOT cancelled — its late result is dropped by the harness check (F3), which
+/// toasts the type change. A committed add runs to its result.
+fn cancel_staged_new_login(app: &mut App) {
+    cancel_open_login(app, false);
+}
+
+/// `space` on the shunt form's `family` cycle: claude → codex → antigravity →
+/// claude.
+fn cycle_family(app: &mut App) {
+    if let Some(d) = app.config_draft.as_mut() {
+        d.family = d.family.next();
+    }
+}
+
+/// The codex `+ login` head: validate the typed name against BOTH rosters
+/// before any browser opens (a held name refuses on the name row's `└`), then
+/// run the codex browser flow on a worker and STAGE the minted chain in the
+/// draft — `create account` lands it, a closed form drops it unused. The modal
+/// is commit 1's codex login modal (open-again `r`, copy-link `c`, no paste
+/// door).
+fn start_codex_new_login(app: &mut App) {
+    if let Some(session) = app.codex_login.as_ref() {
+        // Same shape as the re-login guard: a second ⏎ reopens the modal, one
+        // for another name names the running login.
+        let typed = app
+            .config_draft
+            .as_ref()
+            .map(|d| d.name.trimmed().to_string())
+            .unwrap_or_default();
+        if session.name != typed {
+            toast_login_in_progress(app, session.name.clone());
+        }
+        open_codex_login_modal(app);
+        return;
+    }
+    let typed = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.name.trimmed().to_string())
+        .unwrap_or_default();
+    if let Err(e) = validate_profile_name(&typed, Harness::Codex, None) {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name_refusal = Some(format!("{e}"));
+        }
+        focus_name_row(app);
+        return;
+    }
+    app.codex_login_generation += 1;
+    let generation = app.codex_login_generation;
+    let cancel = crate::codex_login::LoginCancel::new();
+    app.codex_login = Some(CodexLoginSession {
+        name: typed.clone(),
+        generation,
+        url: None,
+        cancel: cancel.clone(),
+        is_new: true,
+    });
+    #[cfg(test)]
+    let worker_fn = app.codex_login_worker;
+    let url_tx = app.codex_login_url_tx.clone();
+    let result_tx = app.codex_new_login_result_tx.clone();
+    spawn_worker(move || {
+        let announce = move |url: &str| {
+            let _ = url_tx.send((generation, url.to_string()));
+        };
+        #[cfg(test)]
+        let outcome = worker_fn(&announce, &cancel);
+        #[cfg(not(test))]
+        let outcome =
+            crate::codex_login::login_with_cancel(&announce, &cancel).map_err(|e| format!("{e:#}"));
+        // A cancel seen here drops the minted chain unwritten.
+        let res = if cancel.is_canceled() {
+            Err("login canceled".to_string())
+        } else {
+            outcome
+        };
+        let _ = result_tx.send((generation, res));
+    });
+    open_codex_login_modal(app);
+}
+
+/// Drain a finished `+ new` codex `+ login`: stage the minted chain in the
+/// draft, or toast the failure.
+fn drain_codex_new_login(app: &mut App) {
+    while let Ok((generation, result)) = app.codex_new_login_result_rx.try_recv() {
+        if app.codex_login.as_ref().map(|s| s.generation) != Some(generation) {
+            continue; // superseded or cancelled
+        }
+        app.codex_login = None;
+        close_codex_login_modal(app);
+        match result {
+            Ok(outcome) => {
+                match stash_new_form_login(app, DraftLogin::CodexMint(Box::new(outcome))) {
+                    StashOutcome::Staged => {
+                        app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                    }
+                    StashOutcome::FormClosed => app.toast(
+                        ToastKind::Warning,
+                        "login finished but the new-account form is no longer open\nlog in again",
+                    ),
+                    StashOutcome::WrongType => app.toast(
+                        ToastKind::Info,
+                        "login finished but the form type changed\nnothing was saved",
+                    ),
+                }
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
+        }
+    }
+}
+
+/// `+ capture current login` on the codex form: stage a marker that moves the
+/// operator's own codex login at `create account`, exactly as
+/// `clauth login <name> --codex` does.
+fn stage_codex_capture(app: &mut App) {
+    let typed = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.name.trimmed().to_string())
+        .unwrap_or_default();
+    if let Err(e) = validate_profile_name(&typed, Harness::Codex, None) {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name_refusal = Some(format!("{e}"));
+        }
+        focus_name_row(app);
+        return;
+    }
+    // The row only renders while the operator's login is capturable; the file
+    // may have moved since the flag was computed, so re-check and drop the row.
+    if !crate::actions::codex_operator_login_capturable() {
+        app.toast(
+            ToastKind::Warning,
+            "no codex login to capture\nrun `codex login` first",
+        );
+        return;
+    }
+    if matches!(
+        stash_new_form_login(app, DraftLogin::CodexCapture),
+        StashOutcome::Staged
+    ) {
+        app.toast(
+            ToastKind::Success,
+            "current codex login captured\ncreate account saves it",
+        );
+    }
+}
+
+/// The warning a codex capture that could not adopt the operator's slot owes
+/// the user: the chain is now a separate copy of a single-use rotating chain.
+fn codex_separate_copy_warning(outcome: &crate::actions::CodexCaptureOutcome) -> Option<String> {
+    match outcome {
+        crate::actions::CodexCaptureOutcome::Captured {
+            canonical,
+            adopted: false,
+            ..
+        } => Some(format!(
+            "captured a separate copy of a single-use rotating chain\nrun codex through {} from here on, or run codex login again",
+            prose::cmd(&format!("clauth start {canonical}"))
+        )),
+        _ => None,
+    }
+}
+
+/// `create account` on the codex form: land the staged mint through
+/// [`crate::actions::land_codex_login`] or the staged capture through
+/// [`crate::actions::codex_login_capture_at`], both create-only — a name either
+/// roster holds refuses at create (re-checked under the state lock), never a
+/// re-auth. Nothing staged refuses on the create row's `└`.
+fn commit_codex_account(app: &mut App) {
+    let Some(d) = app.config_draft.as_ref() else {
+        return;
+    };
+    let name = d.name.trimmed().to_string();
+    let stash = d.captured_login.clone();
+    let result = match stash {
+        Some(DraftLogin::CodexMint(outcome)) => {
+            crate::actions::land_codex_login(&name, &outcome, None).map(|_| None)
+        }
+        Some(DraftLogin::CodexCapture) => crate::actions::codex_login_capture_at(
+            &name,
+            &chrono::Utc::now().to_rfc3339(),
+            crate::actions::CodexLandMode::CreateOnly,
+        )
+        .map(|outcome| codex_separate_copy_warning(&outcome)),
+        _ => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.create_refusal = Some("log in or capture a login first".to_string());
+            }
+            return;
+        }
+    };
+    match result {
+        Ok(warning) => {
+            finish_created_codex(app, &name);
+            app.toast(ToastKind::Success, format!("created '{name}'"));
+            if let Some(warning) = warning {
+                app.toast(ToastKind::Warning, warning);
+            }
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("create failed\n{e:#}")),
+    }
+}
+
+/// Land a created codex account: re-read the codex snapshot, and put Setup and
+/// the Overview on the new row.
+fn finish_created_codex(app: &mut App, name: &str) {
+    app.codex_rows = codex_rows();
+    let new_idx = app
+        .codex_rows
+        .iter()
+        .position(|row| row.name == name)
+        .unwrap_or(0);
+    land_created_item(
+        app,
+        Some(SetupItem::Codex(ProfileName::from(name))),
+        MainItemKind::Codex(new_idx),
+    );
 }
 
 /// ⏎ on an `EnvEntry`: seed the shared value buffer from the entry's saved value
@@ -17501,6 +24435,7 @@ fn enter_env_value_edit(app: &mut App, i: usize) {
     if let Some(d) = app.config_draft.as_mut() {
         d.env_value = InputState::new(&value);
         d.active = Some(ConfigRow::EnvEntry(i));
+        d.field_seed = Some(d.env_value.value.clone());
     }
 }
 
@@ -17509,6 +24444,7 @@ fn enter_env_add_edit(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
         d.env_new_key = InputState::new("");
         d.active = Some(ConfigRow::EnvAdd);
+        d.field_seed = Some(d.env_new_key.value.clone());
     }
 }
 
@@ -17516,49 +24452,47 @@ fn enter_env_add_edit(app: &mut App) {
 /// persist via [`edit_profile_env`], then reseed from the saved value.
 /// An emptied value is an unset — the entry is dropped, so neither the
 /// profile's config.toml nor the live settings.json keeps `key = ""`.
-fn commit_env_value(app: &mut App, i: usize) {
+fn commit_env_value(app: &mut App, i: usize) -> bool {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return false;
     };
     let value = app
         .config_draft
         .as_ref()
         .map(|d| d.env_value.trimmed().to_string())
         .unwrap_or_default();
-    let key = {
+    let (present, key) = {
         let cfg = app.config();
-        cfg.find(&name).and_then(|p| p.env.keys().nth(i).cloned())
+        let profile = cfg.find(&name);
+        (
+            profile.is_some(),
+            profile.and_then(|p| p.env.keys().nth(i).cloned()),
+        )
     };
-    let new_env = {
-        let cfg = app.config();
-        cfg.find(&name).map(|p| {
-            let mut env = p.env.clone();
-            if let Some(key) = key.clone() {
-                if value.is_empty() {
-                    // Unset, not blank: `edit_profile_env` strips the dropped
-                    // key from the live settings on its own (prev-key removal).
-                    env.remove(&key);
-                } else {
-                    env.insert(key, value.clone());
-                }
-            }
-            env
-        })
-    };
-    let Some(new_env) = new_env else {
+    if !present {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
         }
-        return;
-    };
+        return true;
+    }
     let result = {
         let mut cfg = app.config();
-        edit_profile_env(&mut cfg, &name, new_env)
+        edit_profile_env(&mut cfg, &name, |env| {
+            if let Some(key) = &key {
+                if value.is_empty() {
+                    // Unset, not blank: `edit_profile_env` strips the dropped
+                    // key from the live settings on its own (prev-key removal).
+                    env.remove(key);
+                } else {
+                    env.insert(key.clone(), value.clone());
+                }
+            }
+        })
     };
     match result {
         Ok(()) => {
@@ -17582,21 +24516,31 @@ fn commit_env_value(app: &mut App, i: usize) {
                 d.env_value = InputState::new(&saved);
                 d.active = None;
             }
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("env update failed\n{e}")),
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "env update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            false
+        }
     }
 }
 
 /// ⏎ in the add-env key editor: validate, run the 3-source collision check, and
 /// either prompt (overwrite/keep/cancel) or add the key and drop into value-edit.
-fn commit_env_new_key(app: &mut App) {
+fn commit_env_new_key(app: &mut App) -> CommitResult {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return CommitResult::Refused;
     };
     let key = app
         .config_draft
@@ -17607,7 +24551,7 @@ fn commit_env_new_key(app: &mut App) {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
         }
-        return;
+        return CommitResult::Landed;
     }
     // A settings.json env key is a shell-style name; spaces or `=` are never valid.
     if key.contains(char::is_whitespace) || key.contains('=') {
@@ -17615,7 +24559,7 @@ fn commit_env_new_key(app: &mut App) {
             ToastKind::Danger,
             "env key can't contain spaces or '='".to_string(),
         );
-        return; // keep the editor open so the user can fix it
+        return CommitResult::Refused; // keep the editor open so the user can fix it
     }
     let base_env_keys = claude_settings_env_keys().unwrap_or_default();
     let collision = {
@@ -17627,19 +24571,28 @@ fn commit_env_new_key(app: &mut App) {
         d.active = None;
     }
     match collision {
-        Some(c) => app.open_modal(Modal::EnvCollision(env_collision_form(
-            name.to_string(),
-            key,
-            c,
-        ))),
-        None => env_add_commit(app, &name, &key),
+        Some(c) => {
+            app.open_modal(Modal::EnvCollision(env_collision_form(
+                name.to_string(),
+                key,
+                c,
+            )));
+            CommitResult::Dialog
+        }
+        None => {
+            if env_add_commit(app, &name, &key) {
+                CommitResult::Landed
+            } else {
+                CommitResult::Refused
+            }
+        }
     }
 }
 
 /// Add (when new) the custom key with an empty value, then focus its row and open
 /// the value editor. An existing key (overwrite chosen on the prompt) is edited in
-/// place — never re-blanked.
-fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
+/// place — never re-blanked. Returns whether the commit landed.
+fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) -> bool {
     let exists = {
         let cfg = app.config();
         cfg.find(name)
@@ -17647,27 +24600,33 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
             .unwrap_or(false)
     };
     if !exists {
-        let new_env = {
-            let cfg = app.config();
-            cfg.find(name).map(|p| {
-                let mut env = p.env.clone();
-                env.insert(key.to_string(), String::new());
-                env
-            })
-        };
-        let Some(new_env) = new_env else {
-            return;
-        };
+        if app.config().find(name).is_none() {
+            return false;
+        }
+        // An existing key is never re-blanked: one a peer added since the
+        // app's read keeps its value, and the cancel stays disarmed for it.
+        let mut added = false;
         if let Err(e) = {
             let mut cfg = app.config();
-            edit_profile_env(&mut cfg, name, new_env)
+            edit_profile_env(&mut cfg, name, |env| {
+                if !env.contains_key(key) {
+                    env.insert(key.to_string(), String::new());
+                    added = true;
+                }
+            })
         } {
-            app.toast(ToastKind::Danger, format!("env update failed\n{e}"));
-            return;
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "env update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            return false;
         }
         // The add persisted an empty placeholder; arm the cancel so an escape
         // in the value editor removes the row instead of keeping `key = ""`.
-        if let Some(d) = app.config_draft.as_mut() {
+        if added && let Some(d) = app.config_draft.as_mut() {
             d.env_just_added = Some(key.to_string());
         }
     }
@@ -17677,12 +24636,13 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
             .and_then(|p| p.env.keys().position(|k| k == key))
     };
     let Some(idx) = idx else {
-        return;
+        return false;
     };
     if let Some(row_pos) = config_row_index(app, ConfigRow::EnvEntry(idx)) {
         app.config_action_cursor = row_pos;
     }
     enter_env_value_edit(app, idx);
+    true
 }
 
 /// Position of `row` in the current detail-row list, if present.
@@ -17717,6 +24677,7 @@ fn env_collision_form(
         reviewing_overwrite: false,
         confirm_overwrite: false,
         max_scroll: std::cell::Cell::new(0),
+        max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
         viewport: std::cell::Cell::new(0),
         overwrite_needs_review: std::cell::Cell::new(false),
     }
@@ -17768,11 +24729,11 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
                 state.confirm_overwrite = false;
                 state.scroll.set(0);
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
                 if state.confirm_overwrite {
                     let name = ProfileName::from(state.profile.clone());
                     let pending = state.key.clone();
-                    app.modals.pop();
+                    app.pop_modal();
                     run_env_collision_choice(
                         app,
                         &name,
@@ -17806,9 +24767,9 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let choice = EnvCollisionForm::options()[state.cursor.min(last)];
             if choice == EnvCollisionChoice::Overwrite && state.overwrite_needs_review.get() {
                 state.reviewing_overwrite = true;
@@ -17819,7 +24780,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
             let name = ProfileName::from(state.profile.clone());
             let pending = state.key.clone();
             let existing_idx = state.existing_idx;
-            app.modals.pop();
+            app.pop_modal();
             run_env_collision_choice(app, &name, &pending, existing_idx, choice);
         }
         _ => {}
@@ -17834,7 +24795,9 @@ fn run_env_collision_choice(
     choice: EnvCollisionChoice,
 ) {
     match choice {
-        EnvCollisionChoice::Overwrite => env_add_commit(app, name, key),
+        EnvCollisionChoice::Overwrite => {
+            let _ = env_add_commit(app, name, key);
+        }
         EnvCollisionChoice::KeepExisting => {
             // For an own-field clash, jump to the existing entry; else just dismiss.
             if let Some(idx) = existing_idx
@@ -17847,30 +24810,62 @@ fn run_env_collision_choice(
     }
 }
 
-fn commit_rename(app: &mut App) {
+/// Rebind every name-keyed suspended field from the old name to the new one
+/// after an in-app rename, so a landing never sees the renamed account as gone
+/// and drops the suspended work. The Setup draft's own `editing_name` is
+/// rebound beside it in [`commit_rename`].
+fn rebind_name_keyed_state(app: &mut App, old: &ProfileName, new: &ProfileName) {
+    if let Some(editor) = app.note_editor.as_mut()
+        && editor.profile == *old
+    {
+        editor.profile = new.clone();
+    }
+    if let Some(edit) = app.fallback_edit.as_mut()
+        && edit.member == *old
+    {
+        edit.member = new.clone();
+    }
+    if let Some(stop) = app.fallback_day_stop.as_mut()
+        && stop.member == *old
+    {
+        stop.member = new.clone();
+    }
+}
+
+fn commit_rename(app: &mut App) -> bool {
     let Some(d) = app.config_draft.as_ref() else {
-        return;
+        return false;
     };
     let Some(old) = d.editing_name.clone() else {
-        return;
+        return false;
     };
     let new = d.name.trimmed().to_string();
     if new == old {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
         }
-        return;
+        return true;
     }
     let validation = validate_profile_name(&new, Harness::Claude, Some(old.as_str()));
     if let Err(e) = validation {
-        app.toast(ToastKind::Danger, format!("{e}"));
-        return;
+        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
+        return false;
     }
     // The rotation guard is taken BEFORE `app.config()`: ROTATION ranks outside
     // `Config`, so acquiring it under the config guard is the inversion
     // `lockorder` asserts on.
     let old_pn = ProfileName::from(old.clone());
     let new_pn = ProfileName::from(new.clone());
+    // Renaming the active profile relinks the live slot. A held rename keeps
+    // the field open; the settle's answer commits it again.
+    let _placed = if app.config().is_active(&old_pn) {
+        let Some(placed) = bare_item_gate(app, BareItemWrite::Rename) else {
+            return false;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     let result = rotation_guard_for_mutation(&old_pn).and_then(|rotation| {
         let mut cfg = app.config();
         rename_profile(&mut cfg, &old_pn, &new_pn, &rotation)
@@ -17878,63 +24873,51 @@ fn commit_rename(app: &mut App) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.last_reload_fp = reload_fingerprint();
+            app.apply_forgets();
+            rebind_name_keyed_state(app, &old_pn, &new_pn);
             if let Some(d) = app.config_draft.as_mut() {
                 d.editing_name = Some(new.clone());
                 d.name = InputState::new(&new);
                 d.active = None;
             }
             app.toast(ToastKind::Success, format!("renamed '{old}' → '{new}'"));
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("rename failed\n{e}")),
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("rename failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            false
+        }
     }
 }
 
-/// Drop one profile's name-keyed fetch-status + streak chrome — the shared
-/// clear every credential-replacing path runs: a repaired or repointed
-/// credential retires the old provider's verdicts, so the next frame
-/// must read no stale `[ key rejected ]` pill and the throttler attribution
-/// cannot accuse the new endpoint with the old provider's streak. The OAuth
-/// fetch status joins them because the render merges it over the third-party
-/// one — either left standing would still read as the stale verdict. The
-/// store clears only: the per-frame snapshot derives its readings from these
-/// stores on the next frame, so no handle write is needed.
-fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
-    // Read through a poisoned lock: a skip would leave the stale verdict
-    // behind, and the per-frame snapshot reads these stores back next frame,
-    // so a clear that silently no-ops strands the pill it was meant to retire.
-    app.third_party_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(name.as_str());
-    app.third_party_streaks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(name.as_str());
-    app.usage_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(name.as_str());
-}
-
-fn commit_endpoint(app: &mut App) {
+fn commit_endpoint(app: &mut App, field: ConfigRow) -> bool {
     let Some(d) = app.config_draft.as_ref() else {
-        return;
+        return false;
     };
     let Some(name) = d.editing_name.clone().map(ProfileName::from) else {
-        return;
+        return false;
     };
     let active_field = d.active;
     let base_url = d.base_url.trimmed_some();
-    // An API key only makes sense with a base URL; drop it for OAuth.
-    let api_key = if base_url.is_some() {
-        d.api_key.trimmed_some()
-    } else {
-        None
-    };
+    let api_key = d.api_key.trimmed_some();
     let result = {
         let mut cfg = app.config();
-        edit_profile_endpoint(&mut cfg, &name, base_url, api_key)
+        // Only the committed row moves; the other half is the one disk holds
+        // now, so a peer's edit to it survives this commit.
+        edit_profile_endpoint(&mut cfg, &name, |url, key| {
+            if field == ConfigRow::ApiKey {
+                *key = api_key;
+            } else {
+                *url = base_url;
+            }
+            // An API key only makes sense with a base URL; drop it for OAuth.
+            if url.is_none() {
+                *key = None;
+            }
+        })
     };
     match result {
         Ok(()) => {
@@ -17943,7 +24926,7 @@ fn commit_endpoint(app: &mut App) {
             // rejection verdict reads the AppConfig profile fingerprint, never
             // this list, so a stale entry cannot keep the name key-rejected.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &name);
+            app.apply_forgets();
             // Reseed from the saved profile (API key may have been dropped).
             let (base, key) = {
                 let cfg = app.config();
@@ -17962,13 +24945,21 @@ fn commit_endpoint(app: &mut App) {
                 if d.relogin_chain && active_field == Some(ConfigRow::BaseUrl) && !base.is_empty() {
                     d.api_key.end();
                     d.active = Some(ConfigRow::ApiKey);
+                    d.field_seed = Some(d.api_key.value.clone());
                 } else {
                     d.relogin_chain = false;
                     d.active = None;
                 }
             }
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("edit failed\n{e}")),
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("edit failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            false
+        }
     }
 }
 
@@ -17978,7 +24969,7 @@ fn commit_endpoint(app: &mut App) {
 /// ordinary account instead of a dead `+ new` draft.
 fn finish_created_profile(app: &mut App, name: &str) {
     app.refresh_tokens();
-    app.last_reload_fp = reload_fingerprint();
+    app.apply_forgets();
     app.refresh_unsaved_live_login();
     let new_idx = app
         .config()
@@ -17986,9 +24977,8 @@ fn finish_created_profile(app: &mut App, name: &str) {
         .iter()
         .position(|p| p.name == name)
         .unwrap_or(0);
-    app.profile_cursor = new_idx;
-    app.config_focus = ConfigFocus::Profiles;
-    app.config_draft = None;
+    app.profile_cursor.set(new_idx);
+    land_created_item(app, None, MainItemKind::Profile(new_idx));
 }
 
 fn commit_new_account(app: &mut App) {
@@ -18029,9 +25019,23 @@ fn commit_new_account(app: &mut App) {
     };
     let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
-        app.toast(ToastKind::Danger, format!("{e}"));
+        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
         return;
     }
+    // A fresh login becomes the active one when none is, linking the live
+    // slot. Settled before the gateway mint below, so a held create has
+    // minted nothing. A captured live login needs no settle: the capture
+    // saves the very login the item holds.
+    let _placed = if matches!(captured, Some(DraftLogin::Mint(_)))
+        && app.config().state.active_profile.is_none()
+    {
+        let Some(placed) = bare_item_gate(app, BareItemWrite::NewAccount) else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     // Mint before the create, under C1's one-save guard; a refusal keeps the
     // form open. The token never reaches a toast, a buffer or a log line.
     // Read the gateway pid BEFORE the mint: the pid the require's restart wait
@@ -18078,19 +25082,27 @@ fn commit_new_account(app: &mut App) {
                 capture_into_profile(&mut cfg, name.clone(), models, *snapshot)
             }
             // The draft parked the login's uuid until this moment fixed the
-            // name; `create_profile_from_login` anchors it on the commit.
+            // name; `create_profile_from_login` anchors it and seeds the probe's
+            // plan on the commit.
             Some(DraftLogin::Mint(login)) => create_profile_from_login(
                 &mut cfg,
                 name.clone(),
                 models,
                 login.credentials,
                 login.account_uuid,
+                login.plan,
             ),
+            // Unreachable: the `captured` filter above maps a codex stash to
+            // `None` — this claude-only path never consumes one.
+            Some(DraftLogin::CodexMint(_) | DraftLogin::CodexCapture) => {
+                unreachable!("the captured filter drops a codex stash first")
+            }
             None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, models),
         }
     };
     match result {
         Ok(()) => {
+            app.apply_forgets();
             if mint_discarded {
                 app.toast(
                     ToastKind::Info,
@@ -18122,63 +25134,62 @@ fn commit_new_account(app: &mut App) {
             }
         }
         Err(e) => {
-            let Some((mint, token)) = minted else {
-                // `config.add` is the event that makes the profile exist in this
-                // session, and every create helper runs it only after its
-                // `save_profile` succeeded — so the roster, never a disk read,
-                // answers "did the profile land" (`load_profile` returns a
-                // default-valued profile for one that was never written). A
-                // failed `save_profile` (nothing on disk, nothing in memory, or
-                // a rolled-back first-account link) keeps the form open with its
-                // draft and any captured login; a failure after the save (state
-                // write) closes onto the created profile, else `create failed`
-                // leaves the pane editing a profile that already exists.
-                if app
-                    .config()
-                    .find(&crate::profile::ProfileName::from(name.as_str()))
-                    .is_some()
-                {
-                    finish_created_profile(app, &name);
-                }
-                app.toast(ToastKind::Danger, format!("create failed\n{e}"));
-                return;
-            };
-            // Decide the rollback from the profile as saved on disk after the
-            // error (C1's `run_add_client_token` shape): the profile save
-            // landed and only the state write failed -> it holds the minted
-            // key, keep the token; the save itself failed -> remove it. The
-            // token takes part in the comparison, never in a message.
-            let kept =
-                crate::profile::load_profile(&crate::profile::ProfileName::from(name.as_str()))
-                    .ok()
-                    .is_some_and(|saved| saved.api_key.as_deref() == Some(token.expose()));
-            if kept {
+            // `config.add` is the event that makes the profile exist in this
+            // session, and every create helper runs it only once the roster
+            // write landed — so memory, never a disk read, answers "did the
+            // profile land". A create that failed before that left nothing
+            // behind (its undo took back the dir and the live link it made), so
+            // the form stays open with its draft and any captured login; a
+            // failure after it (the first account's live settings write) closes
+            // onto the created profile, else `create failed` leaves the pane
+            // editing a profile that already exists.
+            let landed = app
+                .config()
+                .find(&crate::profile::ProfileName::from(name.as_str()))
+                .is_some();
+            if landed {
                 finish_created_profile(app, &name);
                 app.toast(
                     ToastKind::Danger,
-                    format!(
-                        "create failed\n{} was created, but {e:#}",
-                        escape_control(&name)
-                    ),
+                    format!("create failed\n{}", escape_control(&error_toast_detail(&e))),
                 );
                 return;
             }
+            let Some((mint, _token)) = minted else {
+                match chain_held_skipped("create", &e) {
+                    Some(skipped) => app.toast(ToastKind::Warning, skipped),
+                    None => app.toast(
+                        ToastKind::Danger,
+                        format!("create failed\n{}", escape_control(&error_toast_detail(&e))),
+                    ),
+                }
+                return;
+            };
+            // No profile holds the minted token, so it is revoked; a revoke
+            // that fails names the token left stored, and any dir the undo
+            // left beside it.
             match crate::gateway_tokens::remove_client_token(&mint.record, &name) {
                 Ok(_) => app.toast(ToastKind::Danger, format!("create failed\n{e:#}")),
-                Err(removal) => app.toast(
-                    ToastKind::Danger,
-                    format!(
-                        "create failed\nthe token for {} is stored but no profile was created: {removal:#}",
-                        escape_control(&name),
-                    ),
-                ),
+                Err(removal) => {
+                    let left = e
+                        .downcast_ref::<crate::actions::CreateUndoIncomplete>()
+                        .map(crate::actions::CreateUndoIncomplete::note)
+                        .unwrap_or_default();
+                    app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "create failed\nthe token for {} is stored but no profile was created: {removal:#}{left}",
+                            escape_control(&name),
+                        ),
+                    );
+                }
             }
         }
     }
 }
 
 fn perform_delete(app: &mut App, name: &ProfileName) {
-    // The unforced guard in `delete_profile` refuses a live-session profile,
+    // The unforced guard in `delete_profile_taking_config` refuses a live-session profile,
     // which would otherwise dead-end the TUI on a danger toast with no way
     // forward. Confirm the deauth risk instead of attempting (and failing)
     // the unforced delete first.
@@ -18199,103 +25210,378 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
     finish_delete(app, name, false);
 }
 
+/// How a delete worker ended.
+enum DeleteResult {
+    /// The delete ran: done, held, or its refusal or failure.
+    Ran(ProfileName, Result<DeleteRan>),
+    /// The worker panicked; the in-flight marker must still clear.
+    Panicked,
+}
+
+/// A delete that ran without failing.
+enum DeleteRan {
+    Deleted,
+    /// The bare item holds a login only the user can place: the delete waits
+    /// on [`Modal::BareItem`], having removed nothing.
+    Held,
+}
+
+/// Run the delete on a worker: its rescue walks the account's dead runtime
+/// trees and can wait on another process's rescue lock, and the UI thread
+/// waits on neither. The outcome lands through [`drain_profile_delete`].
 fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
-    // Before `app.config()`, for the reason the rename path states.
-    let result = rotation_guard_for_mutation(name).and_then(|rotation| {
-        let mut cfg = app.config();
-        delete_profile(&mut cfg, name, force, &rotation)
+    if app.deleting.is_some() {
+        app.toast(
+            ToastKind::Info,
+            "a delete is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    app.deleting = Some(name.clone());
+    let config = Arc::clone(&app.config);
+    let tx = app.delete_tx.clone();
+    let bare_item_tx = app.bare_item_tx.clone();
+    let source = app.bare_item_source;
+    let ready = app.bare_item_ready.take();
+    let name = name.clone();
+    let settling = ready.is_none() && app.config().is_active(&name);
+    let check = if settling {
+        begin_bare_item_check(
+            app,
+            &BareItemWrite::Delete {
+                name: name.clone(),
+                force,
+            },
+        )
+    } else {
+        None
+    };
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    let stop_deadline = crate::runtime::SupervisorStopDeadlineGuard::current();
+    #[cfg(test)]
+    let panic_plant = DELETE_WORKER_PANICS.with(std::cell::Cell::get);
+    spawn_worker(move || {
+        // A test's supervisor-stop deadline is per thread: the worker takes it.
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let _stop_deadline = stop_deadline.map(crate::runtime::SupervisorStopDeadlineGuard::set);
+        // A panic inside the delete still lands a result, so `deleting` never
+        // sticks (the `start_pool_mutation` precedent).
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if panic_plant {
+                panic!("test seam: the delete worker panicked");
+            }
+            // Deleting the active profile signs the live slot out. Settled on
+            // this worker, so the placement guards this thread's write; the
+            // notice goes to the event log, the worker having no toast of its
+            // own. A login only the user can place holds the delete until
+            // they answer; a resumed delete takes their answer instead.
+            let _placed = if App::lock_config(&config).is_active(&name) {
+                let placed = match ready {
+                    Some(placed) => placed,
+                    None => {
+                        // A panicking settle fails as a settle, so the toast
+                        // says what every other bare-item worker's does.
+                        let settle = catch_unwind(AssertUnwindSafe(|| {
+                            settle_bare_keychain_item(
+                                source,
+                                crate::claude::BareItemWriter::SignOut,
+                            )
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED)));
+                        // The check ends with the settle, not with the
+                        // delete's own rescue walk after it.
+                        drop(check);
+                        // The drain shows a delete error's outer link alone,
+                        // and a settle's cause sits below it.
+                        match settle.map_err(|e| anyhow::anyhow!("{e:#}"))? {
+                            crate::claude::BareItemSettle::Settled(settled) => {
+                                if let Some(notice) = &settled.notice {
+                                    crate::logline::logline!("clauth: {notice}");
+                                }
+                                settled.placed
+                            }
+                            held @ crate::claude::BareItemSettle::NeedsChoice(_) => {
+                                let _ = bare_item_tx.send(BareItemAnswer {
+                                    write: BareItemWrite::Delete {
+                                        name: name.clone(),
+                                        force,
+                                    },
+                                    outcome: BareItemOutcome::Settled(Ok(held)),
+                                });
+                                return Ok(DeleteRan::Held);
+                            }
+                        }
+                    }
+                };
+                Some(enter_bare_item_placement(placed))
+            } else {
+                None
+            };
+            // Before the config lock, for the reason the rename path states.
+            rotation_guard_for_mutation(&name)
+                .and_then(|rotation| {
+                    // The TUI has no `--force` flag, so no refusal names it.
+                    delete_profile_taking_config(
+                        || App::lock_config(&config),
+                        &name,
+                        force,
+                        false,
+                        &rotation,
+                    )
+                })
+                .map(|()| DeleteRan::Deleted)
+        }));
+        let _ = tx.send(match result {
+            Ok(result) => DeleteResult::Ran(name, result),
+            Err(_) => DeleteResult::Panicked,
+        });
     });
-    match result {
-        Ok(()) => {
-            app.refresh_tokens();
-            app.last_reload_fp = reload_fingerprint();
-            app.refresh_unsaved_live_login();
-            app.config_focus = ConfigFocus::Profiles;
-            app.config_draft = None;
-            app.clamp_profile_cursor();
-            app.toast(ToastKind::Success, format!("deleted '{name}'"));
-        }
-        Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by [`DeleteWorkerPanics`]: a delete started on this thread hands its
+    /// worker a panic before the delete runs.
+    static DELETE_WORKER_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes every delete worker started on the calling thread panic until dropped.
+#[cfg(test)]
+pub(crate) struct DeleteWorkerPanics(bool);
+
+#[cfg(test)]
+impl DeleteWorkerPanics {
+    pub(crate) fn set() -> Self {
+        Self(DELETE_WORKER_PANICS.with(|c| c.replace(true)))
     }
 }
 
-/// The action menu's `disable account` / `enable account` off the Setup pane,
-/// where there is no row to arm. Disabling routes through the confirm modal
-/// instead (the row's own arm-then-confirm, in the shape a modal can carry);
-/// enabling is harmless, so it fires straight away, exactly as the row does.
-///
-/// The two gates the row renders inert speak up here: a menu carries no dimmed
-/// item, so a silent no-op would read as a broken pick.
-fn toggle_focused_account_disabled(app: &mut App) {
-    let Some((name, _, _)) = focused_account(app) else {
-        return;
-    };
-    if app.config().is_active(&name) {
+#[cfg(test)]
+impl Drop for DeleteWorkerPanics {
+    fn drop(&mut self) {
+        DELETE_WORKER_PANICS.with(|c| c.set(self.0));
+    }
+}
+
+/// Land a finished delete: the stores forget the account and its open draft
+/// closes, or the refusal or failure is toasted as it reads.
+pub(crate) fn drain_profile_delete(app: &mut App) {
+    while let Ok(result) = app.delete_rx.try_recv() {
+        app.deleting = None;
+        match result {
+            DeleteResult::Ran(_, Ok(DeleteRan::Held)) => {}
+            DeleteResult::Ran(name, Ok(DeleteRan::Deleted)) => {
+                app.refresh_tokens();
+                app.apply_forgets();
+                app.refresh_unsaved_live_login();
+                // A draft opened on another account while the worker ran stays.
+                if !app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.editing_name.as_deref() != Some(name.as_str()))
+                {
+                    app.config_focus = ConfigFocus::Profiles;
+                    app.config_draft = None;
+                }
+                app.clamp_profile_cursor();
+                app.toast(ToastKind::Success, format!("deleted '{name}'"));
+            }
+            DeleteResult::Ran(_, Err(e)) => {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("delete failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
+            }
+            DeleteResult::Panicked => app.toast(ToastKind::Danger, "delete failed"),
+        }
+    }
+}
+
+/// Which way a disable/enable control was asked to go. The label or confirm
+/// that produced the pick owns the direction; the account's state at run time
+/// only decides whether anything is left to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisableDirection {
+    Disable,
+    Enable,
+}
+
+impl DisableDirection {
+    /// The past tense every toast and success line for this control reads with.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Disable => "disabled",
+            Self::Enable => "enabled",
+        }
+    }
+}
+
+/// Disable/enable the named account — the menu's per-row pick resolves its
+/// stored claude identity through this and hands it the direction its item's
+/// label named. Disabling routes through the confirm modal instead of acting on
+/// one press (the row's own arm-then-confirm, in the shape a modal can carry);
+/// enabling is harmless, so it fires straight away. A pick whose direction the
+/// account already holds writes nothing and says so. The two gates the row
+/// renders inert speak up here: a menu carries no dimmed item, so a silent
+/// no-op would read as a broken pick.
+fn toggle_account_disabled(app: &mut App, name: &ProfileName, direction: DisableDirection) {
+    if app.config().is_active(name) {
         app.toast(
             ToastKind::Warning,
             format!("'{name}' is the active account\nswitch away before disabling it"),
         );
         return;
     }
-    if crate::runtime::has_live_session(&name) {
+    if crate::runtime::has_live_session(name) {
         app.toast(
             ToastKind::Warning,
             format!("'{name}' has a live session\nclose it before disabling"),
         );
         return;
     }
-    if app.config().find(&name).is_some_and(Profile::is_disabled) {
-        toggle_profile_disabled(app, &name);
+    let already_there = app.config().find(name).is_some_and(Profile::is_disabled)
+        == matches!(direction, DisableDirection::Disable);
+    if already_there {
+        app.toast(
+            ToastKind::Info,
+            format!("'{name}' is already {}", direction.verb()),
+        );
         return;
     }
-    app.open_modal(Modal::Confirm(ConfirmState {
-        message: format!("disable '{name}'?"),
-        detail: Some(DISABLE_DETAIL.to_string()),
-        choice: false,
-        scroll: ConfirmScroll::default(),
-        on_confirm: ConfirmAction::DisableOne(name.to_string()),
-    }));
+    match direction {
+        DisableDirection::Enable => toggle_profile_disabled(app, name, direction),
+        DisableDirection::Disable => {
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: format!("disable '{name}'?"),
+                detail: Some(DISABLE_DETAIL.to_string()),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::DisableOne(name.to_string()),
+            }));
+        }
+    }
 }
 
 // ── Setup menu: duplicate + presets ───────────────────────────────────────────
 
-/// `duplicate account`: ask for the new name. The copy itself runs on ⏎, so
-/// esc costs nothing.
-fn prompt_duplicate_profile(app: &mut App) {
-    let Some((name, _, _)) = focused_account(app) else {
-        return;
-    };
+/// Ask for the duplicate's new name. The copy itself runs on ⏎, so esc costs
+/// nothing.
+fn duplicate_account(app: &mut App, name: &ProfileName) {
     app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
         action: NamePromptAction::DuplicateProfile(name.to_string()),
     }));
 }
 
-/// `save as preset`: ask for the preset name.
-fn prompt_save_preset(app: &mut App) {
-    let Some((name, _, _)) = focused_account(app) else {
-        return;
-    };
+/// The answer to deleting a built-in preset: it has no file to drop.
+fn toast_builtin_preset(app: &mut App, name: &str) {
+    app.toast(
+        ToastKind::Info,
+        format!("'{name}' is built in and always available"),
+    );
+}
+
+/// Ask for the preset name.
+fn save_preset_account(app: &mut App, name: &ProfileName) {
     app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
         action: NamePromptAction::SavePreset(name.to_string()),
     }));
 }
 
+/// What opening the preset picker did to the Setup pane, so a cancel of the
+/// pick sequence can reverse it losslessly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PresetPickerOpen {
+    /// No undo: the pane was already on a form, or the picker targets an
+    /// existing account.
+    #[default]
+    None,
+    /// A fresh `+ new` form was built and descended; a cancel drops it and
+    /// ascends.
+    Fresh,
+    /// A suspended `+ new` form was restored and descended; a cancel returns
+    /// it to `new_account_draft` and ascends.
+    Restored,
+}
+
+/// Reverse [`open_preset_picker`]'s open-side effect when the pick sequence
+/// ends with no preset applied: a restored form goes back to its home through
+/// the guarded writer, a fresh one is dropped, and the pane ascends to its
+/// selector. A no-op when the open changed nothing, and unless the pane holds
+/// the `+ new` draft it built or restored — a stale flag over an existing
+/// account's draft must not move it.
+fn undo_preset_picker_open(app: &mut App) {
+    let is_new_form = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none());
+    match app.preset_picker_open {
+        PresetPickerOpen::None => {}
+        PresetPickerOpen::Fresh if is_new_form => {
+            app.config_draft = None;
+            app.config_focus = ConfigFocus::Profiles;
+        }
+        PresetPickerOpen::Restored if is_new_form => {
+            let Some(draft) = app.config_draft.take() else {
+                app.config_focus = ConfigFocus::Profiles;
+                app.preset_picker_open = PresetPickerOpen::None;
+                return;
+            };
+            match set_new_account_draft(app, draft) {
+                None => app.config_focus = ConfigFocus::Profiles,
+                Some(draft) => app.config_draft = Some(draft),
+            }
+        }
+        PresetPickerOpen::Fresh | PresetPickerOpen::Restored => {}
+    }
+    app.preset_picker_open = PresetPickerOpen::None;
+}
+
 /// `apply preset`: open the picker. The list always holds the built-ins, so
 /// it is never empty and needs no empty state. On `+ new` the preset's fields
 /// are stamped into the draft, not a saved profile.
 fn open_preset_picker(app: &mut App) {
+    app.preset_picker_open = PresetPickerOpen::None;
     let target = if let Some((name, _, _)) = focused_account(app) {
         PresetTarget::from(name.to_string())
-    } else if app.profile_cursor >= app.profile_count() {
+    } else if app.profile_cursor.read() >= app.profile_count() {
         if app.config_draft.is_none() {
-            app.config_draft = Some(build_draft_new());
+            // Restore the suspended `+ new` form (or build a fresh one) and
+            // descend onto it, so the preset stamps the user's own form and
+            // the form is the active pane, so a switch suspends it and `esc`/`←` ascend from it.
+            // `preset_picker_open` records which, so a cancel reverses it.
+            let restored = app.new_account_draft.is_some();
+            app.config_draft = app
+                .new_account_draft
+                .take()
+                .or_else(|| Some(build_draft_new()));
+            app.config_focus = ConfigFocus::Actions;
+            app.config_action_cursor = 0;
+            app.preset_picker_open = if restored {
+                PresetPickerOpen::Restored
+            } else {
+                PresetPickerOpen::Fresh
+            };
         }
         PresetTarget::NewAccount
     } else {
         return;
     };
+    open_preset_picker_for(app, target);
+}
+
+/// [`open_preset_picker`] for a named account — the menu's `apply preset` pick
+/// resolves its stored claude identity through this.
+fn apply_preset_account(app: &mut App, name: &ProfileName) {
+    app.preset_picker_open = PresetPickerOpen::None;
+    open_preset_picker_for(app, PresetTarget::from(name.to_string()));
+}
+
+/// Open the preset picker for `target` (the shared tail of
+/// [`open_preset_picker`] and [`apply_preset_account`]).
+fn open_preset_picker_for(app: &mut App, target: PresetTarget) {
     app.open_modal(Modal::PresetPicker(PresetPickerForm {
         target,
         presets: crate::presets::list_presets(),
@@ -18320,7 +25606,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
         // input editor. (The other modals' `q` shortcut doesn't apply to a
         // text field.)
         KeyCode::Esc => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
@@ -18329,10 +25615,10 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                 NamePromptAction::DuplicateProfile(source) => {
                     let validation = validate_profile_name(&name, Harness::Claude, None);
                     if let Err(e) = validation {
-                        app.toast(ToastKind::Danger, format!("{e}"));
+                        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                         return;
                     }
-                    app.modals.pop();
+                    app.pop_modal();
                     duplicate_profile_into(
                         app,
                         &ProfileName::from(source),
@@ -18343,7 +25629,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     // The preset store is its own namespace — neither harness's
                     // roster has a say; only the charset + built-in rules apply.
                     if let Err(e) = validate_name_chars(&name) {
-                        app.toast(ToastKind::Danger, format!("{e}"));
+                        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                         return;
                     }
                     if crate::presets::is_builtin(&name) {
@@ -18353,7 +25639,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                         );
                         return;
                     }
-                    app.modals.pop();
+                    app.pop_modal();
                     if crate::presets::preset_exists(&name) {
                         app.open_modal(Modal::Confirm(ConfirmState {
                             message: format!("preset '{name}' already exists."),
@@ -18369,6 +25655,35 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     }
                     save_preset_from(app, &source, &name);
                 }
+                NamePromptAction::SaveBareItem => {
+                    let Some(naming) = app.bare_item_naming.take() else {
+                        app.pop_modal();
+                        return;
+                    };
+                    let result = {
+                        let mut cfg = app.config();
+                        crate::actions::save_bare_item_as_profile(
+                            &mut cfg,
+                            &name,
+                            naming.login.clone(),
+                            naming.account.clone(),
+                        )
+                    };
+                    if let Err(e) = result {
+                        // The prompt stays open on its own login for another name.
+                        app.bare_item_naming = Some(naming);
+                        app.toast(ToastKind::Danger, format!("{e:#}"));
+                        return;
+                    }
+                    let write = naming.write;
+                    app.pop_modal();
+                    app.refresh_tokens();
+                    app.apply_forgets();
+                    app.refresh_unsaved_live_login();
+                    app.toast(ToastKind::Success, format!("captured '{name}'"));
+                    // The login is saved: settle again before the held write.
+                    spawn_bare_item_settle(app, write);
+                }
             }
         }
         _ => apply_input_edit(&mut form.input, key),
@@ -18382,7 +25697,8 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
     let last = state.presets.len().saturating_sub(1);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
+            undo_preset_picker_open(app);
         }
         KeyCode::Up => {
             state.cursor = if state.cursor == 0 {
@@ -18437,25 +25753,25 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             if preset.builtin {
-                app.toast(
-                    ToastKind::Info,
-                    format!("'{}' is built in and always available", preset.name),
-                );
+                toast_builtin_preset(app, &preset.name);
                 return;
             }
-            app.modals.pop();
+            app.pop_modal();
+            // The picker is gone, so no preset will be applied: undo the
+            // open-side effect before the delete confirm.
+            undo_preset_picker_open(app);
             app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::DeletePreset(preset.name),
+                on_confirm: ConfirmAction::DeletePreset(preset),
             }));
         }
         KeyCode::Enter => {
             let picked = state.presets.get(state.cursor.min(last)).cloned();
             let target = state.target.clone();
-            app.modals.pop();
+            app.pop_modal();
             if let Some(preset) = picked {
                 offer_preset_apply(app, target, &preset);
             }
@@ -18484,6 +25800,23 @@ fn preset_target_block(
     }
 }
 
+/// The preset apply's re-check found the confirmed lists moved under the
+/// write, carrying the block as the write read it: the caller mirrors it and
+/// asks again over the fresh diff. Never rendered.
+#[derive(Debug)]
+struct PresetDiffMoved {
+    base_url: Option<String>,
+    models: ModelSettings,
+}
+
+impl std::fmt::Display for PresetDiffMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the preset's diff moved before the write")
+    }
+}
+
+impl std::error::Error for PresetDiffMoved {}
+
 /// Apply `preset` to `target`, asking first whenever it would change a value:
 /// the keep / clear confirm when the target holds a value the preset leaves
 /// unset, the plain confirm when it only replaces values, straight through
@@ -18491,6 +25824,9 @@ fn preset_target_block(
 /// settings" says nothing a user can act on.
 fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::presets::Preset) {
     let Some((base_url, models)) = preset_target_block(app, &target) else {
+        // The pick sequence ends here with no stamp, so the open's undo is not
+        // owed and the flag must not outlive its sequence.
+        app.preset_picker_open = PresetPickerOpen::None;
         app.toast(ToastKind::Danger, format!("{target} is gone"));
         return;
     };
@@ -18499,7 +25835,7 @@ fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::prese
     if !leaves.is_empty() {
         app.open_modal(Modal::PresetApply(PresetApplyForm {
             target,
-            preset: preset.name.clone(),
+            preset: preset.clone(),
             message,
             replaces,
             leaves,
@@ -18512,13 +25848,13 @@ fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::prese
             detail: Some(format!("replaces {}.", replaces.join(", "))),
             choice: false,
             scroll: ConfirmScroll::default(),
-            on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name.clone(), replaces),
+            on_confirm: ConfirmAction::ApplyPresetOver(target, preset.clone(), replaces),
         }));
     } else {
         apply_preset_to(
             app,
             &target,
-            &preset.name,
+            preset,
             crate::presets::Leftover::Keep,
             &[],
             &[],
@@ -18538,23 +25874,39 @@ fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::prese
 /// `+ new` the result lands in the draft's input buffers and is committed when
 /// the create form fires.
 ///
-/// The preset is re-read here rather than carried from the picker: a confirm can
-/// sit open across an edit to the store, and what the user confirmed was a NAME.
-/// The account's own api key is preserved — a template names an endpoint, never
-/// the credential for one.
+/// The picked row's `builtin` identity travels with it, so the re-read hits the
+/// store that row came from: the saved `qwen` beside the built-in `Qwen`
+/// re-reads the file, never the binary's copy, and a confirm can sit open
+/// across an edit to the store. The account's own api key is preserved — a
+/// template names an endpoint, never the credential for one.
 fn apply_preset_to(
     app: &mut App,
     target: &PresetTarget,
-    preset: &str,
+    preset: &crate::presets::Preset,
     leftover: crate::presets::Leftover,
     replaces: &[&'static str],
     leaves: &[&'static str],
 ) {
-    let Some(preset) = crate::presets::load_preset(preset) else {
-        app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
+    // Re-read the store the picked row came from, never a second lookup by name
+    // alone: `load_preset("qwen")` answers the built-in, so the saved row must
+    // resolve through the disk-only loader.
+    let loaded = if preset.builtin {
+        crate::presets::load_preset(&preset.name)
+    } else {
+        crate::presets::load_saved_preset(&preset.name)
+    };
+    let Some(preset) = loaded else {
+        // The pick sequence ends here with no stamp: clear the flag so it
+        // cannot act on a later, unrelated cancel.
+        app.preset_picker_open = PresetPickerOpen::None;
+        app.toast(
+            ToastKind::Danger,
+            format!("preset '{}' is gone", preset.name),
+        );
         return;
     };
     let Some((base_url, models)) = preset_target_block(app, target) else {
+        app.preset_picker_open = PresetPickerOpen::None;
         app.toast(ToastKind::Danger, format!("{target} is gone"));
         return;
     };
@@ -18564,30 +25916,71 @@ fn apply_preset_to(
     }
     let name = match target {
         PresetTarget::NewAccount => {
+            // The menu offer gates on the same predicate; re-check here so a
+            // pick that raced the type off `claude` stamps nothing rather than
+            // editing fields the form no longer shows.
+            if !new_account_type_is_claude(app) {
+                app.preset_picker_open = PresetPickerOpen::None;
+                app.toast(ToastKind::Danger, "apply preset is for the claude form");
+                return;
+            }
             let selected = config_rows(app).get(app.config_action_cursor).copied();
             stamp_draft_from_preset(app, &preset, leftover);
             if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
                 app.config_action_cursor = pos;
             }
+            // A preset landed, so the pick sequence's open-side effect is done.
+            app.preset_picker_open = PresetPickerOpen::None;
             return;
         }
         PresetTarget::Account(name) => ProfileName::from(name.as_str()),
     };
-    let (new_url, new_models) = preset.applied_to(&base_url, &models, leftover);
-    let repointed = new_url != base_url;
+    // Stamped onto the fields disk holds, never this copy: a field the preset
+    // does not set keeps a peer's edit, and a clear empties only the fields the
+    // confirm named.
+    let cleared: &[&str] = match leftover {
+        crate::presets::Leftover::Keep => &[],
+        crate::presets::Leftover::Clear => leaves,
+    };
+    // Re-checked against the fields as the write re-reads them: a field the
+    // preset replaces that the confirm did not name (a peer filled it after
+    // the check above) asks again. A leftover the confirm did not name is kept
+    // in both modes, so it needs no ask.
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset(&mut cfg, &name, new_url, new_models)
+        edit_profile_preset(&mut cfg, &name, |url, models| {
+            let (fresh_replaces, _) = preset.apply_diff(url.as_deref(), models);
+            if !fresh_replaces.iter().all(|field| replaces.contains(field)) {
+                return Err(anyhow::Error::new(PresetDiffMoved {
+                    base_url: url.clone(),
+                    models: models.clone(),
+                }));
+            }
+            (*url, *models) = preset.applied_clearing(url, models, cleared);
+            Ok(())
+        })
+    };
+    let result = match result {
+        Err(e) => match e.downcast::<PresetDiffMoved>() {
+            Ok(moved) => {
+                if let Some(profile) = app.config().find_mut(&name) {
+                    profile.base_url = moved.base_url;
+                    profile.models = moved.models;
+                }
+                offer_preset_apply(app, target.clone(), &preset);
+                return;
+            }
+            Err(e) => Err(e),
+        },
+        Ok(()) => Ok(()),
     };
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            // A repoint retires the old provider's verdicts — the shared
-            // clear keeps its streak from accusing the new endpoint.
-            if repointed {
-                clear_profile_status_chrome(app, &name);
-            }
-            app.last_reload_fp = reload_fingerprint();
+            // A repoint retires the old provider's verdicts — the drain
+            // forgets the changed halves, keeping the old streak from accusing
+            // the new endpoint. When nothing repointed the drain is a no-op.
+            app.apply_forgets();
             if app.config_draft.is_some() {
                 let selected = config_rows(app).get(app.config_action_cursor).copied();
                 app.config_draft = Some(build_draft_existing(app, &name));
@@ -18600,7 +25993,13 @@ fn apply_preset_to(
                 format!("applied '{}' to '{name}'", preset.name),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "apply preset failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -18654,7 +26053,13 @@ fn save_preset_from(app: &mut App, source: &str, preset: &str) {
     };
     match crate::presets::save_preset(preset, &base_url, &models) {
         Ok(()) => app.toast(ToastKind::Success, format!("saved preset '{preset}'")),
-        Err(e) => app.toast(ToastKind::Danger, format!("save preset failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "save preset failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -18666,67 +26071,65 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
     };
     match result {
         Ok(()) => {
-            app.refresh_tokens();
-            app.last_reload_fp = reload_fingerprint();
-            let idx = app
-                .config()
-                .profiles
-                .iter()
-                .position(|p| p.name == *new_name)
-                .unwrap_or(0);
-            app.profile_cursor = idx;
-            app.config_action_cursor = 0;
-            if app.config_focus == ConfigFocus::Actions {
-                app.config_draft = Some(build_draft_existing(app, new_name));
-            }
+            // A duplicate is a create (the spec's "after any create, claude
+            // included"): the same shared tail as the `+ new` create — lands
+            // Setup on the new row and the Overview's remembered row onto it.
+            finish_created_profile(app, new_name.as_str());
             app.toast(
                 ToastKind::Success,
                 format!("duplicated '{source}' as '{new_name}'"),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("duplicate failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "duplicate failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
-/// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
+/// Set `name`'s `Profile::disabled` flag the way `direction` names (the Setup
+/// `disabled` row and the menu's disable confirm both route here). Inert while
 /// `name` is the active profile or holds a live `clauth start` session — the
 /// same gate `actions::disable_profile` itself enforces, checked here TOO so
 /// the row stays truly inert (silent no-op, matching the dimmed-row rule):
 /// `disable_profile`'s own refusal is a real `bail!`, and without this early
 /// return every press would surface a red danger toast instead of doing
-/// nothing, which is what a dimmed/disabled row is supposed to mean.
+/// nothing, which is what a dimmed/disabled row is supposed to mean. A
+/// direction the account already holds writes nothing and says so.
 /// `disable_profile`/`enable_profile` persist into the live shared
-/// `AppConfig` directly (`app.config()`), so the flip renders next frame with
+/// `AppConfig` directly (`app.config()`), so the flag renders next frame with
 /// no reload round-trip; `refresh_tokens` rebuilds the scheduler's per-profile
 /// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
 /// `is_disabled`) the same way `toggle_auto_start` does, since a per-profile
 /// `config.toml` write doesn't bump the mtime the periodic reload watches.
-fn toggle_profile_disabled(app: &mut App, name: &ProfileName) {
-    let currently_disabled = app.config().find(name).is_some_and(Profile::is_disabled);
+fn toggle_profile_disabled(app: &mut App, name: &ProfileName, direction: DisableDirection) {
     let gated = app.config().is_active(name) || crate::runtime::has_live_session(name);
     if gated {
         return;
     }
     let result = {
         let mut cfg = app.config();
-        if currently_disabled {
-            crate::actions::enable_profile(&mut cfg, name)
-        } else {
-            crate::actions::disable_profile(&mut cfg, name)
+        match direction {
+            DisableDirection::Disable => crate::actions::disable_profile(&mut cfg, name),
+            DisableDirection::Enable => crate::actions::enable_profile(&mut cfg, name),
         }
     };
     match result {
         Ok(true) => {
             app.refresh_tokens();
-            let verb = if currently_disabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            app.toast(ToastKind::Success, format!("{verb} '{name}'"));
+            app.toast(ToastKind::Success, format!("{} '{name}'", direction.verb()));
         }
-        Ok(false) => {}
-        Err(e) => app.toast(ToastKind::Danger, format!("toggle failed\n{e}")),
+        Ok(false) => app.toast(
+            ToastKind::Info,
+            format!("'{name}' is already {}", direction.verb()),
+        ),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("toggle failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
@@ -18739,20 +26142,23 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
     }
     let outcome = {
         let mut cfg = app.config();
-        match cfg.find_mut(name) {
+        match cfg.find(name) {
             None => Outcome::Missing,
             Some(profile) if !profile.is_oauth() => Outcome::NotOAuth,
             Some(profile) => {
-                profile.auto_start = !profile.auto_start;
-                let now_on = profile.auto_start;
-                match save_profile_config(profile) {
-                    Ok(()) => Outcome::Saved(now_on),
-                    Err(e) => {
+                let now_on = !profile.auto_start;
+                match update_profile_config(name, |p| {
+                    p.auto_start = now_on;
+                    Ok(())
+                }) {
+                    Ok(None) => Outcome::Missing,
+                    Ok(Some(_)) => {
                         if let Some(p) = cfg.find_mut(name) {
-                            p.auto_start = !now_on;
+                            p.auto_start = now_on;
                         }
-                        Outcome::SaveFailed(e)
+                        Outcome::Saved(now_on)
                     }
+                    Err(e) => Outcome::SaveFailed(e),
                 }
             }
         }
@@ -18773,7 +26179,160 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
             app.refresh_tokens();
         }
         Outcome::SaveFailed(e) => {
-            app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+        }
+    }
+}
+
+/// Flip `name`'s usage probe onto its `config.toml` re-read under the flock,
+/// mirroring the saved switch into memory; a failed save leaves memory as it
+/// was. The probe leg reads the shared config each tick, so the switch
+/// reaches it without a token-list rebuild.
+fn toggle_usage_probe(app: &mut App, name: &ProfileName) {
+    let saved = {
+        let mut cfg = app.config();
+        let Some(now_on) = cfg.find(name).map(|p| !p.usage_probe) else {
+            return;
+        };
+        match update_profile_config(name, |p| {
+            p.usage_probe = now_on;
+            Ok(())
+        }) {
+            Ok(None) => return,
+            Ok(Some((fresh, ()))) => {
+                if let Some(p) = cfg.find_mut(name) {
+                    p.usage_probe = fresh.usage_probe;
+                }
+                Ok((fresh.usage_probe, fresh.usage_probe_interval_ms))
+            }
+            Err(e) => Err(e),
+        }
+    };
+    match saved {
+        // Off, nothing reads the account any more.
+        Ok((false, _)) => crate::usage::forget_probe_reading(&app.memory_stores(), name),
+        // On, the cached reading comes back at once, as a restart would seed
+        // it, dated at the probe's interval. The later of the held stamp and
+        // the reading's own keeps the cadence and any `retry-after` wait, so
+        // no probe goes out early for it.
+        Ok((true, interval_ms)) => crate::usage::reseed_keeping_cadence(
+            &app.usage_store,
+            &app.usage_status,
+            &app.last_fetched,
+            name,
+            interval_ms,
+        ),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        ),
+    }
+}
+
+/// What one `+`/`-` on the `probe every` row moves the interval by.
+const USAGE_PROBE_STEP_MS: i64 = 30_000;
+
+/// Step the drafted account's probe interval by `delta_ms` from wherever it
+/// stands. It writes the interval alone, never the switch.
+fn step_usage_probe_interval(app: &mut App, delta_ms: i64) {
+    let Some(current) = app.config_draft.as_ref().and_then(|d| {
+        let cfg = app.config();
+        cfg.find(&ProfileName::from(d.editing_name.clone()?))
+            .map(|p| p.usage_probe_interval_ms)
+    }) else {
+        return;
+    };
+    write_usage_probe_interval(app, current.saturating_add_signed(delta_ms));
+}
+
+/// ⏎ on the `probe every` field: whole seconds, an `s` after them allowed,
+/// inside the band the loader keeps the interval in; anything else keeps the
+/// editor open, as `refresh` and `alert at` do.
+fn commit_usage_probe_interval(app: &mut App) -> bool {
+    let raw = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.usage_probe_interval.trimmed().to_string())
+        .unwrap_or_default();
+    let Some(ms) = parse_usage_probe_interval(&raw) else {
+        return false;
+    };
+    write_usage_probe_interval(app, ms)
+}
+
+/// A typed `probe every` value in milliseconds: whole seconds, with or without
+/// a trailing `s`, between [`crate::profile::MIN_USAGE_PROBE_INTERVAL_MS`] and
+/// [`crate::profile::MAX_USAGE_PROBE_INTERVAL_MS`]. `None` = refused.
+pub(crate) fn parse_usage_probe_interval(raw: &str) -> Option<u64> {
+    let secs = raw.strip_suffix('s').unwrap_or(raw).trim();
+    secs.parse::<u64>().ok()?.checked_mul(1000).filter(|ms| {
+        (crate::profile::MIN_USAGE_PROBE_INTERVAL_MS..=crate::profile::MAX_USAGE_PROBE_INTERVAL_MS)
+            .contains(ms)
+    })
+}
+
+/// Persist the drafted account's probe interval clamped into its band,
+/// rolling memory back on a failed save, then reseed the row's buffer from
+/// what was saved.
+fn write_usage_probe_interval(app: &mut App, ms: u64) -> bool {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return false;
+    };
+    let ms = ms.clamp(
+        crate::profile::MIN_USAGE_PROBE_INTERVAL_MS,
+        crate::profile::MAX_USAGE_PROBE_INTERVAL_MS,
+    );
+    // Decided on the profile re-read under the flock, never memory's copy: a
+    // value a peer changed on disk is written back even when memory already
+    // shows the typed one, and an unchanged value writes nothing.
+    let result = {
+        let mut cfg = app.config();
+        match update_profile_config(&name, |p| {
+            p.usage_probe_interval_ms = ms;
+            Ok(())
+        }) {
+            Ok(None) => None,
+            Ok(Some((fresh, ()))) => {
+                if let Some(p) = cfg.find_mut(&name) {
+                    p.usage_probe_interval_ms = fresh.usage_probe_interval_ms;
+                }
+                Some(Ok(()))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    };
+    match result {
+        None => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.active = None;
+            }
+            true
+        }
+        Some(Ok(())) => {
+            let shown = {
+                let cfg = app.config();
+                row_committed_value(cfg.find(&name), &name, ConfigRow::UsageProbeInterval)
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.usage_probe_interval = InputState::new(&shown);
+                d.active = None;
+            }
+            true
+        }
+        Some(Err(e)) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&e.to_string())),
+            );
+            false
         }
     }
 }
@@ -18813,23 +26372,624 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
             ) as u16;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            let is_preset = matches!(&state.on_confirm, ConfirmAction::ApplyPresetOver(..));
+            app.pop_modal();
+            if is_preset {
+                undo_preset_picker_open(app);
+            }
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let confirmed = state.choice;
             let action = state.on_confirm.clone();
-            app.modals.pop();
+            let is_preset = matches!(&action, ConfirmAction::ApplyPresetOver(..));
+            app.pop_modal();
             if confirmed {
                 run_confirm_action(app, action);
+            } else if is_preset {
+                undo_preset_picker_open(app);
             }
         }
         _ => {}
     }
 }
 
+/// The loss warning's grammar over its buttons: `←`/`→` step and stop at the
+/// ends, `tab`/`⇧tab` wrap, `↵` chooses, `esc`/`q` = `go back`. `discard`
+/// drops the warned work, `save` validates then commits it, and whichever lands
+/// performs the switch or quit that opened the warning.
+fn handle_loss_warning_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::LossWarning(state)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Left => {
+            state.focus = step_loss_button(state.focus, state.drop.saveable(), -1);
+        }
+        KeyCode::Right => {
+            state.focus = step_loss_button(state.focus, state.drop.saveable(), 1);
+        }
+        KeyCode::Tab => {
+            state.focus = wrap_loss_button(state.focus, state.drop.saveable(), 1);
+        }
+        KeyCode::BackTab => {
+            state.focus = wrap_loss_button(state.focus, state.drop.saveable(), -1);
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.pop_modal();
+        }
+        KeyCode::Enter => {
+            let focus = state.focus;
+            let target = state.target.clone();
+            let dirty = state.drop.dirty.clone();
+            app.pop_modal();
+            match focus {
+                LossWarningButton::GoBack => {}
+                LossWarningButton::Discard => {
+                    discard_dirty(app, &dirty);
+                    // A quit goes through the one quit function, so it holds on
+                    // an in-flight field save and never exits under a running
+                    // write; a switch keeps running behind the switch.
+                    resolve_target(app, target);
+                }
+                LossWarningButton::Save => {
+                    let _ = try_save_all(app, &dirty, target);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Step the highlighted button one position left (-1) or right (1), stopping at
+/// the ends. `[go back, discard]` with nothing to save, `[go back, discard,
+/// save]` otherwise.
+fn step_loss_button(focus: LossWarningButton, saveable: bool, dir: i8) -> LossWarningButton {
+    let idx = loss_button_index(focus);
+    let count = loss_button_count(saveable);
+    let next = if dir < 0 {
+        idx.saturating_sub(1)
+    } else {
+        (idx + 1).min(count - 1)
+    };
+    loss_button_at(next)
+}
+
+/// Wrap the highlighted button forward (1) or backward (-1).
+fn wrap_loss_button(focus: LossWarningButton, saveable: bool, dir: i8) -> LossWarningButton {
+    let idx = loss_button_index(focus);
+    let count = loss_button_count(saveable);
+    let next = if dir < 0 {
+        (idx + count - 1) % count
+    } else {
+        (idx + 1) % count
+    };
+    loss_button_at(next)
+}
+
+fn loss_button_count(saveable: bool) -> usize {
+    if saveable { 3 } else { 2 }
+}
+
+fn loss_button_index(focus: LossWarningButton) -> usize {
+    match focus {
+        LossWarningButton::GoBack => 0,
+        LossWarningButton::Discard => 1,
+        LossWarningButton::Save => 2,
+    }
+}
+
+fn loss_button_at(index: usize) -> LossWarningButton {
+    match index {
+        0 => LossWarningButton::GoBack,
+        1 => LossWarningButton::Discard,
+        _ => LossWarningButton::Save,
+    }
+}
+
+/// The tab a switch-form target lands on.
+fn target_tab(target: &LossWarningTarget) -> Tab {
+    match target {
+        LossWarningTarget::Switch(tab) => *tab,
+        LossWarningTarget::ShuntCard(_) => Tab::Services,
+        LossWarningTarget::NewAccount
+        | LossWarningTarget::EditAccount(_)
+        | LossWarningTarget::MintForm(_) => Tab::Setup,
+        LossWarningTarget::Quit => Tab::Overview,
+    }
+}
+
+/// A cross-screen jump's entry: disarm, warn over changed work on the screen
+/// being left (with the jump's own landing as the target), else land.
+fn request_target(app: &mut App, target: LossWarningTarget) {
+    if app.loss_pending.is_some() {
+        return;
+    }
+    disarm_switch(app);
+    if app.tab == target_tab(&target) {
+        resolve_target(app, target);
+        return;
+    }
+    let dirty = changed_work_on(app, app.tab);
+    if !dirty.is_empty() {
+        open_loss_warning(app, target, dirty);
+        return;
+    }
+    if in_flight_shunt_edit_save(app) {
+        app.loss_pending = Some(target);
+        return;
+    }
+    resolve_target(app, target);
+}
+
+/// Resolve the landing the warning's buttons answered.
+fn resolve_target(app: &mut App, target: LossWarningTarget) {
+    match target {
+        LossWarningTarget::Switch(tab) => do_switch(app, tab),
+        LossWarningTarget::Quit => quit_or_wait(app),
+        LossWarningTarget::ShuntCard(focus) => land_shunt_card(app, focus),
+        LossWarningTarget::NewAccount => land_new_account(app),
+        LossWarningTarget::EditAccount(item) => land_edit_account(app, item),
+        LossWarningTarget::MintForm(require) => open_new_profile_form_inner(app, require),
+    }
+}
+
+/// Drop every changed item as its `esc` would (the open edit closes, the
+/// `+ new` form is dropped whole, a shunt `+ add` draft is folded).
+fn discard_dirty(app: &mut App, dirty: &[Dirty]) {
+    for d in dirty.iter().cloned() {
+        match d {
+            Dirty::SetupField => {
+                if let Some(field) = app.config_draft.as_ref().and_then(|d| d.active) {
+                    cancel_config_edit(app, field);
+                }
+            }
+            Dirty::NewAccountForm => {
+                if app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.editing_name.is_none())
+                {
+                    app.config_draft = None;
+                }
+                app.new_account_draft = None;
+                app.config_focus = ConfigFocus::Profiles;
+            }
+            Dirty::FallbackField => app.fallback_edit = None,
+            Dirty::RefreshInterval => app.refresh_interval_draft = None,
+            Dirty::ContextNudge => app.context_nudge_draft = None,
+            Dirty::WeeklyThreshold => app.weekly_threshold_draft = None,
+            Dirty::HerdrTag => app.services.herdr_tag_draft = None,
+            Dirty::ShuntField(_) => app.services.shunt_field_edit = None,
+            Dirty::ShuntAdd(kind) => {
+                app.services.shunt_drafts.fold(kind);
+                close_draft_editor_if_open(app, kind);
+            }
+            Dirty::Note => app.note_editor = None,
+        }
+    }
+}
+
+/// Run a loss-warning `save`: validate every saveable changed item (a refusal
+/// runs that item's own `↵`, so its own toast or `└` sentence says why and
+/// nothing commits), detect a commit whose `↵` opens a further dialog, then
+/// commit the rest through their own `↵` paths and resolve the target only once
+/// every commit landed. An async shunt item beside any other changed item
+/// commits the instant (sync) items, lands an open `+ add` draft-field editor
+/// into its in-memory draft, and opens the first async item for its own `↵`; a
+/// lone async item starts and holds, re-running the gate on landing and
+/// cancelling on refusal. A set of only sync items commits them and resolves
+/// the target (a quit entering the exit wait for a running write instead of
+/// exiting); a sync set beside the `+ new` form commits the saveable items and
+/// reopens the two-button warning for the rest. Returns `true` when every item
+/// committed and the target resolved, `false` when a hold, refusal or further
+/// dialog stopped it.
+fn try_save_all(app: &mut App, dirty: &[Dirty], target: LossWarningTarget) -> bool {
+    // A field or `+ add` save already in flight owns the one worker but is not
+    // changed work (it rode in no `dirty` list): commit nothing yet, hold the
+    // target, and re-run the save over the warned items still changed when it
+    // lands, or the gate when anything outside them changed.
+    if in_flight_shunt_edit_save(app) {
+        app.loss_pending = Some(target);
+        app.loss_pending_sync = Some(LossPendingSync::RerunSave(dirty.to_vec()));
+        return false;
+    }
+    // Validate first so a commit-time refusal is only an I/O failure; a refusal
+    // runs the item's own ↵ path, which raises its own toast or `└` sentence
+    // and commits nothing.
+    for d in dirty.iter().cloned() {
+        if d.saveable() && !validate_dirty(app, d.clone()) {
+            focus_dirty(app, d.clone());
+            if let Dirty::ShuntAdd(kind) = d
+                && app.services.shunt_field_edit.as_ref().is_none_or(|state| {
+                    matches!(&state.key, ShuntFieldKey::Draft { kind: k, .. } if *k == kind)
+                })
+            {
+                app.services.focus = ServicesFocus::Detail;
+                app.services
+                    .set_shunt_focus(Some(ShuntFocusLine::SaveAdd(kind)));
+            }
+            let _ = commit_dirty(app, d);
+            return false;
+        }
+    }
+    // A commit that opens a further dialog stops the save before anything
+    // commits; that item's own ↵ runs and opens the dialog.
+    for d in dirty.iter().cloned() {
+        if d.saveable() && commit_opens_dialog(app, d.clone()) {
+            let _ = commit_dirty(app, d);
+            return false;
+        }
+    }
+    let (saveable, unsaveable): (Vec<Dirty>, Vec<Dirty>) =
+        dirty.iter().cloned().partition(|d| d.saveable());
+    let async_items: Vec<Dirty> = saveable
+        .iter()
+        .filter(|d| dirty_is_async(d))
+        .cloned()
+        .collect();
+    let sync_items: Vec<Dirty> = saveable
+        .iter()
+        .filter(|d| !dirty_is_async(d))
+        .cloned()
+        .collect();
+    // An async shunt item beside any other changed item (a sync item, the
+    // unsaveable `+ new` form, or a second async item) shares the one save
+    // worker: the instant (sync) items commit, no shunt save starts, and the
+    // first async item (screen order) opens for its own `↵`.
+    let mixed = !async_items.is_empty()
+        && (async_items.len() > 1 || !sync_items.is_empty() || !unsaveable.is_empty());
+    if mixed {
+        // Commit every instant (sync) item, then hand the keyboard to the first
+        // async item. A refusal or dialog here stops the save (the validate and
+        // dialog pre-checks already ran over the whole saveable set).
+        for d in sync_items.iter().cloned() {
+            match commit_dirty(app, d.clone()) {
+                CommitResult::Landed | CommitResult::AsyncStarted => {}
+                CommitResult::Refused => {
+                    focus_dirty(app, d);
+                    return false;
+                }
+                CommitResult::Dialog => return false,
+            }
+        }
+        land_open_draft_editor(app);
+        if let Some(first) = async_items.first() {
+            close_unchanged_services_editors(app, first);
+            focus_shunt_item(app, first.clone());
+        }
+        return false;
+    }
+    if !unsaveable.is_empty() {
+        // No async item here: commit every saveable sync item, then the
+        // two-button form reopens for the rest (the `+ new` form, which only
+        // `discard` or `go back` settles).
+        for d in sync_items.iter().cloned() {
+            match commit_dirty(app, d.clone()) {
+                CommitResult::Landed | CommitResult::AsyncStarted => {}
+                CommitResult::Refused => {
+                    focus_dirty(app, d);
+                    return false;
+                }
+                CommitResult::Dialog => return false,
+            }
+        }
+        open_loss_warning(app, target, unsaveable);
+        return false;
+    }
+    // A lone async item starts and holds: the gate re-runs on landing, a
+    // refusal cancels the trigger and leaves the item open with its own `└`
+    // sentence.
+    if let Some(async_item) = async_items.first().cloned() {
+        match commit_dirty(app, async_item.clone()) {
+            CommitResult::AsyncStarted => {
+                app.loss_pending = Some(target);
+                app.loss_pending_sync = Some(LossPendingSync::CancelOnRefusal);
+                return false;
+            }
+            CommitResult::Refused => {
+                focus_dirty(app, async_item);
+                return false;
+            }
+            CommitResult::Landed => {}
+            CommitResult::Dialog => return false,
+        }
+    }
+    for d in sync_items.iter().cloned() {
+        match commit_dirty(app, d.clone()) {
+            CommitResult::Landed => {}
+            CommitResult::AsyncStarted => {}
+            CommitResult::Refused => {
+                focus_dirty(app, d);
+                return false;
+            }
+            CommitResult::Dialog => return false,
+        }
+    }
+    // A quit resolves through the one quit function, so it never exits under a
+    // running shunt-card write; a switch resolves straight through.
+    resolve_target(app, target);
+    true
+}
+
+/// Whether a changed item's own `↵` path accepts it — the same predicate the
+/// `↵` path refuses on, so a `save` can never commit what the field's own ⏎
+/// would refuse.
+fn validate_dirty(app: &App, dirty: Dirty) -> bool {
+    match dirty {
+        Dirty::SetupField => setup_field_valid(app),
+        Dirty::FallbackField => fallback_field_valid(app),
+        Dirty::RefreshInterval => app
+            .refresh_interval_draft
+            .as_ref()
+            .is_some_and(|d| parse_refresh_secs(d.input.trimmed()).is_some()),
+        Dirty::ContextNudge => app
+            .context_nudge_draft
+            .as_ref()
+            .is_some_and(|d| parse_context_nudge_tokens(d.input.trimmed()).is_some()),
+        Dirty::WeeklyThreshold => app
+            .weekly_threshold_draft
+            .as_ref()
+            .is_some_and(|d| parse_weekly_pct(d.input.trimmed()).is_some()),
+        Dirty::HerdrTag => app
+            .services
+            .herdr_tag_draft
+            .as_ref()
+            .is_some_and(|d| parse_herdr_tag_secs(d.input.trimmed()).is_some()),
+        Dirty::ShuntField(_) => shunt_field_valid(app),
+        Dirty::ShuntAdd(kind) => shunt_add_valid(app, kind),
+        Dirty::Note | Dirty::NewAccountForm => true,
+    }
+}
+
+/// Whether a changed item's `↵` path opens a further dialog instead of
+/// committing: an env-key collision, a shunt rename cascade, or a bind
+/// restart. The save's dialog pre-check reads this before anything commits.
+fn commit_opens_dialog(app: &App, dirty: Dirty) -> bool {
+    match dirty {
+        Dirty::SetupField => setup_field_opens_dialog(app),
+        Dirty::ShuntField(_) => app
+            .services
+            .shunt_field_edit
+            .as_ref()
+            .is_some_and(|state| shunt_field_confirm(app, state).is_some()),
+        _ => false,
+    }
+}
+
+/// Whether a changed item commits through the one async save worker: a shunt
+/// `+ add` draft, or a real shunt field (a draft field commits in memory, never
+/// the worker). Two such items cannot save together.
+fn dirty_is_async(dirty: &Dirty) -> bool {
+    match dirty {
+        Dirty::ShuntAdd(_) => true,
+        // A `ShuntField` only ever carries a real field key (a draft field's
+        // editor is its kind's `ShuntAdd` work), so it always commits through
+        // the one async save worker.
+        Dirty::ShuntField(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether the open Setup field's `↵` path accepts its buffer — the same
+/// refusals the field's own ⏎ raises (the bell range, a bad name, an env key
+/// with a space or `=`).
+fn setup_field_valid(app: &App) -> bool {
+    let Some(d) = app.config_draft.as_ref() else {
+        return true;
+    };
+    let Some(field) = d.active else {
+        return true;
+    };
+    match field {
+        ConfigRow::BellThreshold => parse_bell_threshold(d.bell_threshold.trimmed()).is_some(),
+        ConfigRow::UsageProbeInterval => {
+            parse_usage_probe_interval(d.usage_probe_interval.trimmed()).is_some()
+        }
+        ConfigRow::Name => {
+            let old = d.editing_name.clone();
+            let new = d.name.trimmed().to_string();
+            if let Some(old) = old
+                && new != old
+            {
+                validate_profile_name(&new, Harness::Claude, Some(old.as_str())).is_ok()
+            } else {
+                true
+            }
+        }
+        ConfigRow::EnvAdd => {
+            let key = d.env_new_key.trimmed();
+            // An empty key closes the editor (a no-op commit), never refuses.
+            !(key.contains(char::is_whitespace) || key.contains('='))
+        }
+        _ => true,
+    }
+}
+
+/// Whether the open Setup field's `↵` opens the env-collision dialog.
+fn setup_field_opens_dialog(app: &App) -> bool {
+    let Some(d) = app.config_draft.as_ref() else {
+        return false;
+    };
+    if d.active != Some(ConfigRow::EnvAdd) {
+        return false;
+    }
+    let Some(name) = d.editing_name.clone() else {
+        return false;
+    };
+    let key = d.env_new_key.trimmed().to_string();
+    if key.is_empty() || key.contains(char::is_whitespace) || key.contains('=') {
+        return false;
+    }
+    let base_env_keys = claude_settings_env_keys().unwrap_or_default();
+    let cfg = app.config();
+    cfg.find(&ProfileName::from(name.as_str()))
+        .and_then(|p| classify_env_key(p, &base_env_keys, &key))
+        .is_some()
+}
+
+/// Whether the Fallback member-card field's `↵` path accepts its buffer.
+fn fallback_field_valid(app: &App) -> bool {
+    let Some(edit) = app.fallback_edit.as_ref() else {
+        return true;
+    };
+    match &edit.state {
+        CardEdit::Threshold(input) => parse_threshold(input.trimmed()).is_some(),
+        CardEdit::Weekly(input) => parse_weekly_override(input.trimmed()).is_some(),
+        CardEdit::MaxSpend(input) => parse_max_spend(input.trimmed()).is_some(),
+        CardEdit::Days(_) | CardEdit::ArmedRemove => true,
+    }
+}
+
+/// Whether the shunt field editor's `↵` path can build its edit. A draft field
+/// always commits; a real field's edit must build (a rename's cascade dry run
+/// is the one further refusal, resolved by the commit itself).
+fn shunt_field_valid(app: &App) -> bool {
+    let Some(state) = app.services.shunt_field_edit.as_ref() else {
+        return true;
+    };
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        return true;
+    }
+    let typed = match &state.edit {
+        ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+        ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
+    };
+    let Some(view) = config_view(app).cloned() else {
+        return false;
+    };
+    edit_for_field(&view, &state.key, &typed).is_some()
+}
+
+/// The `+ add` drafts with the open draft field editor's uncommitted buffer
+/// folded in, so validation reads the text the editor holds, not just the
+/// committed draft.
+fn drafts_with_open_editor(app: &App) -> ShuntDrafts {
+    let mut drafts = app.services.shunt_drafts.clone();
+    if let Some(state) = app.services.shunt_field_edit.as_ref()
+        && let ShuntFieldKey::Draft { kind, field } = &state.key
+    {
+        let value = match &state.edit {
+            ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+            ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
+        };
+        set_draft_field_value(&mut drafts, *kind, field, &value);
+    }
+    drafts
+}
+
+/// Whether a shunt `+ add` draft's own `save <kind>` path accepts it: the add
+/// must build (a required field left blank refuses). The open draft field
+/// editor's uncommitted buffer counts, so a name held only in the open editor
+/// passes.
+fn shunt_add_valid(app: &App, kind: ShuntAddKind) -> bool {
+    let Some(view) = config_view(app) else {
+        return false;
+    };
+    matches!(
+        build_add_edit(view, &drafts_with_open_editor(app), kind),
+        AddDraft::Edit(_)
+    )
+}
+
+/// Commit one changed item through its own `↵` path.
+fn commit_dirty(app: &mut App, dirty: Dirty) -> CommitResult {
+    match dirty {
+        Dirty::SetupField => {
+            if let Some(field) = app.config_draft.as_ref().and_then(|d| d.active) {
+                commit_config_field(app, field)
+            } else {
+                CommitResult::Refused
+            }
+        }
+        Dirty::FallbackField => CommitResult::from(commit_member_field(app)),
+        Dirty::RefreshInterval => CommitResult::from(commit_refresh_interval_edit(app)),
+        Dirty::ContextNudge => CommitResult::from(commit_context_nudge_edit(app)),
+        Dirty::WeeklyThreshold => CommitResult::from(commit_weekly_threshold_edit(app)),
+        Dirty::HerdrTag => CommitResult::from(commit_herdr_tag_edit(app)),
+        Dirty::ShuntField(_) => commit_shunt_field(app),
+        Dirty::ShuntAdd(kind) => {
+            // Land the open draft field first: its uncommitted buffer is the
+            // typed work the save must read, then run the draft's own save.
+            if let Some(state) = app.services.shunt_field_edit.clone()
+                && let ShuntFieldKey::Draft { kind: k, .. } = &state.key
+                && *k == kind
+                && shunt_edit_dirty(&state.edit)
+            {
+                let _ = commit_shunt_field(app);
+            }
+            commit_shunt_add(app, kind)
+        }
+        Dirty::Note => CommitResult::from(commit_note(app)),
+        Dirty::NewAccountForm => CommitResult::Landed,
+    }
+}
+
+/// Land on the first failing item's screen so its invalid-input treatment is
+/// visible; the item is the open edit itself, so no reopen is needed.
+fn focus_dirty(app: &mut App, dirty: Dirty) {
+    let screen = dirty.screen();
+    if screen != app.tab {
+        do_switch(app, screen);
+    }
+}
+
+/// Land an open `+ add` draft-field editor into its in-memory draft (the
+/// `commit_shunt_field` draft arm writes memory only, no file): the mixed
+/// save's opened async item must own the keyboard, and an open draft editor
+/// would keep claiming it. A real field editor (a changed `ShuntField`) stays
+/// open.
+fn land_open_draft_editor(app: &mut App) {
+    let Some(state) = app.services.shunt_field_edit.clone() else {
+        return;
+    };
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        let _ = commit_shunt_field(app);
+    }
+}
+
+/// Close the unchanged Services editors the mixed save does not open: a clean
+/// herdr tag editor, and a clean shunt field editor whose key is not the first
+/// item's own (nothing is lost — both read their unchanged value).
+fn close_unchanged_services_editors(app: &mut App, first: &Dirty) {
+    if app
+        .services
+        .herdr_tag_draft
+        .as_ref()
+        .is_some_and(|d| !d.dirty())
+    {
+        app.services.herdr_tag_draft = None;
+    }
+    let close_field = app.services.shunt_field_edit.as_ref().is_some_and(|state| {
+        !shunt_edit_dirty(&state.edit)
+            && !matches!(first, Dirty::ShuntField(key) if *key == state.key)
+            && !app.services.saving(&ShuntSaveKey::Field(state.key.clone()))
+    });
+    if close_field {
+        app.services.shunt_field_edit = None;
+    }
+}
+
+/// Open an async shunt item for its own `↵`: a field keeps its open editor
+/// (typed text intact); a `+ add` draft lands focus on the Services detail
+/// pane's own `save <kind>` row, switching to Services first when needed.
+fn focus_shunt_item(app: &mut App, item: Dirty) {
+    match item {
+        Dirty::ShuntAdd(kind) => {
+            if app.tab != Tab::Services {
+                do_switch(app, Tab::Services);
+            }
+            select_shunt_check(app);
+            app.services.focus = ServicesFocus::Detail;
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::SaveAdd(kind)));
+        }
+        other => focus_dirty(app, other),
+    }
+}
+
 /// Keys on the apply-preset keep / clear confirm: the confirm's grammar over
-/// three buttons. `←`/`→` step and stop at either end, `tab` wraps, `↵`/space
-/// choose, esc/q cancel; `↑`/`↓` and the page keys scroll the body.
+/// three buttons. `←`/`→` step and stop at either end, `tab` wraps, `↵`
+/// chooses, esc/q cancel; `↑`/`↓` and the page keys scroll the body.
 fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
     use PresetApplyButton::{Cancel, Clear, Keep};
     let Some(Modal::PresetApply(form)) = app.modals.last_mut() else {
@@ -18877,9 +27037,10 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
             ) as u16;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
+            undo_preset_picker_open(app);
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let leftover = match form.focus {
                 Cancel => None,
                 Keep => Some(crate::presets::Leftover::Keep),
@@ -18887,12 +27048,186 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
             };
             let (target, preset) = (form.target.clone(), form.preset.clone());
             let (replaces, leaves) = (form.replaces.clone(), form.leaves.clone());
-            app.modals.pop();
+            app.pop_modal();
             if let Some(leftover) = leftover {
                 apply_preset_to(app, &target, &preset, leftover, &replaces, &leaves);
+            } else {
+                undo_preset_picker_open(app);
             }
         }
         _ => {}
+    }
+}
+
+/// Keys on the re-bind confirm. `↑`/`↓` walk the account toggle lines, `space`
+/// flips the one under the cursor, `←`/`→` pick the button, `PageUp`/`PageDown`
+/// page the cursor through the published geometry. `⏎` runs the highlighted
+/// button; `esc`/`q` are `not now`.
+fn handle_rebind_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::Rebind(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let total = form.account_count();
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+            form.choice = !form.choice;
+        }
+        KeyCode::Up => {
+            if total > 0 {
+                form.cursor = (form.cursor + total - 1) % total;
+            }
+        }
+        KeyCode::Down => {
+            if total > 0 {
+                form.cursor = (form.cursor + 1) % total;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some((bi, ai)) = form.account_at(form.cursor) {
+                form.checked[bi][ai] = !form.checked[bi][ai];
+            }
+        }
+        KeyCode::PageUp => {
+            let next = {
+                let starts = form.starts.borrow();
+                let block_ends = form.block_ends.borrow();
+                page_up_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &block_ends,
+                    &[],
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            };
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let next = {
+                let starts = form.starts.borrow();
+                let block_ends = form.block_ends.borrow();
+                page_down_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &block_ends,
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            };
+            form.cursor = next;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            let form = form.clone();
+            app.pop_modal();
+            store_rebind_digest(app, &form.digest);
+        }
+        KeyCode::Enter => {
+            let apply = form.choice;
+            let form = form.clone();
+            app.pop_modal();
+            if apply {
+                apply_rebind(app, form);
+            } else {
+                store_rebind_digest(app, &form.digest);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Store the current digest and mirror it into the in-memory state, so the
+/// running session reads the value it just stored; `cfg.state` is replaced by
+/// the next fresh save, and only the mirror keeps this process's view current
+/// until then. A failed store raises the house `save failed` toast and leaves
+/// memory unset — the confirm re-offers next launch.
+fn store_rebind_digest(app: &mut App, digest: &str) {
+    match crate::actions::store_preset_binds_offered(digest.to_string()) {
+        Ok(()) => {
+            let mut cfg = app.config();
+            cfg.state.preset_binds_offered = Some(digest.to_string());
+        }
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
+    }
+}
+
+/// Write the checked accounts through the per-account model write path. The
+/// digest is stored only when every checked account wrote; a failure is a
+/// danger toast naming the account. On a partial failure the moved toast (if
+/// any rows moved) precedes the failure toasts, mirroring the CLI's order.
+/// `apply` with every account unchecked behaves exactly like `not now`: the
+/// digest is stored and nothing is toasted.
+fn apply_rebind(app: &mut App, form: RebindForm) {
+    let moves = form.checked_moves();
+    if moves.is_empty() {
+        store_rebind_digest(app, &form.digest);
+        return;
+    }
+    let (rows, moved_accounts, failed) = {
+        let mut cfg = app.config();
+        let mut rows = 0usize;
+        let mut moved_accounts = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for (name, mvs) in &moves {
+            let pname = ProfileName::from(name.clone());
+            match crate::actions::apply_rebind_account(&mut cfg, &pname, mvs) {
+                Ok(applied) => {
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                }
+                Err(e) => {
+                    let (applied, err) =
+                        match e.downcast::<crate::actions::RebindSavedBeforeFailure>() {
+                            Ok(saved) => (saved.applied, saved.error),
+                            Err(e) => (0, e),
+                        };
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                    failed.push((name.clone(), format!("{err:#}")));
+                }
+            }
+        }
+        (rows, moved_accounts, failed)
+    };
+    if failed.is_empty() {
+        store_rebind_digest(app, &form.digest);
+        if rows == 0 {
+            return;
+        }
+        app.toast(
+            ToastKind::Success,
+            format!(
+                "moved {} onto the built-in preset models",
+                crate::presets::rows_on_accounts(rows, moved_accounts)
+            ),
+        );
+        app.apply_forgets();
+    } else {
+        // The rows that did move are reported first, then each failure.
+        if rows > 0 {
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "moved {} onto the built-in preset models",
+                    crate::presets::rows_on_accounts(rows, moved_accounts)
+                ),
+            );
+            app.apply_forgets();
+        }
+        for (name, err) in failed {
+            app.toast(
+                ToastKind::Danger,
+                format!("re-bind failed for '{name}'\n{err}"),
+            );
+        }
     }
 }
 
@@ -18929,17 +27264,35 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
             // lie, so the notes surface verbatim.
             app.toast(
                 ToastKind::Warning,
-                format!("herdr's config needs attention\n{}", notes.join("\n")),
+                format!(
+                    "herdr's config needs attention\n{}",
+                    stderr_display_lines(&notes.join("\n")).join("\n")
+                ),
             );
             recompute_services_checks(app, false, ShuntRefresh::Keep);
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            diagnostic_toast_body("herdr config fix failed", &error_toast_detail(&e)),
+        ),
     }
 }
 
 /// The detail line of a shunt-card confirm whose adopted record vanished
 /// before the yes.
 const NO_ADOPTED_CONFIG: &str = "no shunt config is adopted any more";
+
+/// Make the account an AdoptDivergence overwrite just wrote active. The
+/// activation runs in its own hold, so it re-checks the id there: a delete or
+/// rename landing after the overwrite's hold released must refuse the
+/// activation rather than write an off-roster marker.
+fn activate_adopted(cfg: &mut AppConfig, name: &ProfileName, account: &ProfileId) -> Result<()> {
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        update_app_state(|s, held| s.set_active(Some(name.clone()), held))
+            .map(|state| cfg.state = state)
+    })
+}
 
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
@@ -18950,84 +27303,184 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 from_divergence,
             }));
         }
-        ConfirmAction::CaptureOverwrite(snapshot, name, from_divergence) => {
+        ConfirmAction::CaptureOverwrite(snapshot, name, account, from_divergence) => {
+            // The overwrite relinks the live slot when the profile is or
+            // becomes the active one, a divergence's capture always (it
+            // deactivates the prior one first). Settled before that detach,
+            // so a held overwrite has changed nothing.
+            let relinks = from_divergence.is_some() || {
+                let cfg = app.config();
+                cfg.is_active(&ProfileName::from(name.as_str()))
+                    || cfg.state.active_profile.is_none()
+            };
+            let _placed = if relinks {
+                let Some(placed) = bare_item_gate(
+                    app,
+                    BareItemWrite::CaptureOverwrite {
+                        snapshot: snapshot.clone(),
+                        name: name.clone(),
+                        account: account.clone(),
+                        from_divergence: from_divergence.clone(),
+                    },
+                ) else {
+                    return;
+                };
+                Some(placed)
+            } else {
+                None
+            };
             // Same deferred detach as the non-colliding path: only disown the
             // prior active profile once the overwrite is actually confirmed,
             // so a cancel (handled entirely by `handle_confirm_key` popping
-            // without calling this) leaves it untouched.
-            if from_divergence {
-                let _ = detach_credentials_link();
-                let mut cfg = app.config();
-                let _ = with_state_lock(|held| {
-                    cfg.state.set_active(None, held);
-                    save_app_state(&cfg.state)
-                });
-            }
+            // without calling this) leaves it untouched. The writer disowns it
+            // after its id check, so a refused overwrite leaves it untouched too.
             let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
-                overwrite_captured_profile(&mut cfg, &name, *snapshot)
+                match &from_divergence {
+                    Some(from) => while_divergence_stands(
+                        &mut cfg,
+                        &ProfileName::from(from.as_str()),
+                        *snapshot,
+                        |cfg, snapshot| {
+                            crate::actions::overwrite_captured_profile_held(
+                                cfg, &name, &account, snapshot, true,
+                            )
+                        },
+                    )
+                    .map(|outcome| {
+                        outcome.map(|oauth_moved| {
+                            if oauth_moved {
+                                crate::usage::expire_profile_ttl(&name);
+                            }
+                        })
+                    }),
+                    None => crate::actions::overwrite_captured_profile_with(
+                        &mut cfg, &name, &account, *snapshot, false,
+                    )
+                    .map(Ok),
+                }
             };
             match result {
-                Ok(()) => {
+                Ok(Err(moved)) => {
+                    let from = from_divergence.unwrap_or_default();
+                    app.toast(ToastKind::Warning, moved.skipped("overwrite", &from));
+                }
+                Ok(Ok(())) => {
                     app.refresh_tokens();
-                    clear_profile_status_chrome(app, &name);
-                    app.last_reload_fp = reload_fingerprint();
+                    app.apply_forgets();
                     app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("overwrote '{name}' with the captured login"),
                     );
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("overwrite failed\n{e}")),
+                Err(e) => match chain_held_skipped("overwrite", &e) {
+                    Some(skipped) => app.toast(ToastKind::Warning, skipped),
+                    None => app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "overwrite failed\n{}",
+                            escape_control(&error_toast_detail(&e))
+                        ),
+                    ),
+                },
             }
         }
-        ConfirmAction::AdoptDivergence(snapshot, name) => {
+        ConfirmAction::AdoptDivergence(snapshot, name, account, from) => {
             // `name` is never the active profile (the picker lists only others),
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
             // make it active — the divergence is resolved onto the target.
+            // That relink replaces the bare item, so it settles first.
+            let Some(_placed) = bare_item_gate(
+                app,
+                BareItemWrite::AdoptDivergence {
+                    snapshot: snapshot.clone(),
+                    name: name.clone(),
+                    account: account.clone(),
+                    from: from.clone(),
+                },
+            ) else {
+                return;
+            };
             let name = ProfileName::from(name);
-            // Captured before the activation replaces the marker, through the
-            // one helper that also answers for a CLEARED marker — this arm can
-            // run after a `switch_off` left the departed account's `[env]` in
-            // the live file.
-            let outgoing_env_keys = crate::actions::outgoing_env_keys(&app.config());
+            // The store, the activation and the relink share one hold with the
+            // check that the divergence the prompt showed still stands.
             let result = {
                 let mut cfg = app.config();
-                overwrite_captured_profile(&mut cfg, &name, *snapshot).and_then(|()| {
-                    with_state_lock(|held| {
-                        cfg.state.set_active(Some(name.clone()), held);
-                        save_app_state(&cfg.state)
-                    })
-                })
+                while_divergence_stands(
+                    &mut cfg,
+                    &ProfileName::from(from.as_str()),
+                    *snapshot,
+                    |cfg, snapshot| {
+                        // Captured before the activation replaces the marker,
+                        // through the one helper that also answers for a
+                        // CLEARED marker — this arm can run after a
+                        // `switch_off` left the departed account's `[env]` in
+                        // the live file — plus the keys disk holds for the
+                        // account it names active.
+                        let keys = crate::actions::outgoing_env_keys_now(cfg)?;
+                        let oauth_moved = crate::actions::overwrite_captured_profile_held(
+                            cfg, &name, &account, snapshot, false,
+                        )?;
+                        // This arm activates OUTSIDE `overwrite_captured_profile`,
+                        // so the settings write its own activate arms make has
+                        // to happen here too: an endpoint that never reaches
+                        // `settings.json` routes the live session at Anthropic
+                        // under a profile that says otherwise. In this hold, so
+                        // a peer's switch cannot land between the activation
+                        // and the write and have its settings overwritten. The
+                        // profile as disk holds it: the overwrite mirrored only
+                        // its own fields into memory, and a peer may have
+                        // edited the rest meanwhile.
+                        let activated = activate_adopted(cfg, &name, &account)
+                            .and_then(|()| force_link_profile_credentials(&name))
+                            .and_then(|()| {
+                                let fresh = crate::profile::read_profile(&name)?;
+                                crate::claude::apply_profile_to_claude_settings(&fresh, &keys)
+                            });
+                        Ok((oauth_moved, activated))
+                    },
+                )
             };
-            let result = result
-                .and_then(|()| force_link_profile_credentials(&name))
-                .and_then(|()| {
-                    // This arm activates OUTSIDE `overwrite_captured_profile`,
-                    // so the settings write its own activate arms make has to
-                    // happen here too: an endpoint that never reaches
-                    // `settings.json` routes the live session at Anthropic
-                    // under a profile that says otherwise.
-                    let cfg = app.config();
-                    let Some(profile) = cfg.find(&name) else {
-                        return Ok(());
-                    };
-                    crate::claude::apply_profile_to_claude_settings(profile, &outgoing_env_keys)
-                });
+            #[cfg(test)]
+            run_after_adopt_hold_hook();
+            let result = match result {
+                Ok(Ok((oauth_moved, activated))) => {
+                    // After the hold (the TTL store ranks below the flock),
+                    // whether or not the activation landed: the store moved.
+                    if oauth_moved {
+                        crate::usage::expire_profile_ttl(&name);
+                    }
+                    activated
+                }
+                Ok(Err(moved)) => {
+                    app.toast(ToastKind::Warning, moved.skipped("save", &from));
+                    return;
+                }
+                Err(e) => {
+                    if let Some(skipped) = chain_held_skipped("save", &e) {
+                        app.toast(ToastKind::Warning, skipped);
+                        return;
+                    }
+                    Err(e)
+                }
+            };
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    clear_profile_status_chrome(app, &name);
-                    app.last_reload_fp = reload_fingerprint();
+                    app.apply_forgets();
                     app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("saved the login into '{name}', now active"),
                     );
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+                ),
             }
         }
         ConfirmAction::Switch(name) => {
@@ -19048,7 +27501,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             perform_switch(app, &name);
         }
-        ConfirmAction::DiscardDivergence(name) => run_discard_divergence(app, &name),
+        ConfirmAction::DiscardDivergence(name, seen) => run_discard_divergence(app, &name, seen),
         ConfirmAction::RotateAll => {
             // Refuse if anything is in-flight. Bootstrap is a whole-worker
             // signal separate from per-profile activity; the flag covers the
@@ -19060,12 +27513,34 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 );
                 return;
             }
+            // Stamp every candidate `Refreshing` on the UI thread BEFORE the
+            // worker spawns, so a quit decided before the worker runs still
+            // sees the spend and enters the exit wait. The worker's workers
+            // clear their own slot (via `rotate_one_inner`), so the UI thread
+            // is not an owner of any slot it raised.
+            let snapshots = {
+                let cfg = App::lock_config(&app.config);
+                oauth::rotation_candidates(&cfg, true)
+            };
+            for (name, _) in &snapshots {
+                mark_activity(&app.activity, name, ProfileActivity::Refreshing);
+            }
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
+            let shutting_down = Arc::clone(&app.shutting_down);
             let sender = app.op_sender.clone();
             spawn_worker(move || {
-                let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
+                #[cfg(test)]
+                rotate_worker_gate();
+                let _ = oauth::refresh_all(
+                    &config,
+                    snapshots,
+                    &refetch,
+                    &activity,
+                    Some(shutting_down),
+                    &sender,
+                );
             });
             app.toast(ToastKind::Info, "rotating all tokens");
         }
@@ -19074,10 +27549,13 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // running it: on macOS `rotate_one_inner` refuses, and an unguarded
             // "rotating 'X'" toast would be a success-shaped message for a no-op.
             let name = ProfileName::from(name);
-            if crate::runtime::rotation_blocked_for(&name) {
+            if let Some(block) = crate::runtime::rotation_block_for(&name) {
                 app.toast(
                     ToastKind::Warning,
-                    format!("'{name}' {ROTATE_LIVE_SESSION_MSG}\n{ROTATE_LIVE_SESSION_TOAST}"),
+                    format!(
+                        "{}\n{ROTATE_LIVE_SESSION_TOAST}",
+                        rotate_blocked_message(name.as_str(), block)
+                    ),
                 );
                 return;
             }
@@ -19085,19 +27563,38 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // live session's own refresh, so unlike RotateAll this doesn't need the
             // global any_busy gate — an unacquirable guard surfaces as a Danger
             // toast (contention blocks inside `acquire`, it never lands there).
+            //
+            // Stamp on the UI thread BEFORE the worker spawns so a quit decided
+            // before the worker runs still sees this spend. Residual (accepted):
+            // the marker now spans the worker's blocking `RotationGuard::acquire`
+            // wait, so a quit over a rotate parked behind a foreign holder waits
+            // it out; ⌃c ⌃c still exits.
+            mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
+            let shutting_down = Arc::clone(&app.shutting_down);
             let sender = app.op_sender.clone();
             let target = name.clone();
             spawn_worker(move || {
-                oauth::rotate_one(&config, &target, &refetch, &activity, &sender);
+                #[cfg(test)]
+                rotate_worker_gate();
+                oauth::rotate_one(
+                    &config,
+                    &target,
+                    &refetch,
+                    &activity,
+                    Some(shutting_down.as_ref()),
+                    &sender,
+                );
             });
             app.toast(ToastKind::Info, format!("rotating '{name}'"));
         }
         // Re-checked inside `toggle_profile_disabled`: an account can go active
         // or open a session between arming this confirm and running it.
-        ConfirmAction::DisableOne(name) => toggle_profile_disabled(app, &ProfileName::from(name)),
+        ConfirmAction::DisableOne(name) => {
+            toggle_profile_disabled(app, &ProfileName::from(name), DisableDirection::Disable);
+        }
         ConfirmAction::WireMcpServers => {
             match crate::plugin_probe::wire_mcp_server() {
                 Ok(()) => {
@@ -19105,7 +27602,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     // Reflect the new wiring in the rows without a fresh version probe.
                     recompute_services_checks(app, false, ShuntRefresh::Keep);
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
+                Err(e) => {
+                    app.toast(
+                        ToastKind::Danger,
+                        format!("wire failed\n{}", escape_control(&error_toast_detail(&e))),
+                    );
+                }
             }
         }
         ConfirmAction::HealHerdrConfig(path) => run_herdr_heal(app, &path),
@@ -19114,43 +27616,90 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // the state (the way `install` reads it), so heal writes the row the
             // user just asked for. Cancel never reaches here — the modal pops
             // without running the action.
-            {
-                let mut cfg = app.config();
-                cfg.state.herdr.delegate_row_text = !cfg.state.herdr.delegate_row_text;
-                let _ = save_app_state(&cfg.state);
-            }
-            app.last_reload_fp = reload_fingerprint();
+            let next = !app.config().state.herdr.delegate_row_text;
+            app.save_state_delta(|s, _held| s.herdr.delegate_row_text = next);
+            app.apply_forgets();
             run_herdr_heal(app, &path);
         }
-        ConfirmAction::InstallPlugin => match crate::plugin_host::install() {
-            // A no-op from a row that read "not installed" means the backend
-            // never ran — `claude` not on PATH is the reachable case (agentgear
-            // skips an undetected backend). A green success toast over a
-            // skipped install is a lie, so the warning names it instead.
-            Ok(agentgear::Outcome::NoOp) => {
-                app.toast(
-                    ToastKind::Warning,
-                    "plugin install made no changes\ninstall claude code first, then try again",
-                );
-                recompute_services_checks(app, false, ShuntRefresh::Keep);
-            }
-            // Installed / Repaired / Adopted / Updated, or anything agentgear
-            // adds later: a real change happened, so the success toast is
-            // earned. (`Outcome` is #[non_exhaustive], so the wildcard is the
-            // contract, not a shortcut.)
-            Ok(outcome) => {
-                app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
-                // Reflect the fresh install in the rows without a version probe.
-                recompute_services_checks(app, false, ShuntRefresh::Keep);
-            }
-            Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
+        // Asked at the install itself, never off a cached reading: the
+        // install registers the plugin tree this process's image carries.
+        ConfirmAction::InstallPlugin => match crate::plugin_host::self_exe_change() {
+            Some(change) => app.toast(ToastKind::Warning, own_binary_install_refusal(change)),
+            None => match crate::plugin_host::install() {
+                // A no-op from a row that read "not installed" means the
+                // backend never ran — `claude` not on PATH is the reachable
+                // case (agentgear skips an undetected backend). A green success
+                // toast over a skipped install is a lie, so the warning names
+                // it instead.
+                Ok(agentgear::Outcome::NoOp) => {
+                    app.toast(
+                        ToastKind::Warning,
+                        "plugin install made no changes\ninstall claude code first, then try again",
+                    );
+                    recompute_services_checks(app, false, ShuntRefresh::Keep);
+                }
+                // Installed / Repaired / Adopted / Updated, or anything
+                // agentgear adds later: a real change happened, so the success
+                // toast is earned. (`Outcome` is #[non_exhaustive], so the
+                // wildcard is the contract, not a shortcut.)
+                Ok(outcome) => {
+                    app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
+                    // Reflect the fresh install in the rows without a version
+                    // probe.
+                    recompute_services_checks(app, false, ShuntRefresh::Keep);
+                }
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    diagnostic_toast_body("install failed", &error_toast_detail(&e)),
+                ),
+            },
         },
+        // Asked at the fix itself, never off a cached reading: a replaced image
+        // would write its old emission, not what the installed binary prints.
+        ConfirmAction::Completions { shell, stale } => {
+            match crate::plugin_host::self_exe_change() {
+                Some(change) => app.toast(
+                    ToastKind::Warning,
+                    own_binary_completions_refusal(change, stale),
+                ),
+                None => match crate::completions::install(Some(&shell)) {
+                    Ok(()) => {
+                        app.toast(ToastKind::Success, format!("wrote {shell} completions"));
+                        // The card's own re-probe: the script on disk just changed.
+                        recompute_services_checks(app, false, ShuntRefresh::Keep);
+                    }
+                    Err(e) => app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "{} failed\n{}",
+                            if stale {
+                                "update completions"
+                            } else {
+                                "install completions"
+                            },
+                            escape_control(&error_toast_detail(&e)),
+                        ),
+                    ),
+                },
+            }
+        }
         ConfirmAction::BlankCredentials(name) => {
             let name = ProfileName::from(name);
+            // Logging the active profile out signs the live slot out.
+            let _placed = if app.config().is_active(&name) {
+                let Some(placed) =
+                    bare_item_gate(app, BareItemWrite::BlankCredentials(name.to_string()))
+                else {
+                    return;
+                };
+                Some(placed)
+            } else {
+                None
+            };
             let result = {
                 let mut cfg = app.config();
-                // OAuth accounts drop the token via the shared clearer; API
-                // accounts drop only the api key, keeping the base-url shell.
+                // OAuth accounts drop the whole login; API accounts drop only
+                // the api key, keeping the base-url shell.
                 let is_oauth = cfg.find(&name).map(|p| p.login_is_oauth()).unwrap_or(true);
                 if is_oauth {
                     clear_profile_credentials(&mut cfg, &name)
@@ -19163,23 +27712,38 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     app.refresh_tokens();
                     // No leg ever fetches a keyless profile, so a stale
                     // `[ key rejected ]` verdict would render forever — the
-                    // shared clear retires it with the credential.
-                    clear_profile_status_chrome(app, &name);
-                    app.last_reload_fp = reload_fingerprint();
+                    // drain forgets the changed provider half with the
+                    // credential.
+                    app.apply_forgets();
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("log out failed\n{e}")),
+                Err(e) => {
+                    app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "log out failed\n{}",
+                            escape_control(&error_toast_detail(&e))
+                        ),
+                    );
+                }
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::CaptureOverMintStash(snapshot) => {
-            if stash_new_form_login(app, DraftLogin::LiveLogin(snapshot)) {
+            if matches!(
+                stash_new_form_login(app, DraftLogin::LiveLogin(snapshot)),
+                StashOutcome::Staged
+            ) {
                 app.toast(
                     ToastKind::Success,
                     "current login captured\ncreate account saves it",
                 );
             }
+        }
+        ConfirmAction::CycleAccountType(next) => {
+            cancel_staged_new_login(app);
+            set_account_type(app, next);
         }
         ConfirmAction::DeleteLiveSession(name) => {
             finish_delete(app, &ProfileName::from(name), true)
@@ -19196,10 +27760,37 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 &[],
             );
         }
-        ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
-            Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
-            Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
-        },
+        ConfirmAction::DeletePreset(preset) => {
+            // A built-in has no file to drop; `delete_preset` by its name would
+            // reach a saved file spelled the same.
+            if preset.builtin {
+                toast_builtin_preset(app, &preset.name);
+                return;
+            }
+            // Re-read the saved file, like `apply_preset_to`: one that vanished
+            // since the confirm opened toasts the same gone message and deletes
+            // nothing.
+            let Some(loaded) = crate::presets::load_saved_preset(&preset.name) else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("preset '{}' is gone", preset.name),
+                );
+                return;
+            };
+            match crate::presets::delete_preset(&loaded.name) {
+                Ok(()) => app.toast(
+                    ToastKind::Success,
+                    format!("deleted preset '{}'", loaded.name),
+                ),
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "delete preset failed\n{}",
+                        escape_control(&error_toast_detail(&e))
+                    ),
+                ),
+            }
+        }
         ConfirmAction::AdoptConfig(path) => {
             app.services
                 .shunt_action
@@ -19261,6 +27852,14 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::RemoveToken { record, profile } => {
             app.services.shunt_token_refusal.take();
             start_shunt_token_save(app, ShuntSaveKey::Token(profile.clone()), record, profile);
+        }
+        ConfirmAction::RemovePoolAccount {
+            record,
+            family,
+            name,
+            display,
+        } => {
+            start_pool_remove(app, record, family, name, display);
         }
         ConfirmAction::AddToken {
             record,
@@ -19340,18 +27939,31 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             // Just close — the prompt is on-demand now; the non-blocking
             // banner keeps carrying the signal until the divergence resolves.
-            app.modals.pop();
+            app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let action = actions[state.cursor.min(last)].clone();
             let active = state.active.clone();
-            app.modals.pop();
+            let seen = state.seen;
+            app.pop_modal();
             match action {
                 DivergenceAction::SwitchToOwner(owner) => {
                     // Same confirmed path as the "save elsewhere" picker: the
                     // live login is captured into its own profile, which then
                     // becomes active. Nothing is lost, nothing else rewritten.
+                    // The owner was named for the login the prompt read, so
+                    // only that login is captured.
                     let Some(snapshot) = capture_live_or_toast(app) else {
+                        return;
+                    };
+                    if creds_fingerprint(snapshot.credentials.as_ref()) != seen {
+                        app.toast(
+                            ToastKind::Warning,
+                            DivergenceMoved::Login.skipped("save", &active),
+                        );
+                        return;
+                    }
+                    let Some(account) = claim_or_toast(app, &owner, "save failed") else {
                         return;
                     };
                     app.open_modal(Modal::Confirm(ConfirmState {
@@ -19362,40 +27974,121 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                         )),
                         choice: false,
                         scroll: ConfirmScroll::default(),
-                        on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
+                        on_confirm: ConfirmAction::AdoptDivergence(
+                            Box::new(snapshot),
+                            owner,
+                            account,
+                            active,
+                        ),
                     }));
                 }
-                DivergenceAction::Choice(choice) => run_divergence_choice(app, &active, choice),
+                DivergenceAction::Choice(choice) => {
+                    run_divergence_choice(app, &active, choice, seen);
+                }
             }
         }
         _ => {}
     }
 }
 
-fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) {
+/// Act on a divergence answer about `active`, whose live login the prompt read
+/// as `seen` (its fingerprint): every capture, relink or drop the answer makes
+/// is of that login only.
+fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice, seen: Option<u64>) {
     match choice {
         DivergenceChoice::Overwrite => {
-            let snapshot_result = {
-                let mut cfg = app.config();
-                force_snapshot_active_credentials(&mut cfg)
+            // The relink below replaces the bare item: settled before the
+            // snapshot, so a held overwrite has changed nothing.
+            let Some(_placed) = bare_item_gate(
+                app,
+                BareItemWrite::DivergenceOverwrite(active.to_string(), seen),
+            ) else {
+                return;
             };
-            if let Err(e) = snapshot_result {
-                app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
+            let name = ProfileName::from(active);
+            // The capture and the relink share one hold with the check that
+            // disk still names the modal's account active and the live login
+            // is still the one the modal read.
+            let outcome = {
+                let mut cfg = app.config();
+                crate::actions::while_disk_names_active(&mut cfg, &name, |cfg| {
+                    if live_creds_fingerprint() != seen {
+                        return Ok(Err(DivergenceMoved::Login));
+                    }
+                    // A login another account already stores is saved: the
+                    // answer captures nothing and only relinks `active`.
+                    let owner = crate::claude::live_login_owner_elsewhere(&name);
+                    let oauth_moved = if owner.is_some() {
+                        false
+                    } else {
+                        crate::actions::force_capture_live_login(cfg)?
+                    };
+                    Ok(Ok((
+                        oauth_moved,
+                        owner,
+                        force_link_profile_credentials(&name),
+                    )))
+                })
+            };
+            let (oauth_moved, saved_in, relinked) = match outcome {
+                Ok(Some(Ok(Ok(captured)))) => captured,
+                Ok(None) => {
+                    app.toast(
+                        ToastKind::Warning,
+                        DivergenceMoved::Active.skipped("overwrite", active),
+                    );
+                    return;
+                }
+                Ok(Some(Ok(Err(moved)))) => {
+                    app.toast(ToastKind::Warning, moved.skipped("overwrite", active));
+                    return;
+                }
+                Ok(Some(Err(e))) | Err(e) => {
+                    match chain_held_skipped("overwrite", &e) {
+                        Some(skipped) => app.toast(ToastKind::Warning, skipped),
+                        None => app.toast(
+                            ToastKind::Danger,
+                            format!(
+                                "overwrite failed\n{}",
+                                escape_control(&error_toast_detail(&e))
+                            ),
+                        ),
+                    }
+                    return;
+                }
+            };
+            if oauth_moved {
+                // A force snapshot removes the anchor, so an anchored profile
+                // forgets once and its `/profile` clock expires; only an
+                // unanchored snapshot of the same token forgets nothing.
+                crate::usage::expire_profile_ttl(&name);
+            }
+            if let Err(e) = relinked {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("relink failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
                 return;
             }
-            // The overwrite captured a live login that may be a DIFFERENT
-            // account: expire the clock so the next `/profile` read re-seeds the
-            // anchor, the way `overwrite_captured_profile` does.
-            crate::usage::expire_profile_ttl(&ProfileName::from(active));
-            if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
-                app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
+            if let Some(owner) = saved_in {
+                // Nothing was saved into `active`, so no save is claimed and
+                // no quarantine lifts.
+                app.refresh_tokens();
+                app.refresh_unsaved_live_login();
+                app.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "nothing saved\n{}",
+                        crate::profile::ChainHeldElsewhere { owner }
+                    ),
+                );
                 return;
             }
             app.refresh_tokens();
             // The live login replaced the stored credential, so the old
-            // credential's verdicts must not survive it — the shared clear,
-            // not a wait for the next OAuth fetch.
-            clear_profile_status_chrome(app, &ProfileName::from(active));
+            // credential's verdicts must not survive it — the drain forgets the
+            // halves whose identity changed, not a wait for the next OAuth fetch.
+            app.apply_forgets();
             // AUTH-1: the fresh login is the documented recovery for a revoked
             // chain, so a standing auth_broken quarantine is stale — same lift
             // every sibling fresh-login path runs.
@@ -19405,7 +28098,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 format!("saved live credentials into '{active}'"),
             );
         }
-        DivergenceChoice::NewProfile => open_divergence_target_picker(app),
+        DivergenceChoice::NewProfile => open_divergence_target_picker(app, active, seen),
         DivergenceChoice::Discard => {
             app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("discard the new login and restore '{active}'?"),
@@ -19414,16 +28107,57 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 ),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
+                on_confirm: ConfirmAction::DiscardDivergence(active.to_string(), seen),
             }));
         }
     }
 }
 
-fn run_discard_divergence(app: &mut App, active: &str) {
-    if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
-        app.toast(ToastKind::Danger, format!("discard failed\n{e}"));
+/// Drop the live login the discard confirm showed (`seen`, its fingerprint)
+/// and relink `active`, in one hold with the check that disk still names
+/// `active` and the live login is still that one.
+fn run_discard_divergence(app: &mut App, active: &str, seen: Option<u64>) {
+    // Discarding drops the live file's login, never a Keychain login no store
+    // saved: the settle saves that into its owner first.
+    let Some(_placed) = bare_item_gate(
+        app,
+        BareItemWrite::DiscardDivergence(active.to_string(), seen),
+    ) else {
         return;
+    };
+    let name = ProfileName::from(active);
+    let discarded = {
+        let mut cfg = app.config();
+        crate::actions::while_disk_names_active(&mut cfg, &name, |_| {
+            if live_creds_fingerprint() != seen {
+                return Ok(Err(DivergenceMoved::Login));
+            }
+            force_link_profile_credentials(&name).map(Ok)
+        })
+    };
+    match discarded {
+        Ok(Some(Ok(Ok(())))) => {}
+        Ok(None) => {
+            app.toast(
+                ToastKind::Warning,
+                DivergenceMoved::Active.skipped("discard", active),
+            );
+            return;
+        }
+        Ok(Some(Ok(Err(moved)))) => {
+            app.toast(ToastKind::Warning, moved.skipped("discard", active));
+            return;
+        }
+        Ok(Some(Err(e))) | Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "discard failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            return;
+        }
     }
     app.toast(
         ToastKind::Warning,
@@ -19431,19 +28165,93 @@ fn run_discard_divergence(app: &mut App, active: &str) {
     );
 }
 
-/// Open the "save elsewhere" picker from the Divergence modal. Lists every
-/// profile except the active (diverged) one; a refresh-token match is
+/// The toast for a divergence answer about `active` that a peer's switch
+/// outran: disk names another account active, so nothing was captured,
+/// dropped or relinked.
+fn divergence_answer_skipped(action: &str, active: &str) -> String {
+    format!("{action} skipped\n'{active}' is no longer the active account")
+}
+
+/// What moved under a divergence answer while its prompt was open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DivergenceMoved {
+    /// Disk names another account active, or none.
+    Active,
+    /// The live credentials file holds another login than the prompt read.
+    Login,
+}
+
+impl DivergenceMoved {
+    /// The toast for an answer about `active`'s divergence that this outran:
+    /// nothing was stored, captured or relinked.
+    fn skipped(self, action: &str, active: &str) -> String {
+        match self {
+            Self::Active => divergence_answer_skipped(action, active),
+            Self::Login => {
+                format!("{action} skipped\nthe live login changed after the prompt opened")
+            }
+        }
+    }
+}
+
+/// Test seam: what a peer does right after the next divergence adopt's hold
+/// releases, run once.
+#[cfg(test)]
+static AFTER_ADOPT_HOLD: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn after_the_next_adopt_hold(f: impl FnOnce() + Send + 'static) {
+    if let Ok(mut hook) = AFTER_ADOPT_HOLD.lock() {
+        *hook = Some(Box::new(f));
+    }
+}
+
+#[cfg(test)]
+fn run_after_adopt_hold_hook() {
+    let hook = AFTER_ADOPT_HOLD
+        .lock()
+        .ok()
+        .and_then(|mut hook| hook.take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+/// Run `act` with `snapshot` under one state flock hold only while the
+/// divergence the prompt showed still stands: disk names `from` active
+/// (mirrored into `cfg`) and the live credentials file still holds the
+/// snapshot's login. A peer's switch, a re-login or a refresh landing while
+/// the prompt was open would otherwise have the answer store a login the user
+/// never saw, or relink away one nobody saved.
+fn while_divergence_stands<T>(
+    cfg: &mut AppConfig,
+    from: &ProfileName,
+    snapshot: CaptureSnapshot,
+    act: impl FnOnce(&mut AppConfig, CaptureSnapshot) -> Result<T>,
+) -> Result<std::result::Result<T, DivergenceMoved>> {
+    let outcome = crate::actions::while_disk_names_active(cfg, from, |cfg| {
+        let live = serde_json::to_value(read_claude_credentials()?)?;
+        if live != serde_json::to_value(&snapshot.credentials)? {
+            return Ok(Err(DivergenceMoved::Login));
+        }
+        act(cfg, snapshot).map(Ok)
+    })?;
+    outcome.unwrap_or(Ok(Err(DivergenceMoved::Active)))
+}
+
+/// Open the "save elsewhere" picker from the Divergence modal about `active`.
+/// Lists every profile except that diverged one; a refresh-token match is
 /// pre-selected. With no other profile to pick, drops straight into a
 /// new-profile capture.
-fn open_divergence_target_picker(app: &mut App) {
+fn open_divergence_target_picker(app: &mut App, active: &str, seen: Option<u64>) {
     let (targets, preselect) = {
         let cfg = app.config();
-        let active = cfg.state.active_profile.as_deref();
         let targets: Vec<String> = cfg
             .profiles
             .iter()
             .map(|p| p.name.as_str().to_string())
-            .filter(|n| Some(n.as_str()) != active)
+            .filter(|n| n != active)
             .collect();
         let live = read_claude_credentials().ok().flatten();
         let preselect = find_matching_oauth_profile(&cfg, live.as_ref())
@@ -19452,19 +28260,20 @@ fn open_divergence_target_picker(app: &mut App) {
         (targets, preselect)
     };
     if targets.is_empty() {
-        begin_capture(app, true);
+        begin_capture(app, Some(active.to_string()), seen);
         return;
     }
-    app.modals
-        .push(Modal::DivergenceTarget(DivergenceTargetForm {
-            targets,
-            cursor: preselect,
-            scroll: std::cell::Cell::new(0),
-            viewport: std::cell::Cell::new(0),
-            starts: std::cell::RefCell::new(Vec::new()),
-            block_ends: std::cell::RefCell::new(Vec::new()),
-            total: std::cell::Cell::new(0),
-        }));
+    app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: active.to_string(),
+        seen,
+        targets,
+        cursor: preselect,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
 }
 
 /// Rows: 0 = `+ new profile` (→ capture-name), 1.. = existing profiles
@@ -19523,21 +28332,31 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             form.cursor = next;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let cursor = form.cursor;
-            let Some(Modal::DivergenceTarget(form)) = app.modals.pop() else {
+            let Some(Modal::DivergenceTarget(form)) = app.pop_modal() else {
                 return;
             };
             if cursor == 0 {
-                begin_capture(app, true);
+                begin_capture(app, Some(form.from), form.seen);
                 return;
             }
             let Some(target) = form.targets.get(cursor - 1).cloned() else {
                 return;
             };
             let Some(snapshot) = capture_live_or_toast(app) else {
+                return;
+            };
+            if creds_fingerprint(snapshot.credentials.as_ref()) != form.seen {
+                app.toast(
+                    ToastKind::Warning,
+                    DivergenceMoved::Login.skipped("save", &form.from),
+                );
+                return;
+            }
+            let Some(account) = claim_or_toast(app, &target, "save failed") else {
                 return;
             };
             // Names no surviving endpoint, unlike the browser-login confirm:
@@ -19555,7 +28374,12 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 )),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
+                on_confirm: ConfirmAction::AdoptDivergence(
+                    Box::new(snapshot),
+                    target,
+                    account,
+                    form.from,
+                ),
             }));
         }
         _ => {}
@@ -19563,7 +28387,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Keys on the `+ add token` profile picker: Up/Down wrap, PageUp/PageDown
-/// page, `esc`/`q` close, `↵`/`space` pick. Row 0 is `+ new profile` (opens
+/// page, `esc`/`q` close, `↵` picks. Row 0 is `+ new profile` (opens
 /// the new-account form); the profiles sit below it, so the cursor runs
 /// `0..=targets.len()`.
 fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
@@ -19618,11 +28442,11 @@ fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
             form.cursor = next;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let cursor = form.cursor;
-            let Some(Modal::TokenPicker(form)) = app.modals.pop() else {
+            let Some(Modal::TokenPicker(form)) = app.pop_modal() else {
                 return;
             };
             if cursor == 0 {
@@ -19644,7 +28468,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
     };
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
@@ -19659,14 +28483,14 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 .map(|_| ())
                 .and_then(|()| validate_foreign_harness_free(&name, Harness::Claude));
             if let Err(e) = validation {
-                app.toast(ToastKind::Danger, format!("{e}"));
+                app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                 return;
             }
             let collision = {
                 let cfg = app.config();
                 cfg.canonical_name(&name)
             };
-            let Some(Modal::CaptureName(form)) = app.modals.pop() else {
+            let Some(Modal::CaptureName(form)) = app.pop_modal() else {
                 return;
             };
             let CaptureNameForm {
@@ -19675,6 +28499,9 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 ..
             } = form;
             if let Some(existing) = collision {
+                let Some(account) = claim_or_toast(app, &existing, "overwrite failed") else {
+                    return;
+                };
                 // Issue #7: typing an existing profile's name used to dead-end
                 // with an error. Route to the same confirm-modal machinery as
                 // every other destructive action instead of a picker/new modal.
@@ -19688,38 +28515,111 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                     on_confirm: ConfirmAction::CaptureOverwrite(
                         snapshot,
                         existing,
+                        account,
                         from_divergence,
                     ),
                 }));
                 return;
             }
-            // Divergence capture: detach + deactivate only after name is
-            // confirmed so `capture_into_profile` sees `active_profile.is_none()`
-            // and links the new one. On Esc this never runs.
-            if from_divergence {
-                let _ = detach_credentials_link();
-                let mut cfg = app.config();
-                let _ = with_state_lock(|held| {
-                    cfg.state.set_active(None, held);
-                    save_app_state(&cfg.state)
-                });
-            }
-            let result = {
-                let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
-            };
-            match result {
-                Ok(()) => {
-                    app.refresh_tokens();
-                    app.last_reload_fp = reload_fingerprint();
-                    app.refresh_unsaved_live_login();
-                    app.toast(ToastKind::Success, format!("captured '{name}'"));
-                }
-                Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
-            }
+            commit_capture_name(app, name, snapshot, from_divergence);
         }
         _ => apply_input_edit(&mut form.input, key),
     }
+}
+
+/// Capture `snapshot` into a new profile `name`, the capture prompt's ⏎ once
+/// no profile holds the name.
+fn commit_capture_name(
+    app: &mut App,
+    name: String,
+    snapshot: Box<CaptureSnapshot>,
+    from_divergence: Option<String>,
+) {
+    // The new profile becomes the active one, linking the live slot over the
+    // bare item, when none is active or a divergence deactivates the prior
+    // one. Settled before that detach, so a held capture has changed nothing.
+    let relinks = from_divergence.is_some() || app.config().state.active_profile.is_none();
+    let _placed = if relinks {
+        let Some(placed) = bare_item_gate(
+            app,
+            BareItemWrite::CaptureName {
+                name: name.clone(),
+                snapshot: snapshot.clone(),
+                from_divergence: from_divergence.clone(),
+            },
+        ) else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
+    // Divergence capture: detach + deactivate only after name is
+    // confirmed so `capture_into_profile` sees `active_profile.is_none()`
+    // and links the new one. On Esc this never runs. One hold, the name
+    // check first: a name taken meanwhile refuses with nothing detached; a
+    // divergence that no longer stands captures and detaches nothing.
+    let capture = |cfg: &mut AppConfig, snapshot: CaptureSnapshot, detach: bool| {
+        with_state_lock(|held| {
+            // Every refusal the create can raise, before the detach: a refused
+            // capture leaves the active account and its live link as they were.
+            validate_profile_name(&name, Harness::Claude, None)?;
+            let profile = ProfileName::from(name.as_str());
+            crate::actions::refuse_leftover_login(&profile)?;
+            crate::profile::refuse_login_held_elsewhere(
+                &profile,
+                snapshot.credentials.as_ref(),
+                held,
+            )?;
+            if detach {
+                let _ = detach_credentials_link();
+                if let Ok(saved) = update_app_state(|s, held| s.set_active(None, held)) {
+                    cfg.state = saved;
+                }
+            }
+            capture_into_profile(cfg, name.clone(), Default::default(), snapshot)
+        })
+    };
+    let result = {
+        let mut cfg = app.config();
+        match &from_divergence {
+            Some(from) => while_divergence_stands(
+                &mut cfg,
+                &ProfileName::from(from.as_str()),
+                *snapshot,
+                |cfg, snapshot| capture(cfg, snapshot, true),
+            ),
+            None => capture(&mut cfg, *snapshot, false).map(Ok),
+        }
+    };
+    match result {
+        Ok(Err(moved)) => {
+            let from = from_divergence.unwrap_or_default();
+            app.toast(ToastKind::Warning, moved.skipped("capture", &from));
+        }
+        Ok(Ok(())) => {
+            app.refresh_tokens();
+            app.apply_forgets();
+            app.refresh_unsaved_live_login();
+            app.toast(ToastKind::Success, format!("captured '{name}'"));
+        }
+        Err(e) => match chain_held_skipped("capture", &e) {
+            Some(skipped) => app.toast(ToastKind::Warning, skipped),
+            None => app.toast(
+                ToastKind::Danger,
+                format!(
+                    "capture failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            ),
+        },
+    }
+}
+
+/// The toast for an answer refused because another account already stores
+/// the login it would save, if `e` is that refusal: nothing was written.
+fn chain_held_skipped(action: &str, e: &anyhow::Error) -> Option<String> {
+    crate::profile::ChainHeldElsewhere::find(e).map(|held| format!("{action} skipped\n{held}"))
 }
 
 fn apply_input_edit(input: &mut InputState, key: KeyEvent) {
@@ -19813,7 +28713,10 @@ fn apply_status_incidents(
             };
             if app.tab == Tab::Status {
                 let title = truncate(&incident.title, 40);
-                app.toast(severity, format!("new incident: {title}"));
+                app.toast(
+                    severity,
+                    format!("new incident: {}", escape_control(&title)),
+                );
             } else {
                 app.set_tab_activity(Tab::Status, severity);
             }
@@ -19906,6 +28809,17 @@ fn drain_pricing_events(app: &mut App) {
 /// after the browser callback won has no door to reach.
 fn drain_login_events(app: &mut App) {
     while let Ok((generation, event)) = app.login_event_rx.try_recv() {
+        // The shunt add's commit point arrives as its own event, tracked even
+        // after a cancel so the committed complete's outcome still drains. It
+        // carries the add's `(family, name)` so the late result clears only its
+        // own guard marker, never a later pool action's.
+        if let LoginEvent::ShuntCommitted(family, name) = &event {
+            app.shunt_add_committed = Some(ShuntAddIdentity {
+                generation,
+                family: *family,
+                name: name.clone(),
+            });
+        }
         if let Some(session) = app.login.as_mut()
             && session.generation == generation
         {
@@ -19920,78 +28834,113 @@ fn drain_login_events(app: &mut App) {
                         session.paste_field = None;
                     }
                 }
+                LoginEvent::ShuntCommitted(_, _) => {}
             }
         }
     }
     while let Ok((generation, result)) = app.login_result_rx.try_recv() {
-        if app.login.as_ref().map(|s| s.generation) != Some(generation) {
-            continue; // superseded login; drop it
-        }
-        let Some(session) = app.login.take() else {
+        if app.login.as_ref().map(|s| s.generation) == Some(generation) {
+            let Some(session) = app.login.take() else {
+                continue;
+            };
+            // A shunt add holds its raw door beside the session; the take above
+            // drops `login`, so the door must go with it now.
+            let door = app.shunt_paste.take();
+            close_login_modal(app);
+            if let Some(door) = door {
+                let identity = ShuntAddIdentity {
+                    generation,
+                    family: door.family,
+                    name: door.name.clone(),
+                };
+                if let Some(outcome) = shunt_add_outcome(result) {
+                    finish_shunt_add(app, &identity, outcome);
+                }
+                continue;
+            }
+            match result {
+                Ok(LoginResult::Oauth(creds)) => apply_login(app, session, *creds),
+                Ok(LoginResult::Console(outcome)) => apply_console_login(app, session, *outcome),
+                Ok(LoginResult::Shunt(_)) => {
+                    // No shunt door rides this session, so the result cannot be
+                    // a shunt add's own: drop it rather than panic (R4-1).
+                    crate::logline::logline!("a login with no shunt door reported a shunt result");
+                }
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!("login for '{}' failed\n{e}", session.name),
+                ),
+            }
+        } else if let Some(identity) = app
+            .shunt_add_cancelled
+            .clone()
+            .filter(|cancelled| cancelled.generation == generation)
+        {
+            // A pre-commit-cancelled add's worker reported it stopped: release
+            // the guard marker now (the cancel held it until this report, R3-3).
+            // No toast, no landing — the add was cancelled before it sent
+            // anything. The marker is still this add's own: nothing else can
+            // start while it is held.
+            if matches!(
+                &app.pool_mutation_row,
+                Some((family, name)) if *family == identity.family && name == &identity.name
+            ) {
+                app.pool_mutation_row = None;
+            }
+            app.shunt_add_cancelled = None;
             continue;
-        };
-        close_login_modal(app);
-        match result {
-            Ok(LoginResult::Oauth(creds)) => apply_login(app, session, *creds),
-            Ok(LoginResult::Console(outcome)) => apply_console_login(app, session, *outcome),
-            Err(e) => app.toast(
-                ToastKind::Danger,
-                format!("login for '{}' failed\n{e}", session.name),
-            ),
+        } else if let Some(identity) = app
+            .shunt_add_committed
+            .clone()
+            .filter(|committed| committed.generation == generation)
+        {
+            // A post-commit cancel (or supersede): `complete_pool_account` was
+            // sent, so its outcome still lands a toast and a pool re-read.
+            if let Some(outcome) = shunt_add_outcome(result) {
+                finish_shunt_add(app, &identity, outcome);
+            }
         }
+        // else: a superseded claude/console login; drop it.
     }
 }
 
 /// Fold a completed login into the app on the UI thread. A new-account login
 /// stashes the mint into the live `+ new` draft — the profile is created only
-/// when `create account` fires (capture-then-commit). A re-login re-checks
-/// existence at apply time and, since fresh creds replacing stored ones IS a
-/// divergence, gates the overwrite on `AppState.default_divergence`: only an
-/// `Overwrite` default applies silently; anything else asks first.
+/// when `create account` fires (capture-then-commit). A re-login lands only
+/// on the account it started for (the write refuses any other) and, since
+/// fresh creds replacing stored ones IS a divergence, gates the overwrite on
+/// `AppState.default_divergence`: only an `Overwrite` default applies silently;
+/// anything else asks first.
 fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login::LoginOutcome) {
-    if session.is_new {
+    let Some(account) = session.account else {
         // The `+ new` form may have been closed during the browser round-trip;
         // the mint lives only in the draft, so without one it is dropped. The
         // anchor waits for `create account`: the draft's name is still editable,
         // so the profile this login belongs to has no final name yet.
-        let stashed = stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome)));
-        if stashed {
-            app.toast(ToastKind::Success, "logged in\ncreate account saves it");
-        } else {
-            app.toast(
+        match stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome))) {
+            StashOutcome::Staged => {
+                app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+            }
+            StashOutcome::FormClosed => app.toast(
                 ToastKind::Warning,
                 "login finished but the new-account form is no longer open\nlog in again",
-            );
+            ),
+            StashOutcome::WrongType => app.toast(
+                ToastKind::Info,
+                "login finished but the form type changed\nnothing was saved",
+            ),
         }
         return;
-    }
+    };
 
-    let (exists, has_creds) = {
-        let cfg = app.config();
-        let profile = cfg.find(&ProfileName::from(session.name.clone()));
-        (
-            profile.is_some(),
-            profile.and_then(|p| p.credentials.as_ref()).is_some(),
-        )
-    };
-    if !exists {
-        app.toast(
-            ToastKind::Danger,
-            format!("login failed\nprofile '{}' no longer exists", session.name),
-        );
-        return;
-    }
+    let has_creds = app
+        .config()
+        .find(&ProfileName::from(session.name.clone()))
+        .is_some_and(|p| p.credentials.is_some());
     // The uuid rides the snapshot: this may land in a confirm modal instead of
-    // committing now, and only the commit may seed the anchor.
-    let snapshot = CaptureSnapshot {
-        credentials: Some(outcome.credentials),
-        base_url: None,
-        api_key: None,
-        anchor: outcome
-            .account_uuid
-            .map(crate::actions::AnchorAction::Proven)
-            .unwrap_or(crate::actions::AnchorAction::Unproven),
-    };
+    // committing now, and only the commit may seed the anchor. The probe body's
+    // plan rides it too, for the commit's `usage_cache.json` seed.
+    let snapshot = crate::actions::capture_snapshot_from_outcome(outcome);
     // No stored creds → nothing diverges; adopt silently (mirrors the
     // first-login adopt in `poll_credentials_divergence`).
     let apply_now = !has_creds
@@ -20000,10 +28949,23 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             Some(DivergenceChoice::Overwrite)
         );
     if !apply_now {
+        // The modal below describes the account under the name, so it opens
+        // only while that is still the one the login started for.
+        let held_by_account = with_state_lock(|held| {
+            crate::profile::require_profile_id(
+                &ProfileName::from(session.name.clone()),
+                &account,
+                held,
+            )
+        });
+        if let Err(e) = held_by_account {
+            app.toast(ToastKind::Danger, format!("login failed\n{e:#}"));
+            return;
+        }
         // Names the endpoint only where the preserve arm will actually keep it
-        // — the same rule `reauth_confirm_object` enforces on the CLI prompt,
-        // asked of the same predicate. This snapshot is credential-only, so
-        // the arm turns on the stored profile alone.
+        // — the same rule the CLI reauth prompt enforces, asked of the same
+        // predicate. This snapshot is credential-only, so the arm turns on the
+        // stored profile alone.
         let keeps_endpoint = app
             .config()
             .find(&ProfileName::from(session.name.clone()))
@@ -20020,23 +28982,67 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             ),
             choice: false,
             scroll: ConfirmScroll::default(),
-            on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
+            on_confirm: ConfirmAction::CaptureOverwrite(
+                Box::new(snapshot),
+                session.name,
+                account,
+                None,
+            ),
         }));
         return;
     }
+    apply_login_snapshot(app, session.name, account, snapshot);
+}
+
+/// Overwrite profile `name` with a finished login's `snapshot`, no confirm,
+/// while `name` still holds `account`.
+fn apply_login_snapshot(
+    app: &mut App,
+    name: String,
+    account: ProfileId,
+    snapshot: CaptureSnapshot,
+) {
+    // The overwrite relinks the live slot when the profile is or becomes the
+    // active one.
+    let relinks = {
+        let cfg = app.config();
+        cfg.is_active(&ProfileName::from(name.clone())) || cfg.state.active_profile.is_none()
+    };
+    let _placed = if relinks {
+        let Some(placed) = bare_item_gate(
+            app,
+            BareItemWrite::Login {
+                name: name.clone(),
+                account: account.clone(),
+                snapshot: Box::new(snapshot.clone()),
+            },
+        ) else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     let result = {
         let mut cfg = app.config();
-        overwrite_captured_profile(&mut cfg, &ProfileName::from(session.name.clone()), snapshot)
+        overwrite_captured_profile(
+            &mut cfg,
+            &ProfileName::from(name.clone()),
+            &account,
+            snapshot,
+        )
     };
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &ProfileName::from(session.name.clone()));
-            app.last_reload_fp = reload_fingerprint();
+            app.apply_forgets();
             app.refresh_unsaved_live_login();
-            app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
+            app.toast(ToastKind::Success, format!("logged in '{name}'"));
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("login failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
@@ -20045,50 +29051,25 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
 /// scoped to a workspace rather than to this plan (`alibaba_login`'s module doc
 /// has the reason it is dropped).
 ///
-/// Re-checks the account at apply time the way [`apply_login`] does, and on the
-/// same reasoning: a browser round-trip is long enough for the profile to be
-/// deleted or repointed at a different endpoint underneath it, and a session is
-/// only meaningful on the console its endpoint is administered from. There is no
-/// divergence gate, because a lapsed session cannot be refreshed and re-running
-/// this login is the routine repair rather than an overwrite to guard.
+/// [`crate::actions::store_console_login`] refuses an account other than the
+/// one the login started for, and one repointed at another console front.
+/// There is no divergence gate, because a lapsed session cannot be refreshed
+/// and re-running this login is the routine repair rather than an overwrite to
+/// guard.
 fn apply_console_login(
     app: &mut App,
     session: LoginSession,
     outcome: crate::alibaba_login::ConsoleLoginOutcome,
 ) {
-    let name = ProfileName::from(session.name);
-    let (exists, target) = {
-        let cfg = app.config();
-        let profile = cfg.find(&name);
-        (
-            profile.is_some(),
-            profile.and_then(Profile::console_login_target),
-        )
+    // `start_console_login` always claims an account; only a `+ new` draft's
+    // session has none, and no draft session receives a console result.
+    let Some(account) = session.account else {
+        return;
     };
-    if !exists {
-        app.toast(
-            ToastKind::Danger,
-            format!("console login failed\nprofile '{name}' no longer exists"),
-        );
-        return;
-    }
-    // The SITE, not just "still Alibaba". A session is minted on one console
-    // front and is meaningless on the other, and the usage fetch keys on the
-    // credential's OWN site rather than on `base_url` — so an endpoint moved
-    // between two Model Studio hosts mid-round-trip would not degrade to a dead
-    // session, it would quietly report the other plan's quota under this name.
-    // Compared against what the console ANSWERED with, which is what got
-    // stored, rather than against what the login opened.
-    if target.map(|(site, _)| site) != Some(outcome.console.site) {
-        app.toast(
-            ToastKind::Danger,
-            format!("console login failed\n'{name}' no longer points at the console this session came from"),
-        );
-        return;
-    }
+    let name = ProfileName::from(session.name);
     let result = {
         let mut cfg = app.config();
-        crate::actions::store_console_login(&mut cfg, &name, outcome.console)
+        crate::actions::store_console_login(&mut cfg, &name, &account, outcome.console)
     };
     match result {
         Ok(()) => {
@@ -20096,9 +29077,9 @@ fn apply_console_login(
             // `store_console_login` drops the cache the old one filled, so ask
             // for the figures the new one can actually read. The stale
             // `console login expired` verdict goes with the old session via
-            // the shared clear — it must not survive until the queued fetch.
+            // the drain — it must not survive until the queued fetch.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &name);
+            app.apply_forgets();
             app.manual_refresh_one(&name);
             // The window is the surprising part and the CLI's own summary leads
             // with it: the 48h runs from the aliyun browser sign-in, so a login
@@ -20110,12 +29091,23 @@ fn apply_console_login(
                 ),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("console login failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "console login failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
+    let now_ms = app.anim_ms();
+    app.clawd.tick(now_ms);
+    // Safety net: a forget noted without an immediate drain still lands before
+    // the next frame reads the stores; the per-site drains keep this a no-op.
+    app.apply_forgets();
 
     while let Ok(ev) = app.update_results.try_recv() {
         match ev {
@@ -20148,9 +29140,27 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     drain_pricing_events(app);
     drain_login_events(app);
+    drain_codex_login(app);
+    drain_codex_new_login(app);
+    drain_profile_delete(app);
+    // After the delete drain: a delete the bare item held has cleared its
+    // in-flight mark before its question can be answered.
+    drain_bare_item_answers(app);
+    drain_unsaved_live_login(app);
+    drain_capture_login(app);
 
+    refresh_shunt_mark(app);
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();
+        // Setup's `+ new` selection is the trailing row, never an index: a
+        // reload that moves the roster keeps it there instead of demoting it
+        // onto the last account. Captured pre-swap (`reload_was_on_new`) so a
+        // deleted last account (whose cursor reads `New` post-swap) is not
+        // mistaken for `+ new`. The Overview's own cursor rules are
+        // `place_overview_cursor`'s, already run by the clamp.
+        if app.reload_was_on_new {
+            app.profile_cursor.set(app.profile_count());
+        }
         if app.profile_count() == 0 {
             app.usage_detail_focus = StatusFocus::List;
             app.usage_detail_scroll = 0;
@@ -20166,6 +29176,12 @@ pub(crate) fn on_tick(app: &mut App) {
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
     for decision in auto_switch_targets {
+        // An exit wait starts no new write: a queued auto-switch would spawn a
+        // gate (and could relink credentials) after the user quit. The
+        // decisions were drained above and drop with the process.
+        if app.exit_wait {
+            break;
+        }
         let name = ProfileName::from(decision.target.clone());
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
@@ -20192,6 +29208,30 @@ pub(crate) fn on_tick(app: &mut App) {
                 continue;
             }
         }
+        // The daemon drain's twin: the queued target's login is re-read ON DISK
+        // right before dispatch, because the in-memory `Profile` is stale until
+        // the next reload and a login deleted out-of-process after the scan's
+        // enqueue must still stop the link. A proven-none store drops; an
+        // unreadable store's first skip marks the member and logs one line, the
+        // only trace of why it leaves the walk, and it is never linked on a guess.
+        match crate::profile::stored_login(&name) {
+            crate::profile::StoredLogin::HoldsNone => continue,
+            crate::profile::StoredLogin::Unknown => {
+                let newly = app
+                    .skipped_unreadable
+                    .lock()
+                    .map(|mut s| s.insert(name.as_str().to_string()))
+                    .unwrap_or(false);
+                if newly {
+                    crate::logline::logline!(
+                        "clauth: not switching to '{name}': {}; skipping it until it reads again",
+                        crate::format::STORED_LOGIN_UNREADABLE
+                    );
+                }
+                continue;
+            }
+            crate::profile::StoredLogin::HoldsLogin => {}
+        }
         let returning = app.config().is_home_today(&name, &key_rejected);
         let msg = if returning {
             format!("returning to preferred account '{name}'")
@@ -20211,17 +29251,39 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_credentials_divergence(app);
     poll_live_sessions(app);
     sync_broken_verdicts(app);
+    sync_credit_refusals(app);
     poll_codex_rows(app);
+    poll_shunt_pool(app);
+    poll_form_predicates(app);
     drain_service_probes(app);
+    drain_shunt_pool_probe(app);
+    drain_pool_mutations(app);
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);
+    poll_tps(app);
+    poll_finished_speeds(app);
     poll_pending_require(app);
     drain_left_behind_probe(app);
+
+    // The codex or pool snapshot may have changed under the selection this
+    // tick; re-place it by the Overview's rule (ascend + first row for a
+    // hidden-but-held row, the row now at the flat index it held for a
+    // dropped one).
+    app.rehome_setup_selection();
+    app.rehome_usage_selection();
 
     warn_day_claim_notices(app);
     update_banner(app);
     app.prune_toasts();
+
+    // The quit is decided and the exit waits for the running writes (a
+    // shunt-card write, a profile delete or a token spend): resolve here, after
+    // every drain, so the tick that drains the last write is the one that exits.
+    if app.exit_wait && !in_flight_exit_write(app) {
+        app.quit = true;
+        app.shutting_down.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Say once, per day and per config change, what today's day lists are doing
@@ -20267,12 +29329,8 @@ fn poll_codex_rows(app: &mut App) {
         return;
     }
     app.last_codex_rows_refresh = Some(Instant::now());
-    let selected = app.current_main_item();
     app.codex_rows = codex_rows();
-    app.clamp_overview_cursor();
-    if app.tab == Tab::Overview && selected != app.current_main_item() {
-        app.sync_overview_profile_selection();
-    }
+    app.place_overview_cursor();
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
@@ -20287,6 +29345,273 @@ fn poll_daemon_health(app: &mut App) {
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
+    sync_daemon_binary_change(app);
+    // The image this process runs never comes back, so each kind's toast
+    // latches once raised; a removal can precede a replacement (a Windows
+    // self-update leaves the path empty mid-swap), so the replacement still
+    // says what to do. A changed binary read while this process's own
+    // self-update holds its mark is credited to that update, whose `Installed`
+    // toast says it. That credit may be wrong, so such a probe stays quiet
+    // without latching, and a change by anything else still toasts once a
+    // failed update clears the mark. The mark is read after the change check:
+    // the update sets it before its rename, so a rename this probe saw is
+    // already marked.
+    if let Some(change) = crate::plugin_host::self_exe_change()
+        && !crate::update::replaced_by_self_update()
+        && app.own_toasted_kinds.latch(change)
+    {
+        app.toast(ToastKind::Warning, own_binary_toast(change));
+    }
+}
+
+/// The kinds of executable change that already raised their toast this run.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ToastedKinds {
+    replaced: bool,
+    removed: bool,
+}
+
+impl ToastedKinds {
+    /// Mark `change` toasted: `true` only the first time for its kind.
+    fn latch(&mut self, change: ExeChange) -> bool {
+        let toasted = match change {
+            ExeChange::Replaced => &mut self.replaced,
+            ExeChange::Removed => &mut self.removed,
+        };
+        !std::mem::replace(toasted, true)
+    }
+}
+
+/// The toast a fresh daemon on a changed binary raises, once per kind per run.
+fn daemon_binary_toast(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "the daemon is still running the old clauth binary and skips the plugin self-heal: restart it with `clauth daemon --replace`"
+        }
+        ExeChange::Removed => {
+            "the daemon's clauth binary was removed and it skips the plugin self-heal: reinstall clauth, then restart it with `clauth daemon --replace`"
+        }
+    }
+}
+
+/// The plugin card's line while a fresh daemon runs a changed binary; the
+/// services renderer draws it whole in the warning tone, never through the
+/// `key: value` splitter.
+pub(crate) fn daemon_binary_card_line(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "daemon still on the old binary: plugin self-heal off until it restarts (`clauth daemon --replace`)"
+        }
+        ExeChange::Removed => {
+            "daemon's binary was removed: plugin self-heal off until clauth is reinstalled and it restarts (`clauth daemon --replace`)"
+        }
+    }
+}
+
+/// The toast this TUI raises, once per kind per run, on the first probe that
+/// reads its own executable changed that way while its own self-update holds
+/// no mark.
+fn own_binary_toast(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "this clauth is still running the old binary: quit and reopen it to run the new one"
+        }
+        ExeChange::Removed => "this clauth's binary was removed: quit it before reinstalling",
+    }
+}
+
+/// The refusal in place of the plugin install while this TUI's own executable
+/// stays changed: the install would register the plugin tree baked into the
+/// old image.
+fn own_binary_install_refusal(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "this clauth is still running the old binary: quit and reopen it before installing the plugin"
+        }
+        ExeChange::Removed => {
+            "this clauth's binary was removed: reinstall clauth and open it to install the plugin"
+        }
+    }
+}
+
+/// The refusal in place of the completions fix while this TUI's own executable
+/// stays changed: the script it would write is the old image's emission, never
+/// what the installed binary prints.
+fn own_binary_completions_refusal(change: ExeChange, stale: bool) -> String {
+    let (gerund, verb) = if stale {
+        ("updating", "update")
+    } else {
+        ("installing", "install")
+    };
+    match change {
+        ExeChange::Replaced => format!(
+            "this clauth is still running the old binary: quit and reopen it before {gerund} completions"
+        ),
+        ExeChange::Removed => format!(
+            "this clauth's binary was removed: reinstall clauth and open it to {verb} completions"
+        ),
+    }
+}
+
+/// Re-read how a fresh daemon's binary changed under the health the app holds
+/// now. A change into `Some` tints the Services tab and raises its kind's
+/// toast, once per kind per run; any change rebuilds the plugin card, so its
+/// line follows the feed on this cadence rather than waiting for a Services
+/// recompute.
+fn sync_daemon_binary_change(app: &mut App) {
+    let change = crate::daemon::daemon_binary_change(app.daemon_health);
+    if change == app.daemon_binary_change {
+        return;
+    }
+    app.daemon_binary_change = change;
+    if let Some(change) = change {
+        app.set_tab_activity(Tab::Services, ToastKind::Warning);
+        if app.daemon_toasted_kinds.latch(change) {
+            app.toast(ToastKind::Warning, daemon_binary_toast(change));
+        }
+    }
+    refresh_plugin_check(app);
+}
+
+/// Rebuild only the `plugin` row from the cheap local reads, keeping the
+/// detail's problem cursor in range. No row yet (no recompute has run) leaves
+/// the first recompute to build it.
+fn refresh_plugin_check(app: &mut App) {
+    let Some(idx) = app.services.checks.iter().position(|c| c.label == "plugin") else {
+        return;
+    };
+    let clauth_path = crate::plugin_probe::on_path("clauth");
+    app.services.checks[idx] = plugin_row(app, clauth_path.as_deref());
+    clamp_problem_cursor(app);
+}
+
+/// Re-read the producer's tps cache on the same once-a-second cadence as the
+/// daemon probe: one JSON read is cheap but not per-frame cheap, and the
+/// lease holder rewrites it on its own tick. This TUI is itself the producer
+/// when it holds the lease, reading the cache its scheduler wrote, so the two
+/// never disagree.
+fn poll_tps(app: &mut App) {
+    const TPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+    if app.last_tps_refresh.elapsed() < TPS_REFRESH_INTERVAL {
+        return;
+    }
+    app.last_tps_refresh = Instant::now();
+    let snapshot = crate::tps::load_cache();
+    app.set_tps(snapshot);
+}
+
+/// A transcript sum's average speed: output tokens ÷ generation seconds,
+/// `None` when the sum carries no generation time.
+pub(crate) fn day_average(sum: crate::tps::DaySum) -> Option<f64> {
+    (sum.gen_ms > 0).then(|| sum.output as f64 / (sum.gen_ms as f64 / 1000.0))
+}
+
+/// Per-job back-off for a finished job whose average has not resolved: the
+/// epoch ms of the next attempt and the current (doubling) back-off in ms.
+pub(crate) struct FinishedRetry {
+    pub(crate) next_ms: u64,
+    pub(crate) backoff_ms: u64,
+}
+
+/// First retry back-off, and the cap the doubling stops at.
+const FINISHED_SPEED_FIRST_BACKOFF_MS: u64 = 2_000;
+const FINISHED_SPEED_MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Resolve finished delegate jobs' own average speeds into the App cache, once
+/// a second, on the tick path — never in render, so a frame never walks the
+/// transcript store.
+fn poll_finished_speeds(app: &mut App) {
+    const FINISHED_SPEED_INTERVAL: Duration = Duration::from_secs(1);
+    if app.last_finished_speeds_refresh.elapsed() < FINISHED_SPEED_INTERVAL {
+        return;
+    }
+    app.last_finished_speeds_refresh = Instant::now();
+    resolve_finished_speeds(app);
+}
+
+/// The finished-speeds pass, throttle-free so a test can drive it directly.
+/// Every pending id is matched against ONE transcript-store walk per pass, and
+/// a job that still has no figure (no session id, or its transcript not yet
+/// rescued into the global store) is backed off — 2 s doubling to 60 s — so the
+/// store is not re-walked for it every second. A `None` is never cached; the
+/// job retries until it resolves or leaves the list, whose ids are evicted.
+pub(crate) fn resolve_finished_speeds(app: &mut App) {
+    let now = crate::usage::now_ms();
+    app.delegate_speed_cache.retain(|id, _| {
+        app.services
+            .delegates
+            .iter()
+            .any(|job| job.record.job_id == *id)
+    });
+    app.delegate_speed_retry.retain(|id, _| {
+        app.services
+            .delegates
+            .iter()
+            .any(|job| job.record.job_id == *id)
+    });
+
+    // Pending finished jobs past their back-off, keyed by session id.
+    let mut pending: Vec<(&crate::mcp::jobs::StoredJob, &str)> = Vec::new();
+    for job in &app.services.delegates {
+        if job.phase() != crate::mcp::jobs::JobPhase::Done {
+            continue;
+        }
+        if app.delegate_speed_cache.contains_key(&job.record.job_id) {
+            continue;
+        }
+        if let Some(retry) = app.delegate_speed_retry.get(&job.record.job_id)
+            && now < retry.next_ms
+        {
+            continue;
+        }
+        if let Some(sid) = job.record.session_id.as_deref() {
+            pending.push((job, sid));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+
+    // One walk matched against every pending id, never one walk per id.
+    #[cfg(test)]
+    {
+        app.delegate_speed_walks += 1;
+    }
+    let by_sid: HashMap<String, std::path::PathBuf> = crate::sessions::walk()
+        .into_iter()
+        .map(|w| (w.id, w.path))
+        .collect();
+
+    for (job, sid) in pending {
+        let speed = by_sid
+            .get(sid)
+            .and_then(|path| crate::tps::transcript_speed(path))
+            .and_then(day_average);
+        match speed {
+            Some(speed) => {
+                app.delegate_speed_cache
+                    .insert(job.record.job_id.clone(), speed);
+                app.delegate_speed_retry.remove(&job.record.job_id);
+            }
+            None => {
+                let backoff = app.delegate_speed_retry.get(&job.record.job_id).map_or(
+                    FINISHED_SPEED_FIRST_BACKOFF_MS,
+                    |r| {
+                        r.backoff_ms
+                            .saturating_mul(2)
+                            .min(FINISHED_SPEED_MAX_BACKOFF_MS)
+                    },
+                );
+                app.delegate_speed_retry.insert(
+                    job.record.job_id.clone(),
+                    FinishedRetry {
+                        next_ms: now.saturating_add(backoff),
+                        backoff_ms: backoff,
+                    },
+                );
+            }
+        }
+    }
 }
 
 /// Resolve a pending `require client tokens` on every tick, whatever tab is
@@ -20295,8 +29620,13 @@ fn poll_daemon_health(app: &mut App) {
 /// ends the wait; a `healthy` slot whose pid is `Some` and differs from the one
 /// read before the mint runs the require. The one-save guard defers a run to a
 /// later tick rather than dropping it, and clearing the pending before starting
-/// means a second tick before the outcome drains starts nothing.
+/// means a second tick before the outcome drains starts nothing. The exit wait
+/// skips it: an exit drops the pending record with the process, so a restart
+/// during the wait starts no require save.
 fn poll_pending_require(app: &mut App) {
+    if app.exit_wait {
+        return;
+    }
     let Some(pending) = app.services.pending_require.clone() else {
         return;
     };
@@ -20338,31 +29668,23 @@ fn poll_live_sessions(app: &mut App) {
         return;
     }
     app.last_live_sessions_refresh = Some(Instant::now());
-    let tally = crate::live_sessions::LiveTally::collect(&app.config());
+    // The job-store snapshot and the handed-off set it implies ride the same
+    // tick: refreshed here, never per frame, so the Setup detail's live-session
+    // field and the tally's background-job term read one store at most once a
+    // second.
+    let jobs = crate::claude_jobs::job_trees();
+    let tally = crate::live_sessions::LiveTally::collect_in(&app.config(), &jobs);
     app.set_live_sessions(tally);
+    app.handed_off = crate::runtime::handed_off_live_members(&jobs);
+    app.job_trees = jobs;
 }
 
-/// The header chip's number: the fleet total, or `—` for a tally that could
-/// not read the registry or the bare-session markers.
-pub(crate) fn live_count_text(total: Option<usize>) -> String {
-    total.map_or_else(|| "—".to_owned(), |n| n.to_string())
-}
-
-/// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`
-/// mirror, at most once a second, gated per profile on the record's stat (an
-/// mtime move, or the file appearing/disappearing). This is the stood-down
-/// TUI's heal path: the fetcher (another process) clears or rewrites
+/// Re-sync the durable dead-login verdicts into the live `ThirdPartyBroken`
+/// mirror at most once a second, through the pass the daemon runs too
+/// ([`crate::usage::sync_dead_logins`]). This is the stood-down TUI's heal
+/// path: the fetcher (another process) clears or rewrites
 /// `third_party_auth.json` under a credential the local mirror still marks,
-/// and the config never changes, so the reload seed cannot see it. Both
-/// directions ride the same stat walk — a record appearing seeds the name, a
-/// record gone drops it. The seed's own shape gate
-/// (`fallback::third_party_key_rejected`) is the ONE gate the insert branch
-/// runs: a `ConsoleExpired` outcome also writes the record under a
-/// still-matching fingerprint, and a lapsed Alibaba console session is
-/// usage-only — it must never render as key-rejected, so a profile the
-/// predicate refuses never inserts and any entry it already has drops. Reads
-/// the record only when the stat moved; the per-second cost is one stat per
-/// credentialed profile, the same discipline `poll_live_sessions` applies.
+/// and the config never changes, so the reload seed cannot see it.
 fn sync_broken_verdicts(app: &mut App) {
     const SYNC_INTERVAL: Duration = Duration::from_secs(1);
     if app
@@ -20372,62 +29694,34 @@ fn sync_broken_verdicts(app: &mut App) {
         return;
     }
     app.last_broken_verdict_sync = Some(Instant::now());
+    crate::usage::sync_dead_logins(
+        &app.config,
+        &app.third_party_broken,
+        &mut app.broken_verdict_mtimes,
+    );
+}
 
-    // The credentialed profiles plus their fingerprints, collected under the
-    // config guard so the stat walk below is lock-free; the mirror lock (295)
-    // ranks outside Config (400), so the update happens after the guard drops.
-    // The clone carries what the shared shape predicate reads — the predicate
-    // itself is the gate, never a reimplementation of its fields.
-    let credentialed: Vec<(Profile, u64)> = {
-        let cfg = app.config();
-        cfg.profiles
-            .iter()
-            .filter_map(|p| {
-                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.clone(), fp))
-            })
-            .collect()
-    };
-
-    let changed: Vec<(Profile, Option<std::time::SystemTime>, u64)> = credentialed
-        .into_iter()
-        .filter_map(|(profile, fp)| {
-            let name = profile.name.to_string();
-            let stat = crate::profile_cache::profile_cache_path(
-                &ProfileName::from(name.clone()),
-                crate::profile_cache::THIRD_PARTY_AUTH_FILE,
-            )
-            .as_deref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok());
-            // `Some(&stat)` doubles as the changed check: an unseen name has no
-            // entry (always "changed"), and a seen one skips while the stat
-            // matches — including two `None`s for a record that never existed.
-            if app.broken_verdict_mtimes.get(&name) == Some(&stat) {
-                return None;
-            }
-            Some((profile, stat, fp))
-        })
-        .collect();
-    if changed.is_empty() {
+/// Re-sync every profile's credit refusal at most once a second, re-reading a
+/// record only when its stat moved, as [`sync_broken_verdicts`] does for the
+/// dead-login records: the instance that fetches usage writes and clears them,
+/// possibly in another process.
+fn sync_credit_refusals(app: &mut App) {
+    const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_credit_refusal_sync
+        .is_some_and(|t| t.elapsed() < SYNC_INTERVAL)
+    {
         return;
     }
-
-    if let Ok(mut broken) = app.third_party_broken.lock() {
-        for (profile, stat, fp) in changed {
-            // The insert branch runs the seed's own predicate: the record must
-            // match the credential the profile holds RIGHT NOW, on a profile
-            // shape that can be key-rejected at all. Everything the predicate
-            // refuses — a cleared record, a re-keyed one, or a lapsed Alibaba
-            // console session — drops the entry.
-            if crate::fallback::third_party_key_rejected(&profile, &profile.name) {
-                broken.insert(profile.name.to_string(), fp);
-            } else {
-                broken.remove(profile.name.as_str());
-            }
-            app.broken_verdict_mtimes
-                .insert(profile.name.to_string(), stat);
-        }
-    }
+    app.last_credit_refusal_sync = Some(Instant::now());
+    let names: Vec<ProfileName> = app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    app.credit_refusal_watch.refresh(&names);
+    app.credit_refusals = app.credit_refusal_watch.refusals();
 }
 
 /// How often a shown standalone-shunt claim is re-probed, so a shunt that
@@ -20442,8 +29736,22 @@ const STANDALONE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// `clauth mcp` — both stay `r`-gated.
 fn poll_services_refresh(app: &mut App) {
     const SERVICES_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+    const OUT_OF_VIEW_ACTIVITY_INTERVAL: Duration = Duration::from_secs(5);
 
-    if app.tab != Tab::Services || !app.modals.is_empty() {
+    if app.tab != Tab::Services {
+        // While the tab is out of view the plugin and herdr rows' health still
+        // needs a periodic re-read so a state change can color the tab — but
+        // only the cheap local reads: no probe worker and no `claude --version`
+        // spawn rides this cadence.
+        if app.modals.is_empty()
+            && app.last_services_refresh.elapsed() >= OUT_OF_VIEW_ACTIVITY_INTERVAL
+        {
+            app.last_services_refresh = Instant::now();
+            refresh_services_activity(app);
+        }
+        return;
+    }
+    if !app.modals.is_empty() {
         return;
     }
     if app.last_services_refresh.elapsed() < SERVICES_REFRESH_INTERVAL {
@@ -20467,6 +29775,115 @@ fn poll_services_refresh(app: &mut App) {
     {
         app.services.last_standalone_recheck = Instant::now();
         app.services.standalone_probe.start();
+    }
+}
+
+/// Read the plugin and herdr rows' health from the clauth path the caller
+/// resolved, the cached probes and the local config files — the cheap reads
+/// the in-view recompute and the out-of-view refresh share. Never spawns a
+/// process. `clauth_path` is passed in so a recompute that already walked
+/// `PATH` for its own gates walks it once, not again here.
+fn plugin_herdr_checks(
+    app: &App,
+    clauth_path: Option<&std::path::Path>,
+) -> (Check, Option<(Check, Option<crate::herdr::ConfigStatus>)>) {
+    let plugin = plugin_row(app, clauth_path);
+    let herdr = app
+        .services
+        .herdr
+        .as_ref()
+        .and_then(|probe| probe.as_ref())
+        .map(|probe| {
+            let config = probe
+                .config_path
+                .as_deref()
+                .map(crate::herdr::read_config)
+                .and_then(Result::ok)
+                .map(|text| crate::herdr::config_status(&text));
+            (herdr_check(probe, config.as_ref()), config)
+        });
+    (plugin, herdr)
+}
+
+/// The `plugin` row over the cached probes, closed by the daemon's
+/// changed-binary line for the kind the app holds. The line moves no health:
+/// the heal only waits for the daemon's restart.
+fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
+    let mut check = plugin_check(
+        clauth_path,
+        app.services.cc_version.clone(),
+        app.services.mcp_boot.clone(),
+        crate::completions::detected_installed_script(),
+    );
+    // Its own group, last: the renderer wraps it over several rows, and past
+    // every fix line those rows move no fix line's rendered row.
+    if let Some(change) = app.daemon_binary_change {
+        check.detail.push(String::new());
+        check
+            .detail
+            .push(daemon_binary_card_line(change).to_string());
+    }
+    check
+}
+
+/// Keep the detail's problem cursor inside the selected row's problem set.
+fn clamp_problem_cursor(app: &mut App) {
+    let problems = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0)
+        .saturating_sub(1);
+    if app.services.problem_cursor > problems {
+        app.services.problem_cursor = problems;
+    }
+}
+
+/// Re-read only the plugin and herdr rows' health while the Services tab is
+/// out of view, then record it for tab activity. Cheap local reads only — one
+/// PATH walk, the cached probes and config file — so no subprocess and no
+/// shunt probe start out of view.
+fn refresh_services_activity(app: &mut App) {
+    let clauth_path = crate::plugin_probe::on_path("clauth");
+    let (plugin, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
+    record_plugin_herdr_health(
+        app,
+        plugin.health,
+        herdr.as_ref().map(|(check, _)| check.health),
+    );
+}
+
+/// The tab-activity color a plugin/herdr health raises; `Idle` colors nothing
+/// (the two rows never render it, but a neutral reading is no event).
+fn health_activity(health: Health) -> Option<ToastKind> {
+    match health {
+        Health::Ok => Some(ToastKind::Success),
+        Health::Warn => Some(ToastKind::Warning),
+        Health::Danger => Some(ToastKind::Danger),
+        Health::Idle => None,
+    }
+}
+
+/// Record a fresh plugin/herdr health reading: the first reading after startup
+/// seeds the baseline (no color), a later change colors the Services tab in
+/// the new state's color through [`App::set_tab_activity`]'s worst-severity
+/// hold. A same-state reading colors nothing.
+fn record_plugin_herdr_health(app: &mut App, plugin: Health, herdr: Option<Health>) {
+    if let Some(prev) = app.services.plugin_health
+        && plugin != prev
+        && let Some(kind) = health_activity(plugin)
+    {
+        app.set_tab_activity(Tab::Services, kind);
+    }
+    app.services.plugin_health = Some(plugin);
+    if let Some(herdr) = herdr {
+        if let Some(prev) = app.services.herdr_health
+            && herdr != prev
+            && let Some(kind) = health_activity(herdr)
+        {
+            app.set_tab_activity(Tab::Services, kind);
+        }
+        app.services.herdr_health = Some(herdr);
     }
 }
 
@@ -20556,7 +29973,10 @@ fn drain_op_results(app: &mut App) {
             Err(e) => {
                 app.toast(
                     ToastKind::Danger,
-                    format!("refresh for '{name}' failed\n{e}"),
+                    format!(
+                        "refresh for '{name}' failed\n{}",
+                        escape_control(&error_toast_detail(&e))
+                    ),
                 );
                 app.set_tab_activity(Tab::Usage, ToastKind::Danger);
             }
@@ -20567,22 +29987,46 @@ fn drain_op_results(app: &mut App) {
     }
 }
 
+/// Whether a modal other than the startup re-bind confirm holds the tick: the
+/// confirm never blocks the switch gates, the wrap-off drain, the divergence
+/// poll or bootstrap — a Divergence prompt those raise stacks ABOVE the
+/// confirm. Every other modal keeps the pre-confirm gate, so no prompt stacks
+/// under one. Callers: [`drain_switch_gates`], [`drain_pending_switch_off`],
+/// [`poll_credentials_divergence`], [`maybe_spawn_bootstrap`].
+fn blocking_modal_open(app: &App) -> bool {
+    app.modals.iter().any(|m| !matches!(m, Modal::Rebind(_)))
+}
+
 /// Complete switches whose off-thread AUTH-1 gate answered: clear the pending
 /// mark, then relink (`Ready`/`Refreshed`) or refuse with the login hint
 /// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
 /// modal guard — completion can raise the Divergence prompt, which must not
-/// stack under an open modal.
+/// stack under an open modal — except during the exit wait, which must drain
+/// the answered gate's `Switching` marker or the quit strands on it.
 fn drain_switch_gates(app: &mut App) {
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) && !app.exit_wait {
         return;
     }
     while let Ok(SwitchGateResult { name, gate }) = app.switch_gates.try_recv() {
         clear_activity(&app.activity, &name);
+        let (gate, settled) = match gate {
+            SwitchGate::Gated { gate, settled } => (gate, settled),
+            SwitchGate::Held(outcome) => {
+                if !app.exit_wait {
+                    land_bare_item_outcome(app, BareItemWrite::Switch(name), outcome);
+                }
+                continue;
+            }
+        };
+        // The settle's carry landed on the worker, before the gate ran.
+        if let Some(notice) = settled.notice {
+            app.toast(ToastKind::Warning, notice);
+        }
         match gate {
-            oauth::AuthGate::Ready => finalize_switch(app, &name),
+            oauth::AuthGate::Ready => finalize_switch(app, &name, settled.placed, true),
             oauth::AuthGate::Refreshed => {
                 app.refresh_tokens();
-                finalize_switch(app, &name);
+                finalize_switch(app, &name, settled.placed, true);
             }
             oauth::AuthGate::Broken => app.toast(
                 ToastKind::Danger,
@@ -20596,6 +30040,10 @@ fn drain_switch_gates(app: &mut App) {
                 },
                 crate::format::refresh_transient(&name, &e).toast(),
             ),
+            // Unreachable: the TUI passes `None` as the spend marker.
+            oauth::AuthGate::Stopping => {
+                app.toast(ToastKind::Danger, crate::format::DAEMON_STOPPING)
+            }
         }
     }
 }
@@ -20604,7 +30052,10 @@ fn drain_switch_gates(app: &mut App) {
 /// may raise a Divergence prompt; consuming the flag while one is open would
 /// let the scheduler re-set it and stack duplicates.
 fn drain_pending_switch_off(app: &mut App) {
-    if !app.modals.is_empty() {
+    if app.exit_wait {
+        return;
+    }
+    if blocking_modal_open(app) {
         return;
     }
     let switch_off_pending = app
@@ -20614,6 +30065,16 @@ fn drain_pending_switch_off(app: &mut App) {
         .unwrap_or(false);
     if switch_off_pending {
         perform_switch_off(app);
+    }
+}
+
+/// Land the latest [`App::refresh_unsaved_live_login`] answer; an older
+/// request's answer is stale.
+fn drain_unsaved_live_login(app: &mut App) {
+    while let Ok((generation, unsaved)) = app.unsaved_login_rx.try_recv() {
+        if generation == app.unsaved_login_generation {
+            app.unsaved_live_login = unsaved;
+        }
     }
 }
 
@@ -20637,7 +30098,16 @@ fn drain_startup_signals(app: &mut App) {
 
 /// Spawn bootstrap once reconcile is done and no modal is open.
 fn maybe_spawn_bootstrap(app: &mut App) {
-    if app.bootstrap_started || !app.reconcile_done || !app.modals.is_empty() {
+    // The exit wait starts no new write: spawning the bootstrap would start the
+    // scheduler, which could raise a fresh spend after the user quit.
+    if app.exit_wait {
+        return;
+    }
+    // The startup re-bind confirm never blocks bootstrap: usage seeding, the
+    // scheduler and the startup auto-switch must run even while the confirm
+    // waits on a key. Every other modal keeps the pre-diff gate.
+    let blocking_modal = blocking_modal_open(app);
+    if app.bootstrap_started || !app.reconcile_done || blocking_modal {
         return;
     }
     app.bootstrap_started = true;
@@ -20672,7 +30142,7 @@ fn poll_credentials_divergence(app: &mut App) {
     }
     app.last_divergence_check = Some(Instant::now());
 
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) {
         return;
     }
     // The reload fingerprint never stats the live credentials file, so a login
@@ -20746,11 +30216,14 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
                 // standing auth_broken quarantine like the sibling fresh-login
                 // paths do.
                 oauth::mark_auth_broken(&app.config, active, false);
-                app.last_reload_fp = reload_fingerprint();
+                app.apply_forgets();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),
+            Err(e) => app.toast(
+                ToastKind::Danger,
+                format!("adopt failed\n{}", escape_control(&error_toast_detail(&e))),
+            ),
         }
         return DivergenceVerdict::Clean;
     }
@@ -20759,8 +30232,11 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
     // banner. This clears clauth's own symlink AND the macOS regular-file mirror CC
     // writes over it. The switch/defer gates apply the same exemption through
     // `live_diverged_and_unsaved`; the poll must adopt a first login before this
-    // point, so it checks the predicate directly here instead.
-    if crate::claude::live_login_is_stored(active) {
+    // point, so it checks the predicate directly here instead. The own-store
+    // half only: a login a sibling account stores is saved too, but it still
+    // raises the banner naming that owner, whose "switch to it" is the
+    // resolution (no default captures it, and a switch passes it as saved).
+    if crate::claude::live_login_in_own_store(active) {
         app.divergence_pending = None;
         return DivergenceVerdict::Clean;
     }
@@ -20788,7 +30264,8 @@ fn resolve_or_note_divergence(app: &mut App, active: &str) {
         // The default IS the resolution, so drop the banner it would otherwise
         // paint for the tick between resolving and the next poll's re-classify.
         app.divergence_pending = None;
-        run_divergence_choice(app, active, choice);
+        // No prompt waits here: the login the default resolves is the one live now.
+        run_divergence_choice(app, active, choice, live_creds_fingerprint());
     }
 }
 
@@ -20829,7 +30306,12 @@ fn startup_default(app: &App, active: &str) -> Option<crate::profile::Divergence
     if live_login_sibling_owner(app, active).is_some() {
         return None;
     }
-    app.config().state.default_divergence
+    // An `Overwrite` default cannot land on an account running on a
+    // long-lived token, which the prompt does not offer it for either.
+    app.config().state.default_divergence.filter(|choice| {
+        *choice != DivergenceChoice::Overwrite
+            || !crate::claude::has_session_token(&ProfileName::from(active))
+    })
 }
 
 /// Whether [`resolve_or_note_divergence`] will resolve a divergence on
@@ -20838,19 +30320,6 @@ fn startup_default(app: &App, active: &str) -> Option<crate::profile::Divergence
 /// default).
 fn divergence_resolves_to_banner(app: &App, active: &str) -> bool {
     startup_default(app, active).is_none()
-}
-
-/// SipHash of the live access token — a cheap identity for "which login sits in
-/// `~/.claude/.credentials.json` right now". It changes on every re-login and
-/// every refresh, so the banner's owner lookup re-runs exactly when the creds
-/// change. `None` when no readable OAuth login is present.
-fn live_creds_fingerprint() -> Option<u64> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let creds = read_claude_credentials().ok().flatten()?;
-    let token = creds.access_token().filter(|t| !t.is_empty())?;
-    let mut hasher = DefaultHasher::new();
-    token.hash(&mut hasher);
-    Some(hasher.finish())
 }
 
 /// Clears `bootstrap_active` and posts `BootstrapDone` when dropped — success
@@ -20868,11 +30337,33 @@ impl Drop for BootstrapDoneGuard {
     }
 }
 
+/// Test seam: every placement a writer enters while a test watches an item,
+/// with the entering thread and whether that thread's writer guards then let
+/// the item be replaced. Armed with the item; `None` otherwise.
+#[cfg(test)]
+pub(crate) static BARE_ITEM_PLACEMENTS: std::sync::Mutex<Option<BareItemPlacements>> =
+    std::sync::Mutex::new(None);
+
+/// The item a test watches, and each placement entered while it does: the
+/// entering thread and whether the item could then be replaced there.
+#[cfg(test)]
+pub(crate) type BareItemPlacements = (serde_json::Value, Vec<(std::thread::ThreadId, bool)>);
+
+#[cfg(test)]
+fn probe_bare_item_placement() {
+    if let Ok(mut probe) = BARE_ITEM_PLACEMENTS.lock()
+        && let Some((item, seen)) = probe.as_mut()
+    {
+        let replaceable = crate::claude::bare_item_may_be_replaced(item, None);
+        seen.push((std::thread::current().id(), replaceable));
+    }
+}
+
 /// Handles of every [`spawn_worker`] thread, so a test can join them BEFORE its
-/// `HomeSandbox` drops. `HOME_OVERRIDE` is a process-global cleared on that drop,
-/// so a detached worker that outlives it resolves the operator's REAL `$HOME` and
-/// takes real locks under `~/.clauth` — `RotationGuard::acquire` alone does
-/// `mkdir_700` + a blocking flock. Serialized by `profile::HOME_TEST_LOCK`, which
+/// `HomeSandbox` drops. `HOME_OVERRIDE` is a process-global cleared on that drop;
+/// a worker that outlives it is detached, and its next home read resolves
+/// whichever `HOME_OVERRIDE` is installed then (a later test's sandbox), never
+/// the operator's real `$HOME`. Serialized by `profile::HOME_TEST_LOCK`, which
 /// every sandboxed test holds, so the registry is effectively exclusive.
 /// Never compiled into the binary.
 #[cfg(test)]
@@ -20889,6 +30380,97 @@ pub(crate) fn join_test_workers() {
         .unwrap_or_default();
     for handle in handles {
         let _ = handle.join();
+    }
+}
+
+/// Join every worker spawned so far, waiting at most `bound` for all of them.
+/// A handle still unfinished when the bound lapses is handed BACK to the
+/// registry before this returns: the caller can then fail naming what it
+/// waited on, while [`join_test_workers`] and the next bounded join still wait
+/// for that handle — or, in `HomeSandbox::drop`, detach it so a stuck worker
+/// cannot hang the teardown again. `Err` carries how many handles were still
+/// running at the bound.
+#[cfg(test)]
+pub(crate) fn join_test_workers_within(bound: Duration) -> Result<(), usize> {
+    let handles: Vec<_> = TEST_WORKERS
+        .lock()
+        .map(|mut w| std::mem::take(&mut *w))
+        .unwrap_or_default();
+    let deadline = Instant::now() + bound;
+    let mut unfinished = Vec::new();
+    for handle in handles {
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            unfinished.push(handle);
+        }
+    }
+    if unfinished.is_empty() {
+        Ok(())
+    } else {
+        let n = unfinished.len();
+        if let Ok(mut workers) = TEST_WORKERS.lock() {
+            workers.extend(unfinished);
+        }
+        Err(n)
+    }
+}
+
+/// Detach every worker the registry still holds, dropping its handle. Used by
+/// `HomeSandbox::drop` after a bounded join misses: the worker is stuck past
+/// the bound and the teardown must not hang on it again. A detached worker's
+/// next [`crate::profile::home_dir`] resolves whichever `HOME_OVERRIDE` is
+/// installed then (a later test's sandbox), never the operator's real `$HOME`.
+#[cfg(test)]
+pub(crate) fn detach_test_workers() {
+    let handles: Vec<_> = TEST_WORKERS
+        .lock()
+        .map(|mut w| std::mem::take(&mut *w))
+        .unwrap_or_default();
+    drop(handles);
+}
+
+/// Test seam for the rotate workers [`run_confirm_action`] spawns: when a test
+/// arms the hold, each spawned rotate worker sends on the parked channel and
+/// blocks on the release channel BEFORE touching `rotate_one`/`refresh_all`, so
+/// "confirm, then quit before the worker runs" is driven deterministically. The
+/// parked send lands before the block, so the test's `recv` is a join, never a
+/// clock poll.
+#[cfg(test)]
+static ROTATE_WORKER_HOLD: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn arm_rotate_worker_hold()
+-> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    if let Ok(mut hold) = ROTATE_WORKER_HOLD.lock() {
+        *hold = Some((parked_tx, release_rx));
+    }
+    (parked_rx, release_tx)
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_rotate_worker_hold() {
+    if let Ok(mut hold) = ROTATE_WORKER_HOLD.lock() {
+        *hold = None;
+    }
+}
+
+#[cfg(test)]
+fn rotate_worker_gate() {
+    let hold = ROTATE_WORKER_HOLD
+        .lock()
+        .map(|mut h| h.take())
+        .unwrap_or_default();
+    if let Some((parked_tx, release_rx)) = hold {
+        let _ = parked_tx.send(());
+        let _ = release_rx.recv();
     }
 }
 
@@ -20913,28 +30495,39 @@ where
 
 /// Snapshot active credentials and detach the symlink. After shutdown, external
 /// writes to `.credentials.json` land in the standalone file, not the profile.
+///
+/// The bounded wait covers only a running token spend, as the backstop for an
+/// exit that skipped the exit wait (a second quit, or a quit while a checking
+/// save holds it): a process that dies between the token endpoint's answer and
+/// the stage write loses the minted pair. A usage read, a queued fetch or a
+/// third-party leg may be abandoned, so none of them delays the exit.
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
     app.shutting_down.store(true, Ordering::SeqCst);
     let wait_start = Instant::now();
     while wait_start.elapsed() < Duration::from_millis(2000) {
-        if !any_busy(&app.activity) {
+        // Drain answered switch gates each iteration without relinking: the
+        // gate already landed its pair (staged/landed), and relinking during
+        // shutdown would re-point credentials after the user quit. Clearing the
+        // marker is what frees the spend wait — an answered gate that stays
+        // queued would otherwise burn the whole bound.
+        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
+            clear_activity(&app.activity, &name);
+        }
+        if !token_spend_in_flight(&app.activity) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Wait up to 5 s for the update check to finish; let it detach if it's
-    // still running (a slow network shouldn't delay TUI exit indefinitely).
+    // Wait up to 5 s for the update check to finish, detaching a still-running
+    // check after that (a slow download shouldn't delay TUI exit) — but never
+    // while the replace step runs, so this shutdown path can't strand the
+    // self-replace's staged file beside the binary.
     if let Some(handle) = app.update_handle.take() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        drop(handle);
+        handle.wait_on_exit(Duration::from_secs(5));
     }
     {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
-        let _ = save_app_state(&cfg.state);
     }
     let _ = detach_credentials_link();
     Ok(())

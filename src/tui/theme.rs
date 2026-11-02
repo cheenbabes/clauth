@@ -12,7 +12,10 @@
 //! atomic so a re-selection re-renders in the new palette on the next frame
 //! without a process restart. Renders read it via the accessor fns below.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(not(test))]
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -29,8 +32,8 @@ pub(crate) enum Tier {
 }
 
 impl Tier {
-    /// Stable atomic encoding. `0` doubles as "uninitialized" so the accessor
-    /// can fall back to auto-detect before [`init`] runs.
+    /// Stable code. `0` doubles as "uninitialized": the production accessor
+    /// falls back to auto-detect, the test accessor to `Full`.
     fn as_code(self) -> u8 {
         match self {
             Tier::Full => 1,
@@ -47,9 +50,24 @@ impl Tier {
     }
 }
 
-/// Process-global tier as an atomic code (`0` = unset → auto-detect). Seeded by
-/// [`init`] and swappable at runtime via [`set_tier`] for the live theme picker.
+/// Tier holder. In production builds a process-global atomic code (`0` = unset
+/// → auto-detect), seeded by [`init`] and swappable at runtime via [`set_tier`]
+/// for the live theme picker. In test builds a thread-local cell, so a
+/// `TierSandbox` on one test thread never changes another thread's tier.
+#[cfg(not(test))]
 static TIER: AtomicU8 = AtomicU8::new(0);
+
+/// Terminal family holder, paired with [`TIER`]. Claude Code draws a different
+/// working-line set when `TERM` is `xterm-ghostty`, so the choice is made once
+/// at startup rather than per frame.
+#[cfg(not(test))]
+static GHOSTTY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static TIER: Cell<u8> = const { Cell::new(0) };
+    static GHOSTTY: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Detect the tier from `$COLORTERM`:
 /// `truecolor` or `24bit` → [`Tier::Full`]; anything else → [`Tier::Compatible`].
@@ -64,44 +82,73 @@ pub(crate) fn detect() -> Tier {
     }
 }
 
-/// Seed the process tier at startup.
+/// Detect the terminal family Claude Code draws its other working-line set for.
+pub(crate) fn detect_ghostty() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term == "xterm-ghostty")
+}
+
+/// Seed the process tier and terminal family at startup.
 /// Precedence (highest first): explicit override → auto-detect.
 pub(crate) fn init(override_tier: Option<Tier>) {
     set_tier(override_tier.unwrap_or_else(detect));
+    set_ghostty(detect_ghostty());
+}
+
+/// Whether the terminal is the family Claude Code draws its other working-line
+/// set for.
+pub(crate) fn ghostty_marks() -> bool {
+    #[cfg(not(test))]
+    {
+        GHOSTTY.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    {
+        GHOSTTY.with(Cell::get)
+    }
+}
+
+pub(crate) fn set_ghostty(on: bool) {
+    #[cfg(not(test))]
+    GHOSTTY.store(on, Ordering::Relaxed);
+    #[cfg(test)]
+    GHOSTTY.with(|c| c.set(on));
 }
 
 /// Swap the active tier at runtime. The next render reads the new value, so the
 /// Config tab's theme selector applies immediately.
 pub(crate) fn set_tier(tier: Tier) {
+    #[cfg(not(test))]
     TIER.store(tier.as_code(), Ordering::Relaxed);
+    #[cfg(test)]
+    TIER.with(|c| c.set(tier.as_code()));
 }
 
-/// Return the active tier. Falls back to auto-detect if [`init`] was not called.
+/// Return the active tier. Falls back to auto-detect if [`init`] was not called;
+/// in test builds an unset tier is `Full`, independent of the ambient
+/// `$COLORTERM`.
 #[inline]
 pub(crate) fn tier() -> Tier {
-    Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
+    #[cfg(not(test))]
+    {
+        Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
+    }
+    #[cfg(test)]
+    {
+        Tier::from_code(TIER.with(|c| c.get())).unwrap_or(Tier::Full)
+    }
 }
 
-/// Serializes tests that pin the tier. Every `tests/inline/*.rs` module compiles
-/// into the one bin target, so under `cargo test` they run as threads sharing
-/// this `TIER`. `testutil::TierSandbox` acquires it as an RAII guard.
-#[cfg(test)]
-pub(crate) static TIER_TEST_LOCK: crate::lockorder::RankedMutex<
-    (),
-    crate::lockorder::rank::TierTest,
-> = crate::lockorder::RankedMutex::new(());
-
-/// Read the stored pin, `None` for unset. [`tier`] collapses unset into a
-/// detected tier, which a restore would then write back as a real pin.
+/// Read the stored pin, `None` for unset. [`tier`] collapses unset into the
+/// test default `Full`, which a restore would then write back as a real pin.
 #[cfg(test)]
 pub(crate) fn tier_override() -> Option<Tier> {
-    Tier::from_code(TIER.load(Ordering::Relaxed))
+    Tier::from_code(TIER.with(|c| c.get()))
 }
 
 /// Put back a [`tier_override`] reading.
 #[cfg(test)]
 pub(crate) fn restore_tier(snapshot: Option<Tier>) {
-    TIER.store(snapshot.map_or(0, Tier::as_code), Ordering::Relaxed);
+    TIER.with(|c| c.set(snapshot.map_or(0, Tier::as_code)));
 }
 
 // ── Palette tables ────────────────────────────────────────────────────────────
@@ -166,6 +213,14 @@ pub(crate) fn accent_color() -> Color {
 pub(crate) fn accent_2_color() -> Color {
     pick(Color::Rgb(217, 119, 87), Color::Indexed(173))
 }
+/// Clawd's `clawd_background` cut-out colour: `rgb(0,0,0)` in the source's dark
+/// and light themes alike (its ansi themes use `ansi:black`). The compatible
+/// tier uses xterm-256 index 16 (the colour cube's black), never 16-colour
+/// `Black`, which a terminal theme can repaint.
+#[inline]
+pub(crate) fn clawd_cutout_color() -> Color {
+    pick(Color::Rgb(0, 0, 0), Color::Indexed(16))
+}
 
 // ── Semantic ──────────────────────────────────────────────────────────────────
 #[inline]
@@ -198,19 +253,133 @@ pub(crate) fn bg_warning_color() -> Color {
 }
 
 /// Per-channel RGB blend of `over` onto `beneath`, weighted by `alpha`
-/// (the weight of `over`, clamped to `0.0..=1.0`).
-/// Blends only on the full truecolor tier with both colors RGB-resolvable;
-/// otherwise returns `over` unchanged.
+/// (the weight of `over`, clamped to `0.0..=1.0`). The full tier blends two
+/// `Color::Rgb`s and returns `over` unchanged otherwise — the call shape the
+/// identity-wave crest uses. The compatible tier resolves both colors to RGB
+/// (an indexed color to the RGB its xterm index stands in for, an unknown or
+/// `Reset` one to `BG`), blends, and snaps to the nearest xterm-256 index.
 pub(crate) fn blend_over(beneath: Color, over: Color, alpha: f64) -> Color {
-    let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (beneath, over) else {
-        return over;
-    };
-    if tier() != Tier::Full {
-        return over;
-    }
     let a = alpha.clamp(0.0, 1.0);
     let mix = |o: u8, b: u8| -> u8 { (a * f64::from(o) + (1.0 - a) * f64::from(b)).round() as u8 };
-    Color::Rgb(mix(or, br), mix(og, bg), mix(ob, bb))
+    match tier() {
+        Tier::Full => {
+            let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (beneath, over) else {
+                return over;
+            };
+            Color::Rgb(mix(or, br), mix(og, bg), mix(ob, bb))
+        }
+        Tier::Compatible => {
+            let (br, bg, bb) = rgb_of(beneath);
+            let (or, og, ob) = rgb_of(over);
+            Color::Indexed(nearest_index((mix(or, br), mix(og, bg), mix(ob, bb))))
+        }
+    }
+}
+
+/// The RGB a color resolves to for the compatible-tier blend. An indexed color
+/// resolves to the RGB its xterm index stands in for; an unknown or `Reset`
+/// one counts as `BG`.
+fn rgb_of(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => indexed_rgb(i),
+        _ => (30, 30, 46),
+    }
+}
+
+/// The RGB column of the theme token whose nearest xterm-256 index is `i` —
+/// the same RGB the accessors above pair with that index. An index the theme
+/// did not mint resolves from the standard xterm-256 palette instead.
+fn indexed_rgb(i: u8) -> (u8, u8, u8) {
+    match i {
+        235 => (30, 30, 46),
+        16 => (0, 0, 0),
+        234 => (24, 24, 37),
+        233 => (17, 17, 27),
+        236 => (40, 40, 56),
+        238 => (49, 50, 68),
+        240 => (69, 71, 90),
+        189 => (205, 214, 244),
+        145 => (166, 173, 200),
+        102 => (127, 132, 156),
+        75 => (67, 171, 229),
+        173 => (217, 119, 87),
+        151 => (166, 227, 161),
+        223 => (249, 226, 175),
+        211 => (243, 139, 168),
+        117 => (116, 199, 236),
+        52 => (75, 35, 44),
+        58 => (74, 60, 33),
+        _ => standard_palette_rgb(i),
+    }
+}
+
+/// The VGA/web 16-color set `standard_palette_rgb` maps to indices 0–15. Those
+/// indices are terminal-defined, so [`nearest_index`] never targets them; this
+/// table only resolves a `Color::Indexed(0..=15)` beneath to a fixed RGB.
+const ANSI_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (128, 0, 0),
+    (0, 128, 0),
+    (128, 128, 0),
+    (0, 0, 128),
+    (128, 0, 128),
+    (0, 128, 128),
+    (192, 192, 192),
+    (128, 128, 128),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (0, 0, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// The six cube levels of the standard xterm-256 palette.
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// The standard xterm-256 palette value for one index: 16 ANSI colors, a
+/// 6×6×6 cube, then a grayscale ramp.
+fn standard_palette_rgb(i: u8) -> (u8, u8, u8) {
+    match i {
+        0..=15 => ANSI_RGB[usize::from(i)],
+        16..=231 => {
+            let n = i - 16;
+            (
+                CUBE_LEVELS[usize::from(n / 36)],
+                CUBE_LEVELS[usize::from((n / 6) % 6)],
+                CUBE_LEVELS[usize::from(n % 6)],
+            )
+        }
+        _ => {
+            let v = 8 + (i - 232) * 10;
+            (v, v, v)
+        }
+    }
+}
+
+/// The xterm-256 index nearest to `rgb` by squared distance, the lower index
+/// winning a tie. Searches 16..=255 only: indices 0..15 are terminal-defined,
+/// so they are never a snap target.
+fn nearest_index(rgb: (u8, u8, u8)) -> u8 {
+    let (r, g, b) = rgb;
+    let distance = |(pr, pg, pb): (u8, u8, u8)| {
+        let dr = i32::from(r) - i32::from(pr);
+        let dg = i32::from(g) - i32::from(pg);
+        let db = i32::from(b) - i32::from(pb);
+        dr * dr + dg * dg + db * db
+    };
+    let mut best = 16;
+    let mut best_distance = i32::MAX;
+    for i in 16..=u8::MAX {
+        let d = distance(standard_palette_rgb(i));
+        if d < best_distance {
+            best_distance = d;
+            best = i;
+        }
+    }
+    best
 }
 
 // ── Toggle glyphs (tier-sensitive) ────────────────────────────────────────────
@@ -231,6 +400,44 @@ pub(crate) fn toggle_off() -> &'static str {
         Tier::Full => "○─",
         Tier::Compatible => "[off]",
     }
+}
+
+// Claude Code's working-line marks, in its default terminals and in the set it
+// draws when `TERM` is `xterm-ghostty`.
+const CLAUDE_WORKING_FRAMES: [&str; 6] = ["·", "✢", "*", "✶", "✻", "✽"];
+const CLAUDE_WORKING_FRAMES_GHOSTTY: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✻"];
+const CLAUDE_WORKING_PERIOD_MS: u64 = 2_000;
+const CLAUDE_WORKING_SNAP_MS: u64 = 64;
+
+/// The active claude account's mark `elapsed_ms` into its working animation:
+/// six frames over a 2 s period, eased in and out by a cosine.
+pub(crate) fn active_claude_frame(elapsed_ms: u64, ghostty: bool) -> &'static str {
+    let phase =
+        elapsed_ms / CLAUDE_WORKING_SNAP_MS * CLAUDE_WORKING_SNAP_MS % CLAUDE_WORKING_PERIOD_MS;
+    let turn = std::f64::consts::TAU * phase as f64 / CLAUDE_WORKING_PERIOD_MS as f64;
+    let index = ((1.0 - turn.cos()) / 2.0 * 5.0).round() as usize;
+    let frames = if ghostty {
+        &CLAUDE_WORKING_FRAMES_GHOSTTY
+    } else {
+        &CLAUDE_WORKING_FRAMES
+    };
+    frames[index.min(frames.len() - 1)]
+}
+
+/// The mark an active claude account rests on while it spends nothing.
+pub(crate) fn active_claude_rest() -> &'static str {
+    CLAUDE_WORKING_FRAMES[4]
+}
+
+/// The active codex account's mark. Static on both tiers.
+pub(crate) fn active_codex_mark() -> &'static str {
+    "⏣"
+}
+
+/// An active claude account while the client-token store holds a token for it.
+/// Static: only the claude account's own mark moves.
+pub(crate) fn active_shunt_mark() -> &'static str {
+    "⥋"
 }
 
 /// Gutter glyph for a row in edit mode — replaces the `❯` selection caret while
@@ -330,3 +537,7 @@ pub(crate) fn info() -> Style {
 pub(crate) fn success() -> Style {
     Style::default().fg(success_color())
 }
+
+#[cfg(test)]
+#[path = "../../tests/inline/tui_theme.rs"]
+mod tests;

@@ -12,9 +12,10 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     if [ "$COMP_CWORD" -eq 1 ]; then
-        local profiles
+        local profiles codex
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy completions --theme" -- "${cur}") )
+        codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy presets completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -23,25 +24,33 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--isolated --with-fallback --auto --explain" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key --dump-openapi" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "start" ] && { [ "$prev" = "--isolated" ] || [ "$prev" = "--explain" ]; } && ! printf '%s\n' "${COMP_WORDS[@]:2:COMP_CWORD-2}" | grep -vxE -- '--(isolated|explain)' >/dev/null; then
+        local profiles codex
+        profiles=$(clauth __complete 2>/dev/null)
+        codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ] || [ "$prev" = "--explain" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
-        local profiles
+        local profiles codex
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
+        [ "$prev" = "start" ] || [ "$prev" = "delete" ] && codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
-        COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--json --tokens --live" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
-        local profiles sids
+        local profiles codex sids
         profiles=$(clauth __complete 2>/dev/null)
+        codex=$(clauth __complete --codex 2>/dev/null)
         sids=$(clauth __complete --live-sessions 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} ${sids}" -- "${cur}") )
+        COMPREPLY+=( $(compgen -W "${codex}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "switch" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -72,10 +81,27 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -f -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--admin-token-file --key-file --destructive" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "presets" ]; then
+        COMPREPLY=( $(compgen -W "rebind" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ]; then
+        local profiles
+        profiles=$(clauth __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "${COMP_WORDS[1]}" = "resume" ] || [ "${COMP_WORDS[1]}" = "info" ]; }; then
+        COMPREPLY=( $(compgen -W "$(clauth __complete --resumable 2>/dev/null)" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "resume" ] && [ "${COMP_WORDS[2]}" = "--profile" ]; then
+        COMPREPLY=( $(compgen -W "$(clauth __complete --resumable 2>/dev/null)" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "delete" ] && ! printf '%s\n' "${COMP_WORDS[@]:2:COMP_CWORD-2}" | grep -vxE -- '(--yes|-y|--force)' >/dev/null; then
+        local profiles codex
+        profiles=$(clauth __complete 2>/dev/null)
+        codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "static-token" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--clear --yes" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "disable" ] && [ "${cur:0:2}" = "--" ]; then
@@ -94,10 +120,14 @@ complete -F _clauth clauth
 
 const ZSH_TEMPLATE: &str = r#"#compdef clauth
 _clauth() {
+    local profile_on_line=0
+    (( ${${(@)words[1,CURRENT-1]}[(I)--profile]} + ${${(@)words[CURRENT+1,-1]}[(I)--profile]} != 0 )) && profile_on_line=1
     if (( CURRENT == 2 )); then
-        local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        local -a profiles codex
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
+        _describe 'codex' codex
         _values 'subcommand' \
             'start[launch claude with that profile]' \
             'login[log in via browser OAuth or an API key]' \
@@ -121,29 +151,36 @@ _clauth() {
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
             'proxy[register clauth-compatible proxies and check them against the contract]' \
+            'presets[built-in preset maintenance]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
-        local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        local -a profiles codex
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        [[ "${words[2]}" == (start|delete) ]] && codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
+        [[ "${words[2]}" == (start|delete) ]] && _describe 'codex' codex
         [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
             '--with-fallback[follow the fallback chain; needs a running daemon]' \
             '--auto[pick the account by the models this session may run]' \
             '--explain[print the account that would be launched, without launching]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain) ]]; then
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == start ]] && (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--with-fallback|--explain)}} )); then
+        local -a profiles codex
+        local ret=1
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--explain)}} )) && codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
+        _describe 'profile' profiles && ret=0
+        _describe 'codex' codex && ret=0
+        return ret
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == resume && "${words[CURRENT-1]}" == --profile ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
-        _describe 'profile' profiles
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
-        local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == herdr ]]; then
         _values 'subcommand' 'install[install the plugin and wire it into herdr'"'"'s config]' \
@@ -162,6 +199,13 @@ _clauth() {
             'enable[record a proxy found on PATH, for the daemon to run]' \
             'disable[stop running a proxy, keeping its port, admin token and state]' \
             'check[check a running proxy against the clauth proxy contract]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == presets ]]; then
+        _values 'subcommand' 'rebind[move accounts onto the model ids the built-in presets bind now]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
+        local -a profiles
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        _describe 'profile' profiles
+        _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == enable ]]; then
         _values 'flag' '--port[loopback port to serve on, first enable only]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == list ]]; then
@@ -185,25 +229,46 @@ _clauth() {
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]' \
-            '--tokens[add token totals + cost; reads every transcript in full]'
+            '--tokens[add token totals + cost; reads every transcript in full]' \
+            '--live[only the sessions running now; opens no transcript]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == switch ]]; then
-        local -a profiles sids
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
-        sids=("${(@f)$(clauth __complete --live-sessions 2>/dev/null)}")
+        local -a profiles codex sids
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
+        sids=(${(f)"$(clauth __complete --live-sessions 2>/dev/null)"})
         _describe 'profile' profiles
+        _describe 'codex' codex
         _describe 'session' sids
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
-    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (resume|info) ]]; then
+        local -a sids
+        sids=(${(f)"$(clauth __complete --resumable 2>/dev/null)"})
+        _describe 'session' sids
+        [[ "${words[2]}" == resume ]] && (( ! profile_on_line )) && _values 'flag' '--profile[resume under this profile instead of prompting]'
+    elif (( CURRENT == 5 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
+        local -a sids
+        sids=(${(f)"$(clauth __complete --resumable 2>/dev/null)"})
+        _describe 'session' sids
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]] && (( ! profile_on_line )); then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' __CLATHA_LOGIN_FLAGS__
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
-        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
+        local -a profiles codex
+        local ret=1
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]' && ret=0
+        if (( ! ${#${(@)words[3,CURRENT-1]:#(--yes|-y|--force)}} )); then
+            profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+            codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
+            _describe 'profile' profiles && ret=0
+            _describe 'codex' codex && ret=0
+        fi
+        return ret
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == static-token ]]; then
         _values 'flag' '--clear[remove the long-lived token]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
@@ -232,11 +297,35 @@ _clauth "$@"
 const FISH_TEMPLATE: &str = r#"function __clauth_profiles
     clauth __complete 2>/dev/null
 end
+function __clauth_codex
+    clauth __complete --codex 2>/dev/null
+end
 function __clauth_sessions
     clauth __complete --live-sessions 2>/dev/null
 end
+function __clauth_resumable
+    clauth __complete --resumable 2>/dev/null
+end
+function __clauth_start_takes_name
+    set -l rest (commandline -opc)[3..]
+    while set -q rest[1]
+        switch $rest[1]
+            case --isolated --explain
+                set -e rest[1]
+            case --theme
+                set -e rest[1]
+                set -q rest[1]; or return 1
+                contains -- $rest[1] full compatible; or return 1
+                set -e rest[1]
+            case '*'
+                return 1
+        end
+    end
+    return 0
+end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n '__fish_is_first_token; and set -l t (commandline -opc); and test "$t[-1]" != "--theme"' -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
@@ -270,6 +359,11 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n __fish_is_first_token -a proxy -d "Register clauth-compatible proxies and check them against the contract"
+complete -c clauth -f -n __fish_is_first_token -a presets -d "Built-in preset maintenance"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets" -a rebind -d "Move accounts onto the model ids the built-in presets bind now"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a "(__clauth_profiles)" -d "Only these accounts"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a --yes -d "Apply the listed changes"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a -y -d "Apply the listed changes"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a list -d "Show every clauth proxy on PATH or registered, with its live state"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a enable -d "Record a proxy found on PATH, for the daemon to run"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a disable -d "Stop running a proxy, keeping its port, admin token and state"
@@ -283,6 +377,8 @@ complete -c clauth -F -n 'set -l t (commandline -opc); and contains -- "$t[-1]" 
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start; and not __fish_seen_subcommand_from proxy; and __clauth_start_takes_name" -a "(__clauth_codex)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from delete; and not __fish_seen_subcommand_from proxy; and not string match -qvr -- '^(--yes|-y|--force)\$' (commandline -opc)[3..]" -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
@@ -292,10 +388,16 @@ complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit 
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
-complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
+complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --live -d "Only the sessions running now; opens no transcript"
+complete -c clauth -f -n "__fish_seen_subcommand_from resume; and not contains -- --profile (commandline -opc)" -a --profile -d "Resume under this profile instead of prompting"
+complete -c clauth -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
+complete -c clauth -f -n '__fish_seen_subcommand_from resume; and set -l t (commandline -opc); and test "$t[-1]" = --profile' -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
+complete -c clauth -f -n 'set -l t (commandline -opc); and test (count $t) -eq 4; and contains -- "$t[2]" resume; and contains -- "$t[3]" --profile' -a "(__clauth_resumable)" -d Session
 __CLATHA_LOGIN_FLAGS__
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
@@ -414,14 +516,19 @@ static ZSH: LazyLock<String> =
 static FISH: LazyLock<String> =
     LazyLock::new(|| FISH_TEMPLATE.replace(LOGIN_FLAGS_MARKER, &fish_login_flags()));
 
-pub(crate) fn print_script(shell: &str) -> Result<()> {
-    let script = match shell {
-        "bash" => BASH.as_str(),
-        "zsh" => ZSH.as_str(),
-        "fish" => FISH.as_str(),
+/// The script this binary emits for `shell`, the bytes `clauth completions
+/// <shell>` prints and `install` writes.
+pub(crate) fn emission(shell: &str) -> Result<&'static str> {
+    match shell {
+        "bash" => Ok(BASH.as_str()),
+        "zsh" => Ok(ZSH.as_str()),
+        "fish" => Ok(FISH.as_str()),
         _ => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
-    };
-    out!("{script}");
+    }
+}
+
+pub(crate) fn print_script(shell: &str) -> Result<()> {
+    out!("{}", emission(shell)?);
     Ok(())
 }
 
@@ -468,8 +575,23 @@ pub(crate) fn print_session_stems() {
     }
 }
 
-/// `__complete --codex`: the codex roster, for the codex-only verbs
-/// (`limit-reset`), whose names the claude roster above never holds.
+/// `clauth resume` / `clauth info` completion words: the word `latest`, then
+/// every top-level session id of the global store, sorted. `latest` resolves
+/// to the newest of these same top-level sessions.
+fn resume_targets() -> Vec<String> {
+    let mut targets = vec!["latest".to_string()];
+    targets.extend(crate::sessions::resumable_session_ids());
+    targets
+}
+
+pub(crate) fn print_resume_targets() {
+    for target in resume_targets() {
+        outln!("{target}");
+    }
+}
+
+/// `__complete --codex`: the codex roster, whose names the claude roster above
+/// never holds.
 pub(crate) fn print_codex_profile_names() {
     for name in codex_profile_names() {
         outln!("{name}");
@@ -490,12 +612,103 @@ pub(crate) fn install(shell: Option<&str>) -> Result<()> {
         None => detect_shell()?,
     };
 
-    match shell.as_str() {
-        "bash" => install_rc("bash", &BASH, ".bashrc"),
-        "zsh" => install_rc("zsh", &ZSH, ".zshrc"),
-        "fish" => install_fish(),
-        s => bail!("unsupported shell '{s}', expected: bash, zsh, fish"),
+    match rc_name(&shell) {
+        Some(rc) => install_rc(&shell, emission(&shell)?, rc),
+        None if shell == "fish" => install_fish(),
+        None => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
     }
+}
+
+/// The shell rc file `install` keeps clauth's `source` line in; only the
+/// shells that read one have an entry.
+fn rc_name(shell: &str) -> Option<&'static str> {
+    match shell {
+        "bash" => Some(".bashrc"),
+        "zsh" => Some(".zshrc"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptState {
+    Current,
+    Stale,
+    Missing,
+}
+
+/// Where `install` puts `shell`'s script: the one path builder the writer and
+/// the state reader share, so neither can drift onto another location.
+fn script_path(home: &std::path::Path, shell: &str) -> Result<std::path::PathBuf> {
+    match shell {
+        "bash" | "zsh" => Ok(home
+            .join(".clauth")
+            .join("completions")
+            .join(format!("clauth.{shell}"))),
+        "fish" => Ok(home
+            .join(".config")
+            .join("fish")
+            .join("completions")
+            .join("clauth.fish")),
+        other => bail!("unsupported shell '{other}', expected: bash, zsh, fish"),
+    }
+}
+
+/// Whether the script installed for `shell` is this binary's own emission.
+/// `Missing` when nothing sits at the writer's path; any other read failure is
+/// an error, never a stale claim (bytes we could not read prove nothing).
+pub(crate) fn script_state(shell: &str) -> Result<ScriptState> {
+    let path = script_path(&home_dir()?, shell)?;
+    let installed = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ScriptState::Missing),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    if installed == emission(shell)? {
+        Ok(ScriptState::Current)
+    } else {
+        Ok(ScriptState::Stale)
+    }
+}
+
+/// An installed completion script and the shell it belongs to, as the Services
+/// plugin card reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledScript {
+    pub(crate) shell: String,
+    pub(crate) state: ScriptState,
+}
+
+/// The shell `$SHELL` names and its script's state; `None` when no supported
+/// shell is named or the script cannot be read (the card then shows nothing).
+pub(crate) fn detected_installed_script() -> Option<InstalledScript> {
+    let shell = detect_shell().ok()?;
+    let state = script_state(&shell).ok()?;
+    Some(InstalledScript { shell, state })
+}
+
+/// `rel`'s components joined with `/`, the separator the confirm always reads:
+/// `Path::display` separates with `\` on Windows.
+fn slash_joined(rel: &std::path::Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// What `install(Some(shell))` writes, in the Services confirm's wording: the
+/// script's path from the writer's own builder, plus the rc edit bash and zsh
+/// also make.
+pub(crate) fn install_summary(shell: &str) -> Result<String> {
+    let home = home_dir()?;
+    let path = script_path(&home, shell)?;
+    let shown = path.strip_prefix(&home).map_or_else(
+        |_| path.display().to_string(),
+        |rel| format!("~/{}", slash_joined(rel)),
+    );
+    Ok(match rc_name(shell) {
+        Some(rc) => format!("writes {shown} and adds a source line to ~/{rc} if it has none."),
+        None => format!("writes {shown}."),
+    })
 }
 
 fn detect_shell() -> Result<String> {
@@ -511,26 +724,37 @@ fn detect_shell() -> Result<String> {
     }
 }
 
-fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
+fn install_rc(shell: &str, script: &str, rc_file: &str) -> Result<()> {
     let home = home_dir()?;
-    let completions_dir = home.join(".clauth").join("completions");
-    crate::profile::mkdir_700(&completions_dir)?;
-    let script_path = completions_dir.join(format!("clauth.{shell}"));
-    crate::profile::atomic_write_600(&script_path, script)
-        .with_context(|| format!("failed to write {}", script_path.display()))?;
+    let path = script_path(&home, shell)?;
+    let rc_path = home.join(rc_file);
+    let source_line = format!("source \"{}\"", path.display());
 
-    let rc_path = home.join(rc_name);
-    let source_line = format!("source \"{}\"", script_path.display());
+    // Raw bytes: a file that does not decode must keep every byte it holds.
+    // Only a missing file counts as empty. Read before writing the script, so
+    // a refused install leaves the disk untouched.
+    let existing = match fs::read(&rc_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", rc_path.display())),
+    };
 
-    let existing = fs::read_to_string(&rc_path).unwrap_or_default();
-    let already = existing.lines().any(|l| l.trim() == source_line);
+    if let Some(dir) = path.parent() {
+        crate::profile::mkdir_700(dir)?;
+    }
+    crate::profile::atomic_write_600(&path, script)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    let already = existing
+        .split(|&b| b == b'\n')
+        .any(|line| line.trim_ascii() == source_line.as_bytes());
 
     if !already {
         let mut new = existing;
-        if !new.is_empty() && !new.ends_with('\n') {
-            new.push('\n');
+        if !new.is_empty() && !new.ends_with(b"\n") {
+            new.push(b'\n');
         }
-        new.push_str(&format!("\n# clauth completions\n{source_line}\n"));
+        new.extend_from_slice(format!("\n# clauth completions\n{source_line}\n").as_bytes());
         fs::write(&rc_path, new)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
     }
@@ -624,10 +848,10 @@ pub(crate) fn auto_install_once() {
 }
 
 fn install_fish() -> Result<()> {
-    let home = home_dir()?;
-    let dir = home.join(".config").join("fish").join("completions");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("clauth.fish");
+    let path = script_path(&home_dir()?, "fish")?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     fs::write(&path, &*FISH).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }

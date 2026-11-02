@@ -166,6 +166,41 @@ fn foreign_logins_and_unreadable_files_are_preserved() {
     assert_eq!(j.keychain.state, SyncState::Conflict);
 }
 
+/// An account whose stored login does not parse loads as logged out, so a
+/// switch to it succeeds; reconciling it publishes nothing and is not an error.
+#[test]
+fn a_torn_store_publishes_nothing_and_is_not_an_error() {
+    let (_home, name) = fixture();
+    let source = crate::claude::install_source_path(&name).unwrap();
+    std::fs::write(&source, b"{\"claudeAiOauth\": {\"accessToken\": ").unwrap();
+    let mut backend = Fake::new("A");
+    reconcile_with(&name, NOW, true, &mut backend).unwrap();
+    assert_eq!(backend.writes, 0);
+}
+
+/// A store that cannot be READ (unlike torn content) is an error: the
+/// reconciler never reports a destination current over a source it could
+/// not see.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_store_is_an_error_not_a_logged_out_account() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_home, name) = fixture();
+    advance(&name, "B");
+    let source = crate::claude::install_source_path(&name).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&source).is_ok() {
+        // Running as root: permissions do not stop the read.
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+    let mut backend = Fake::new("A");
+    let result = reconcile_with(&name, NOW, true, &mut backend);
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(result.is_err(), "an unreadable store is reported");
+    assert_eq!(backend.writes, 0);
+}
+
 #[test]
 fn unreadable_keychain_is_not_treated_as_an_empty_item() {
     let (_home, name) = fixture();
@@ -434,7 +469,7 @@ fn same_profile_cli_switch_repairs_a_managed_file_without_recapture() {
         crate::which::resolve_global(&config).unwrap().1,
         crate::which::Source::ManagedPredecessor
     );
-    crate::actions::switch_profile_cli(config, &name).unwrap();
+    crate::actions::switch_profile_cli(config, &name, std::io::empty()).unwrap();
     let live: ClaudeCredentials = crate::profile::read_json_file(&path).unwrap();
     assert_eq!(live.access_token(), Some("B"));
 }
