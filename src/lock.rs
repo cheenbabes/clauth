@@ -419,10 +419,14 @@ pub(crate) struct InstallationLock {
 
 impl InstallationLock {
     pub(crate) fn acquire() -> Result<Self> {
-        Self::acquire_with_timeout(flock_wait_deadline())
+        Self::acquire_with_timeout(flock_wait_deadline(), None)
     }
 
-    fn acquire_with_timeout(timeout: Duration) -> Result<Self> {
+    /// `timed_out` is the tick's shared flag, as in [`StateLock::acquire_with_flag`]:
+    /// a flagged waiter skips with a zero wait once any hold of the tick has
+    /// timed out, and its own timeout sets the flag before this lock's
+    /// in-process mutex is released, so a queued waiter sees it.
+    fn acquire_with_timeout(timeout: Duration, timed_out: Option<&AtomicBool>) -> Result<Self> {
         if INSTALL_DEPTH.get() > 0 {
             INSTALL_DEPTH.set(INSTALL_DEPTH.get() + 1);
             return Ok(Self {
@@ -430,26 +434,54 @@ impl InstallationLock {
                 _rank: None,
             });
         }
+        let flagged = || timed_out.is_some_and(|flag| flag.load(Ordering::Relaxed));
+        let skip = || {
+            anyhow::Error::new(StateLockTimeout {
+                waited: Duration::ZERO,
+                lock: INSTALLATION_LOCK_PATH,
+            })
+        };
         let deadline = Instant::now() + timeout;
+        // The in-process holder is bounded by the same timeout. A flagged
+        // waiter that queued just after it gets a few polls past its own
+        // deadline to see the holder's outcome, so two holds of one tick take
+        // one timed-out wait between them, never two.
+        let mutex_deadline = if timed_out.is_some() {
+            deadline + 4 * LOCK_POLL_INTERVAL
+        } else {
+            deadline
+        };
         let mut guard = loop {
             match INSTALL_THREAD_LOCK.try_lock() {
                 Ok(g) => break g,
                 Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    // Typed like the flock timeout below, so a held tick flag
-                    // learns of it and the tick's later holds skip the wait.
-                    if Instant::now() >= deadline {
+                    if flagged() {
+                        return Err(skip());
+                    }
+                    // Typed like the flock timeout below, so the tick's flag
+                    // learns of it and its later holds skip the wait.
+                    if Instant::now() >= mutex_deadline {
+                        if let Some(flag) = timed_out {
+                            flag.store(true, Ordering::Relaxed);
+                        }
                         return Err(anyhow::Error::new(StateLockTimeout {
                             waited: timeout,
                             lock: INSTALLATION_LOCK_PATH,
                         }));
                     }
                     std::thread::sleep(
-                        LOCK_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                        LOCK_POLL_INTERVAL
+                            .min(mutex_deadline.saturating_duration_since(Instant::now())),
                     );
                 }
             }
         };
+        // Re-read the flag once this thread owns the mutex: the holder it
+        // queued behind may have timed out and set it.
+        if flagged() {
+            return Err(skip());
+        }
         let dir = clauth_dir()?;
         crate::profile::mkdir_700(&dir)?;
         let file = crate::profile::open_state_file(&dir.join(".installation.lock"))?;
@@ -457,12 +489,17 @@ impl InstallationLock {
             &file,
             deadline.saturating_duration_since(Instant::now()),
             |waited| {
-                let timed_out = StateLockTimeout {
+                // Set while this thread still owns the mutex, so a waiter
+                // queued on it reads the flag before it can take its own wait.
+                if let Some(flag) = timed_out {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                let timeout = StateLockTimeout {
                     waited,
                     lock: INSTALLATION_LOCK_PATH,
                 };
-                logline!("clauth: {timed_out}");
-                anyhow::Error::new(timed_out)
+                logline!("clauth: {timeout}");
+                anyhow::Error::new(timeout)
             },
             "failed to acquire clauth installation lock",
         )?;
@@ -576,19 +613,8 @@ impl StateLock {
         );
 
         let started = Instant::now();
-        // A timeout here is the tick's timeout too: set the shared flag, as the
-        // state flock's own timeout below does, so queued holds skip the wait.
-        let installation = match InstallationLock::acquire_with_timeout(timeout) {
-            Ok(installation) => installation,
-            Err(e) => {
-                if e.downcast_ref::<StateLockTimeout>().is_some()
-                    && let Some(flag) = timed_out
-                {
-                    flag.store(true, Ordering::Relaxed);
-                }
-                return Err(e);
-            }
-        };
+        // Shares the tick's flag: its timeout sets it, and a set flag skips.
+        let installation = InstallationLock::acquire_with_timeout(timeout, timed_out)?;
         let timeout = timeout.saturating_sub(started.elapsed());
 
         // Outermost acquisition: block until we own the thread mutex.
