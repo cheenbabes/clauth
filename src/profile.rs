@@ -2833,6 +2833,28 @@ pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
+/// A credential store as an account reads it: `Ok(None)` when the file is
+/// absent or its content is torn (not UTF-8, or not the expected JSON), which
+/// loads as logged out; `Err` only when the file could not be READ, which is
+/// never mistaken for a logged-out account.
+pub(crate) fn read_json_file_or_torn<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("failed to read {}", path.display())));
+        }
+    };
+    Ok(serde_json::from_str(&content).ok())
+}
+
 /// [`read_json_file`] for a path the live-session count runs every tick: a
 /// regular file only and bounded ([`crate::runtime::read_regular_capped`]),
 /// since a blocking `open` on a FIFO never returns and a device read never

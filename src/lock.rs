@@ -138,6 +138,9 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[derive(Debug)]
 pub(crate) struct StateLockTimeout {
     waited: Duration,
+    /// The lock file the wait was for: the state lock, or the credential
+    /// installation lock every outermost state hold takes first.
+    lock: &'static str,
 }
 
 impl StateLockTimeout {
@@ -148,6 +151,7 @@ impl StateLockTimeout {
     pub(crate) fn stub() -> Self {
         Self {
             waited: STATE_LOCK_TIMEOUT,
+            lock: STATE_LOCK_PATH,
         }
     }
 }
@@ -156,13 +160,17 @@ impl std::fmt::Display for StateLockTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "timed out after {:.0}s acquiring the state lock; another clauth process holds ~/.clauth/.lock",
-            self.waited.as_secs_f64()
+            "timed out after {:.0}s acquiring the state lock; another clauth process holds {}",
+            self.waited.as_secs_f64(),
+            self.lock
         )
     }
 }
 
 impl std::error::Error for StateLockTimeout {}
+
+const STATE_LOCK_PATH: &str = "~/.clauth/.lock";
+const INSTALLATION_LOCK_PATH: &str = "~/.clauth/.installation.lock";
 
 // Serializes all threads of this process across the full closure duration.
 // The guard is stored in the outermost StateLock and dropped only when that
@@ -428,10 +436,14 @@ impl InstallationLock {
                 Ok(g) => break g,
                 Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    anyhow::ensure!(
-                        Instant::now() < deadline,
-                        "credential installation lock timed out"
-                    );
+                    // Typed like the flock timeout below, so a held tick flag
+                    // learns of it and the tick's later holds skip the wait.
+                    if Instant::now() >= deadline {
+                        return Err(anyhow::Error::new(StateLockTimeout {
+                            waited: timeout,
+                            lock: INSTALLATION_LOCK_PATH,
+                        }));
+                    }
                     std::thread::sleep(
                         LOCK_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
                     );
@@ -445,7 +457,10 @@ impl InstallationLock {
             &file,
             deadline.saturating_duration_since(Instant::now()),
             |waited| {
-                let timed_out = StateLockTimeout { waited };
+                let timed_out = StateLockTimeout {
+                    waited,
+                    lock: INSTALLATION_LOCK_PATH,
+                };
                 logline!("clauth: {timed_out}");
                 anyhow::Error::new(timed_out)
             },
@@ -507,6 +522,7 @@ impl StateLock {
         if timed_out.load(Ordering::Relaxed) {
             return Err(anyhow::Error::new(StateLockTimeout {
                 waited: Duration::ZERO,
+                lock: STATE_LOCK_PATH,
             }));
         }
         Self::acquire_inner(state_lock_timeout(), Some(timed_out))
@@ -560,7 +576,19 @@ impl StateLock {
         );
 
         let started = Instant::now();
-        let installation = InstallationLock::acquire_with_timeout(timeout)?;
+        // A timeout here is the tick's timeout too: set the shared flag, as the
+        // state flock's own timeout below does, so queued holds skip the wait.
+        let installation = match InstallationLock::acquire_with_timeout(timeout) {
+            Ok(installation) => installation,
+            Err(e) => {
+                if e.downcast_ref::<StateLockTimeout>().is_some()
+                    && let Some(flag) = timed_out
+                {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                return Err(e);
+            }
+        };
         let timeout = timeout.saturating_sub(started.elapsed());
 
         // Outermost acquisition: block until we own the thread mutex.
@@ -587,6 +615,7 @@ impl StateLock {
         {
             return Err(anyhow::Error::new(StateLockTimeout {
                 waited: Duration::ZERO,
+                lock: STATE_LOCK_PATH,
             }));
         }
 
@@ -601,7 +630,10 @@ impl StateLock {
                 &file,
                 timeout,
                 |waited| {
-                    let timed_out = StateLockTimeout { waited };
+                    let timed_out = StateLockTimeout {
+                        waited,
+                        lock: STATE_LOCK_PATH,
+                    };
                     logline!("clauth: {timed_out}");
                     anyhow::Error::new(timed_out)
                 },

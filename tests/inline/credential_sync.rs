@@ -178,6 +178,29 @@ fn a_torn_store_publishes_nothing_and_is_not_an_error() {
     assert_eq!(backend.writes, 0);
 }
 
+/// A store that cannot be READ (unlike torn content) is an error: the
+/// reconciler never reports a destination current over a source it could
+/// not see.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_store_is_an_error_not_a_logged_out_account() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_home, name) = fixture();
+    advance(&name, "B");
+    let source = crate::claude::install_source_path(&name).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&source).is_ok() {
+        // Running as root: permissions do not stop the read.
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+    let mut backend = Fake::new("A");
+    let result = reconcile_with(&name, NOW, true, &mut backend);
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(result.is_err(), "an unreadable store is reported");
+    assert_eq!(backend.writes, 0);
+}
+
 #[test]
 fn unreadable_keychain_is_not_treated_as_an_empty_item() {
     let (_home, name) = fixture();

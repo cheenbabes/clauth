@@ -150,5 +150,18 @@ this fork keeps reconciliation in their place, because the fork's
 (`at-old` left in the live file after two rotations). Two upstream behaviors
 carry over onto the reconciler: a landing deletes its stage only after
 reconciliation returns (so a cut publication is redone from the stage), and
-the Keychain sync writer runs upstream's bare-item guard
-(`claude::bare_item_may_be_replaced`, GH #106) before replacing the item.
+upstream's bare-item settlement (GH #106) still saves a login a Claude Code
+outside clauth rotated into the Keychain into its owning profile before an
+explicit switch or login replaces it.
+
+The Keychain sync writer does not run upstream's spent-record guard
+(`claude::bare_item_may_be_replaced`). Its protection is the journal: it
+replaces only a login whose access-token fingerprint it recorded clauth
+publishing, and Claude Code mints a new access token on every refresh, so an
+outside rotation is never recognized. The guard checks the refresh token
+against a bounded spent record instead, and after enough private rotations
+would refuse to repair a predecessor the journal still recognizes.
+
+A profile store whose content is torn loads as logged out and publishes
+nothing. A store that cannot be read is an error: reconciliation and linking
+report it rather than treating the account as logged out.

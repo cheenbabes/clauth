@@ -62,6 +62,52 @@ fn cross_thread_with_state_lock_serializes() {
     }
 }
 
+/// The installation lock every outermost state hold takes first counts
+/// toward the tick's flag too: a wedged installation flock costs three holds
+/// sharing one flag one wait, and the timeout names the installation lock.
+#[test]
+fn a_wedged_installation_flock_waits_once_per_flag() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(".installation.lock"))
+        .expect("open holder handle");
+    holder.lock().expect("hold the installation flock");
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(200)));
+    let timed_out = AtomicBool::new(false);
+
+    let refusal_of = |timed_out: &AtomicBool| {
+        crate::lock::with_state_lock_flag(Some(timed_out), |_h| Ok::<(), anyhow::Error>(()))
+            .expect_err("a wedged installation flock times out")
+            .downcast::<crate::lock::StateLockTimeout>()
+            .expect("the refusal is a typed lock timeout")
+    };
+
+    let first = refusal_of(&timed_out);
+    let set_after_first = timed_out.load(Ordering::Relaxed);
+    let second = refusal_of(&timed_out);
+    let third = refusal_of(&timed_out);
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert!(set_after_first, "the first timeout sets the tick's flag");
+    assert!(
+        first.to_string().contains("~/.clauth/.installation.lock"),
+        "{first}"
+    );
+    assert!(
+        first.waited > Duration::ZERO,
+        "the first hold waits out the bound"
+    );
+    assert_eq!(
+        (second.waited, third.waited),
+        (Duration::ZERO, Duration::ZERO),
+        "later holds of the tick skip the wait"
+    );
+}
+
 /// A wedged flock under one tick's flag costs the tick one wait, never once
 /// per landing/kick hold: three holds sharing ONE `timed_out` flag — the first
 /// waits out the bound and sets the flag, the other two skip without waiting.

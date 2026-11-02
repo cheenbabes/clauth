@@ -1517,21 +1517,19 @@ fn write_sync_login_at(
     // explicit switch, a repair never treats an unreadable item as empty.
     let existing = match read_blob_at(service, &account) {
         Ok(blob) => {
+            // This equality is this writer's #106 protection. The reconciler
+            // only writes over a login whose access-token fingerprint its
+            // journal recorded clauth publishing, and Claude Code mints a new
+            // access token on every refresh, so a login a Claude Code outside
+            // clauth rotated in never matches and is left untouched. The
+            // explicit writers' `bare_item_may_be_replaced` is deliberately not
+            // run here: it checks the refresh token against a bounded spent
+            // record, so after enough private rotations it would refuse to
+            // repair a predecessor this journal still recognizes as its own.
             anyhow::ensure!(
                 &Observation::from_blob(blob.as_ref()) == expected,
                 "Keychain login changed during synchronization"
             );
-            // The bare-item guard every item writer runs (GH #106): a login
-            // carrying a refresh token no store holds and no spent record
-            // names was written by a Claude Code outside clauth, and replacing
-            // it would strand that single-use token. The refusal reaches the
-            // reconciler as an error, which leaves the destination pending.
-            if let Some(item) = blob.as_ref() {
-                anyhow::ensure!(
-                    crate::claude::bare_item_may_be_replaced(item, None),
-                    "Keychain holds a login no profile has saved; left untouched"
-                );
-            }
             blob
         }
         Err(e) if carried_raw(&e).is_some() && expected == &Observation::Corrupt => {

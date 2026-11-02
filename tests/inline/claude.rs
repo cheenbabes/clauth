@@ -7433,11 +7433,15 @@ fn a_save_into_an_account_recreated_since_it_was_named_is_refused() {
     assert_eq!(fs::read(&stores[0]).expect("read"), before);
 }
 
-/// The credential-sync Keychain writer hands its caller the guard's refusal
-/// as an error instead of reporting it as a landed write; the macOS-only
-/// module cannot build here, so the body is pinned by source.
+/// The credential-sync Keychain writer replaces only the login its reconciler
+/// observed and recognized: the read it merges over must equal that
+/// observation, checked in an `ensure!` before the write, so a login a Claude
+/// Code outside clauth rotated in is refused as an error. It does not run
+/// the explicit writers' spent-record guard, which would refuse to repair a
+/// recognized predecessor once the bounded record evicts its refresh token.
+/// The macOS-only module cannot build here, so the body is pinned by source.
 #[test]
-fn the_rotation_mirror_tells_its_caller_the_guard_refused() {
+fn the_sync_writer_replaces_only_the_login_it_recognized() {
     let keychain = include_str!("../../src/keychain.rs");
     let writer = keychain
         .split_once("fn write_sync_login_at(")
@@ -7446,18 +7450,22 @@ fn the_rotation_mirror_tells_its_caller_the_guard_refused() {
         .split_once("\n}\n")
         .expect("writer closes")
         .0;
-    let guard = writer
-        .find("crate::claude::bare_item_may_be_replaced(item, None)")
-        .expect("the writer runs the bare-item guard");
-    let ensure = writer[..guard]
+    let check = writer
+        .find("&Observation::from_blob(blob.as_ref()) == expected")
+        .expect("the writer compares the item with the observation it was handed");
+    let ensure = writer[..check]
         .rfind("anyhow::ensure!(")
-        .expect("the guard's answer is an ensure, so a refusal reaches the caller");
+        .expect("the comparison is an ensure, so a refusal reaches the caller");
     let put = writer
         .find("put_blob_at(")
         .expect("the writer writes the item");
     assert!(
-        ensure < guard && guard < put,
-        "the guard decides before the write"
+        ensure < check && check < put,
+        "the comparison decides before the write"
+    );
+    assert!(
+        !writer.contains("bare_item_may_be_replaced(item"),
+        "the sync writer does not run the spent-record guard"
     );
 }
 
@@ -7548,24 +7556,11 @@ fn only_the_expired_prompt_tips_a_refresh() {
     }
 }
 
-/// The macOS-only writers and entries this file's guards rest on, pinned by
-/// source since no Linux build compiles them: the rotation mirror's item
-/// write runs the bare-item guard, and `clauth login` settles before the
-/// browser login it collects, so a refused settle never discards it.
+/// The macOS-only entry this file's guards rest on, pinned by source since
+/// no Linux build compiles it: `clauth login` settles before the browser
+/// login it collects, so a refused settle never discards it.
 #[test]
-fn the_rotation_mirror_guards_the_item_and_login_settles_before_the_browser() {
-    let keychain = include_str!("../../src/keychain.rs");
-    let mirror = keychain
-        .split_once("fn write_sync_login_at(")
-        .expect("the credential-sync writer is defined")
-        .1
-        .split_once("\n}\n")
-        .expect("writer closes")
-        .0;
-    assert!(
-        mirror.contains("crate::claude::bare_item_may_be_replaced(item, None)"),
-        "the credential-sync writer guards the item it replaces"
-    );
+fn login_settles_before_the_browser() {
     let main = include_str!("../../src/main.rs");
     let login = main
         .split_once("fn cmd_login(args: LoginArgs)")
@@ -7833,5 +7828,32 @@ fn an_owner_lookup_that_cannot_start_names_what_failed() {
     assert_eq!(
         bare_item_probe_unstarted_line(&std::io::Error::other("Resource temporarily unavailable")),
         "could not start the macOS Keychain owner lookup: Resource temporarily unavailable"
+    );
+}
+
+/// The linkability verdict a switch takes its logged-out arm from: a torn or
+/// absent store links nothing, but a store that cannot be READ is an error,
+/// so an IO fault never removes the live file or signs the Keychain out.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_install_source_is_an_error_not_a_logged_out_store() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("credentials.json");
+    assert!(!linkable_install_source(&store).expect("absent reads"));
+    fs::write(&store, b"{\"claudeAiOauth\": {\"accessToken\": ").expect("write torn");
+    assert!(!linkable_install_source(&store).expect("torn reads"));
+    fs::write(&store, [0xff, 0xfe, 0x00]).expect("write non-utf8");
+    assert!(!linkable_install_source(&store).expect("non-UTF-8 reads"));
+    fs::write(&store, b"{}").expect("write empty object");
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).expect("chmod");
+    if fs::read(&store).is_ok() {
+        return; // root: permissions do not stop the read
+    }
+    let verdict = linkable_install_source(&store);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o600)).expect("chmod back");
+    assert!(
+        verdict.is_err(),
+        "an unreadable store is an error: {verdict:?}"
     );
 }

@@ -1986,7 +1986,7 @@ fn bare_item_restore_tail(active: Option<&ProfileName>) -> String {
 /// sign the item out (an api-key or third-party profile, or a store that
 /// does not parse): the restore's own [`linkable_install_source`] verdict.
 fn bare_item_active_has_login(active: &ProfileName) -> bool {
-    install_source_path(active).is_ok_and(|path| linkable_install_source(&path))
+    install_source_path(active).is_ok_and(|path| matches!(linkable_install_source(&path), Ok(true)))
 }
 
 /// The line for a bare item holding a login no single clauth account claims,
@@ -3386,7 +3386,7 @@ fn restore_bare_item(active: Option<&ProfileName>, placed: Option<&[u8; 32]>) ->
             return Ok(signed_out && !refused.get());
         };
         let target = install_source_path(active)?;
-        let linkable = linkable_install_source(&target);
+        let linkable = linkable_install_source(&target)?;
         // `SignOut`: an active profile storing no login leaves the item
         // serving nobody, never the account it held.
         keychain_mirror_source(&target, linkable, AbsentSource::SignOut, preserve, placed)
@@ -4871,8 +4871,11 @@ fn hand_sidecar_keys_to_store(sidecar: &Path) {
 /// answers "none" here, exactly like a logged-out account with no store, so a
 /// switch to it links nothing instead of publishing a link the next switch away
 /// would fail reading through.
-fn linkable_install_source(target: &Path) -> bool {
-    target.exists() && read_json_file::<ClaudeCredentials>(target).is_ok()
+/// A torn or absent store links nothing (it loads as logged out); a store that
+/// cannot be read is an error, so an IO fault never takes the logged-out arm
+/// that removes the live file or signs the Keychain item out.
+fn linkable_install_source(target: &Path) -> Result<bool> {
+    Ok(crate::profile::read_json_file_or_torn::<ClaudeCredentials>(target)?.is_some())
 }
 
 /// Whether the live credential file is a symlink to an unreadable store: the
@@ -4898,7 +4901,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
         // unreadable install source takes the mirror's absent arm, never its
         // parse-refusing read, so a switch to a torn store links nothing on
         // every platform.
-        let linkable = linkable_install_source(&target);
+        let linkable = linkable_install_source(&target)?;
         // Loaded once for the file sync and the Keychain mirror alike, so one
         // relink cannot act on two different answers across an edit landing
         // between two reads.
@@ -5765,7 +5768,7 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
         crate::credential_sync::begin_install(name)?;
         // One linkability decision for both layers, as in
         // `link_profile_credentials`.
-        let linkable = linkable_install_source(&target);
+        let linkable = linkable_install_source(&target)?;
         // One load for both layers, as in `link_profile_credentials`.
         let preserve = preserve_non_login_keys();
         let live_unreadable = live_link_is_unreadable(&link);
