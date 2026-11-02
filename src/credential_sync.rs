@@ -494,7 +494,11 @@ pub(crate) fn reconcile_with(
         if !source.exists() {
             return Ok(None);
         }
-        let incoming: ClaudeCredentials = crate::profile::read_json_file(&source)?;
+        // A store that does not parse loads as logged out: there is no login
+        // to publish, and the live slot keeps whatever it holds.
+        let Ok(incoming) = crate::profile::read_json_file::<ClaudeCredentials>(&source) else {
+            return Ok(None);
+        };
         let Some(token) = incoming.access_token().filter(|s| !s.is_empty()) else {
             return Ok(None);
         };

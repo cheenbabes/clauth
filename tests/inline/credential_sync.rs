@@ -166,6 +166,18 @@ fn foreign_logins_and_unreadable_files_are_preserved() {
     assert_eq!(j.keychain.state, SyncState::Conflict);
 }
 
+/// An account whose stored login does not parse loads as logged out, so a
+/// switch to it succeeds; reconciling it publishes nothing and is not an error.
+#[test]
+fn a_torn_store_publishes_nothing_and_is_not_an_error() {
+    let (_home, name) = fixture();
+    let source = crate::claude::install_source_path(&name).unwrap();
+    std::fs::write(&source, b"{\"claudeAiOauth\": {\"accessToken\": ").unwrap();
+    let mut backend = Fake::new("A");
+    reconcile_with(&name, NOW, true, &mut backend).unwrap();
+    assert_eq!(backend.writes, 0);
+}
+
 #[test]
 fn unreadable_keychain_is_not_treated_as_an_empty_item() {
     let (_home, name) = fixture();

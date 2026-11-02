@@ -806,7 +806,11 @@ fn every_keychain_budget_arm_under_src_is_a_known_site() {
             ),
             (
                 "with_keychain_budget(",
-                known(&[("claude.rs", 1), ("credential_sync.rs", 2), ("runtime.rs", 1)]),
+                known(&[
+                    ("claude.rs", 1),
+                    ("credential_sync.rs", 2),
+                    ("runtime.rs", 1)
+                ]),
             ),
         ]),
         "a Keychain budget armed outside its known sites: a per-session item leg arms \

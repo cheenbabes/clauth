@@ -7452,8 +7452,13 @@ fn the_rotation_mirror_tells_its_caller_the_guard_refused() {
     let ensure = writer[..guard]
         .rfind("anyhow::ensure!(")
         .expect("the guard's answer is an ensure, so a refusal reaches the caller");
-    let put = writer.find("put_blob_at(").expect("the writer writes the item");
-    assert!(ensure < guard && guard < put, "the guard decides before the write");
+    let put = writer
+        .find("put_blob_at(")
+        .expect("the writer writes the item");
+    assert!(
+        ensure < guard && guard < put,
+        "the guard decides before the write"
+    );
 }
 
 /// The daemon leg's line when its worker cannot start names what did not

@@ -5249,11 +5249,11 @@ fn repro_104_restamp_follows_a_regular_file_live_slot() {
     );
 }
 
-/// A live slot whose login block carries a token where a number belongs would
-/// otherwise quote the value in the parser's message; the re-stamp's unreadable
-/// line names the position alone, never the value.
+/// A live slot whose login block carries a token where a number belongs: the
+/// re-stamp still succeeds, the slot is left byte for byte, and the parser's
+/// message (which would quote the value) never reaches the log.
 #[test]
-fn an_unreadable_live_slot_names_the_position_and_never_the_value() {
+fn a_restamp_leaves_an_unreadable_live_slot_untouched_and_never_logs_its_value() {
     let _home = HomeSandbox::new();
     let name = "test-live-slot-unreadable";
     let far_chain = crate::usage::now_ms() as i64 + 24 * 3_600_000;
@@ -5289,14 +5289,12 @@ fn an_unreadable_live_slot_names_the_position_and_never_the_value() {
     drop(capture);
 
     let snapshot = sink.snapshot();
-    let expected = format!(
-        "clauth: re-stamped '{name}' but the live .credentials.json could not be \
-         parsed to check its login (line 1, column 72); live file left untouched. Run \
-         `clauth {name}` to reinstall"
-    );
-    assert!(
-        snapshot.iter().any(|line| line == &expected),
-        "the re-stamp line names the position: expected {expected:?} in {snapshot:?}"
+    // The fork's reconciler leaves a live slot it cannot parse alone and
+    // records the conflict in its journal instead of logging a line.
+    assert_eq!(
+        std::fs::read(&live_path).expect("read live"),
+        b"{\"claudeAiOauth\": {\"accessToken\": \"a\", \"expiresAt\": \"sk-c2probe-NOTAKEY\"}}",
+        "the live file is left untouched"
     );
     assert!(
         snapshot
@@ -5306,12 +5304,9 @@ fn an_unreadable_live_slot_names_the_position_and_never_the_value() {
     );
 }
 
-/// An empty live slot has no position to name; the re-stamp's unreadable line
-/// renders the bare frame, with no stray space before the `;`. The pinned line
-/// is the follower's own output, so its presence also proves the re-stamp
-/// reached the follower (a re-stamp that skips it logs nothing there).
+/// An empty live slot: the re-stamp still succeeds and leaves it empty.
 #[test]
-fn a_restamp_over_an_empty_live_slot_names_the_bare_frame() {
+fn a_restamp_leaves_an_empty_live_slot_untouched() {
     let _home = HomeSandbox::new();
     let name = "test-restamp-live-slot-empty";
     let far_chain = crate::usage::now_ms() as i64 + 24 * 3_600_000;
@@ -5340,25 +5335,18 @@ fn a_restamp_over_an_empty_live_slot_names_the_bare_frame() {
     ));
     drop(capture);
 
-    let snapshot = sink.snapshot();
-    let expected = format!(
-        "clauth: re-stamped '{name}' but the live .credentials.json could not be \
-         parsed to check its login; live file left untouched. Run \
-         `clauth {name}` to reinstall"
-    );
+    let _ = sink.snapshot();
     assert!(
-        snapshot.iter().any(|line| line == &expected),
-        "the re-stamp line renders the bare frame: expected {expected:?} in {snapshot:?}"
+        std::fs::read(&live_path).expect("read live").is_empty(),
+        "the empty live file is left untouched"
     );
 }
 
 /// A rotation over a live slot whose login block carries a token where a
-/// number belongs would otherwise quote the value in the parser's message; the
-/// rotation's unreadable line names the position alone, never the value. The
-/// pinned line is the follower's own output, so its presence also proves the
-/// rotation reached the follower (a rotation that skips it logs nothing).
+/// number belongs: the rotation persists, the slot is left byte for byte, and
+/// the parser's message (which would quote the value) never reaches the log.
 #[test]
-fn a_rotation_over_an_unreadable_live_slot_names_the_position_and_never_the_value() {
+fn a_rotation_leaves_an_unreadable_live_slot_untouched_and_never_logs_its_value() {
     let _home = HomeSandbox::new();
     let name = "test-rotation-live-slot-unreadable";
     let mut config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
@@ -5392,14 +5380,12 @@ fn a_rotation_over_an_unreadable_live_slot_names_the_position_and_never_the_valu
     drop(capture);
 
     let snapshot = sink.snapshot();
-    let expected = format!(
-        "clauth: rotated '{name}' but the live .credentials.json could not be \
-         parsed to check its login (line 1, column 72); live file left untouched. Run \
-         `clauth {name}` to reinstall"
-    );
-    assert!(
-        snapshot.iter().any(|line| line == &expected),
-        "the rotation line names the position: expected {expected:?} in {snapshot:?}"
+    // The fork's reconciler leaves a live slot it cannot parse alone and
+    // records the conflict in its journal instead of logging a line.
+    assert_eq!(
+        std::fs::read(&live_path).expect("read live"),
+        b"{\"claudeAiOauth\": {\"accessToken\": \"a\", \"expiresAt\": \"sk-c2probe-NOTAKEY\"}}",
+        "the live file is left untouched"
     );
     assert!(
         snapshot
@@ -5409,10 +5395,9 @@ fn a_rotation_over_an_unreadable_live_slot_names_the_position_and_never_the_valu
     );
 }
 
-/// An empty live slot has no position to name; the rotation's unreadable line
-/// renders the bare frame, with no stray space before the `;`.
+/// An empty live slot: the rotation persists and leaves it empty.
 #[test]
-fn a_rotation_over_an_empty_live_slot_names_the_bare_frame() {
+fn a_rotation_leaves_an_empty_live_slot_untouched() {
     let _home = HomeSandbox::new();
     let name = "test-rotation-live-slot-empty";
     let mut config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
@@ -5439,15 +5424,10 @@ fn a_rotation_over_an_empty_live_slot_names_the_bare_frame() {
     .expect("persist");
     drop(capture);
 
-    let snapshot = sink.snapshot();
-    let expected = format!(
-        "clauth: rotated '{name}' but the live .credentials.json could not be \
-         parsed to check its login; live file left untouched. Run \
-         `clauth {name}` to reinstall"
-    );
+    let _ = sink.snapshot();
     assert!(
-        snapshot.iter().any(|line| line == &expected),
-        "the rotation line renders the bare frame: expected {expected:?} in {snapshot:?}"
+        std::fs::read(&live_path).expect("read live").is_empty(),
+        "the empty live file is left untouched"
     );
 }
 
