@@ -4,11 +4,12 @@
 //!
 //! The default run is safe on a live proxy: it reads every read route, checks
 //! every `/info` declaration, probes each control route without the admin
-//! token, hits each mutating route on an id no proxy holds (proving the route
-//! exists and answers its error shape), starts one login flow and cancels it,
-//! and sends one inference request. `--destructive <account>` adds the
-//! mutating success paths on that account and ends by deleting it, for a
-//! proxy's own CI against a stub upstream.
+//! token, sends each mutating route aimed at an account id no proxy holds, a
+//! PUT on the account list and a config change naming a setting no proxy
+//! declares, starts one login flow and cancels it, and sends one inference
+//! request.
+//! `--destructive <account>` adds the mutating success paths on that account
+//! and ends by deleting it, for a proxy's own CI against a stub upstream.
 //!
 //! Bodies are read as `serde_json::Value` rather than typed structs: the check
 //! reports each wrong field by its path, which a failed typed deserialize
@@ -18,7 +19,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::proxy::{SPOKEN_MAJOR, contract_version};
@@ -37,10 +38,11 @@ const BODY_LIMIT: u64 = 1 << 20;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 /// An inference answer can wait on the provider (a queued off-peak channel).
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(180);
-/// How much of a quoted value a violation line keeps.
+/// A violation line prints a quoted value in at most `REPR_MAX + 1` chars,
+/// `...` included.
 const REPR_MAX: usize = 80;
-/// What a violation line keeps of the route and the expectation, both built
-/// here but able to carry a proxy-supplied id.
+/// A violation line prints the route and the expectation, both built here but
+/// able to carry a proxy-supplied id, in at most `LINE_MAX + 1` chars.
 const LINE_MAX: usize = 240;
 /// The draft keeps a `/health` body under this many bytes, the daemon probe's
 /// body cap.
@@ -73,6 +75,10 @@ impl Secret {
 
     pub(crate) fn expose(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -112,17 +118,18 @@ pub(crate) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
             )));
         }
     };
+    validate_secret_text(path, what, text)
+}
+
+/// The one rule for a credential's text and mode, after it was read: a file
+/// other users can read is refused, as is an empty value or one holding
+/// whitespace or control characters.
+fn validate_secret_text(path: &Path, what: &str, text: String) -> Result<Secret> {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let open_to_others = std::fs::metadata(path)
-            .map(|meta| meta.permissions().mode() & 0o077 != 0)
-            .unwrap_or(true);
-        if open_to_others {
-            return Err(crate::usage_error(format!(
-                "{what} file {path:?} is accessible by other users; run `chmod 600` on it"
-            )));
-        }
+    if secret_file_open_to_others(path) {
+        return Err(crate::usage_error(format!(
+            "{what} file {path:?} is accessible by other users; run `chmod 600` on it"
+        )));
     }
     let value = text.trim_end_matches(['\n', '\r']);
     if value.is_empty() {
@@ -134,6 +141,115 @@ pub(crate) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
         )));
     }
     Ok(Secret(value.to_string()))
+}
+
+/// Whether a credential file's mode lets other users read it; `true` also
+/// when the file cannot be inspected, so the refusal names `chmod 600` there
+/// too. The one check behind both the reader's refusal and the admin-token
+/// rule's choice of fix.
+#[cfg(unix)]
+pub(crate) fn secret_file_open_to_others(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o077 != 0)
+        .unwrap_or(true)
+}
+
+/// Windows has no owner-only file mode to check.
+#[cfg(not(unix))]
+pub(crate) fn secret_file_open_to_others(_path: &Path) -> bool {
+    false
+}
+
+/// The one acceptance rule for a proxy's admin token, shared by `enable`
+/// (through `crate::proxy::ensure_proxy_token`) and `clauth proxy check
+/// <service>`: the reader's rule above plus the [`crate::gateway::MIN_ADMIN_KEY_LEN`]
+/// floor. `None` when the file is absent, so `enable` mints and `check
+/// <service>` names the command that mints it. A refusal names its fix
+/// — `chmod 600` for a file the owner cannot read or other users can read,
+/// else delete the file so clauth mints a new one.
+pub(crate) fn read_admin_token_optional(path: &Path) -> Result<Option<Secret>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(refuse_admin_token_read(
+                path,
+                crate::usage_error(format!(
+                    "cannot read admin token file {path:?} ({})",
+                    e.kind()
+                )),
+            ));
+        }
+    };
+    admin_token_from_text(path, text)
+}
+
+/// The post-read leg of [`read_admin_token_optional`]: validate a token file
+/// whose text was already read, routing a validation error through
+/// [`refuse_admin_token_validation`] (never the read refusal). Split out so a
+/// test can pin that route over an input where the two refusals differ — as a
+/// non-root process a file that is both owner-unreadable and others-readable
+/// (`0o044`) never reaches this leg through the reader, but the seam is called
+/// with its text directly.
+fn admin_token_from_text(path: &Path, text: String) -> Result<Option<Secret>> {
+    let secret = match validate_secret_text(path, "admin token", text) {
+        Ok(secret) => secret,
+        Err(e) => return Err(refuse_admin_token_validation(path, e)),
+    };
+    if secret.expose().len() < crate::gateway::MIN_ADMIN_KEY_LEN {
+        return Err(crate::usage_error(format!(
+            "admin token file {path:?} is shorter than {} characters; delete the file and clauth mints a new one",
+            crate::gateway::MIN_ADMIN_KEY_LEN
+        )));
+    }
+    Ok(Some(secret))
+}
+
+/// Whether the owner-read bit is off: a file whose owner cannot read it,
+/// which only `chmod 600` fixes (deleting it would throw the token away).
+#[cfg(unix)]
+fn admin_token_owner_unreadable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o400 == 0)
+        .unwrap_or(false)
+}
+
+/// Windows has no owner-read file mode to check.
+#[cfg(not(unix))]
+fn admin_token_owner_unreadable(_path: &Path) -> bool {
+    false
+}
+
+/// The fix for a refusal from the read itself: the owner-read bit is decided
+/// first, so an owner-unreadable mode (`0o044`, `0o040`, `0o004`, `0o000`)
+/// names `chmod 600` — which restores both bits — before the others-can-read
+/// question; the reader's own message when only other users can read it; else
+/// delete-and-mint.
+fn refuse_admin_token_read(path: &Path, e: anyhow::Error) -> anyhow::Error {
+    if admin_token_owner_unreadable(path) {
+        crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
+    } else if secret_file_open_to_others(path) {
+        e
+    } else {
+        crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+    }
+}
+
+/// The fix for a refusal from the validation, after the file was read: the
+/// others-can-read question first (its message already names `chmod 600`),
+/// then the owner-read bit, else delete-and-mint — the order a validation
+/// refusal always used, so a validation refusal never gains a second fix
+/// clause.
+fn refuse_admin_token_validation(path: &Path, e: anyhow::Error) -> anyhow::Error {
+    if secret_file_open_to_others(path) {
+        e
+    } else if admin_token_owner_unreadable(path) {
+        crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
+    } else {
+        crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+    }
 }
 
 // ── the report ──────────────────────────────────────────────────────────────
@@ -278,23 +394,31 @@ pub(crate) fn resolve_target(
             "expected a proxy's base URL, like http://127.0.0.1:9101, or the service of a proxy registered with `clauth proxy enable`, like zcode; got {target:?}"
         )));
     };
-    let Some(row) = crate::proxy::Registry::load()?.get(&service).cloned() else {
+    let registry = crate::proxy::Registry::load()?;
+    // A refused row is never run and never checked: refuse before any token
+    // or profile read, with the one text a write refuses with.
+    if let Some(reason) = registry.misconfigured_reason(service.as_str()) {
+        return Err(crate::proxy::misconfigured_error(reason)?);
+    }
+    let Some(row) = registry.get(&service).cloned() else {
         return Err(crate::proxy::not_registered(&service));
     };
     let admin = match admin_file {
+        // The explicit file is the user's own: read it with the plain reader,
+        // whose rule names no mint advice — clauth mints only
+        // `admin_token_path(service)`, never a file the user handed over.
         Some(path) => read_secret_file(path, "admin token")?,
         None => {
             let path = crate::proxy::admin_token_path(&service)?;
-            if !path
-                .try_exists()
-                .with_context(|| format!("failed to inspect {}", path.display()))?
-            {
-                return Err(crate::usage_error(format!(
-                    "proxy {:?} has no admin token file {path:?}; run `clauth proxy enable {service}` to mint it",
-                    service.as_str()
-                )));
+            match read_admin_token_optional(&path)? {
+                Some(secret) => secret,
+                None => {
+                    return Err(crate::usage_error(format!(
+                        "proxy {:?} has no admin token file {path:?}; run `clauth proxy enable {service}` to mint it",
+                        service.as_str()
+                    )));
+                }
             }
-            read_secret_file(&path, "admin token")?
         }
     };
     let key = match key_file {
@@ -380,6 +504,7 @@ fn is_loopback_url_on(url: &str, port: u16) -> bool {
 enum Method {
     Get,
     Post,
+    Put,
     Patch,
     Delete,
 }
@@ -389,6 +514,7 @@ impl Method {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Put => "PUT",
             Self::Patch => "PATCH",
             Self::Delete => "DELETE",
         }
@@ -469,6 +595,7 @@ fn send(
         Method::Get => with_headers!(agent.get(url)).call()?,
         Method::Delete => with_headers!(agent.delete(url)).call()?,
         Method::Post => with_headers!(agent.post(url)).send(body.unwrap_or(""))?,
+        Method::Put => with_headers!(agent.put(url)).send(body.unwrap_or(""))?,
         Method::Patch => with_headers!(agent.patch(url)).send(body.unwrap_or(""))?,
     };
     let header = |name: &str| {
@@ -581,23 +708,9 @@ fn repr(v: &Value) -> String {
 /// and C1) and every bidi formatting character is written as its `\u{..}`
 /// escape, so a proxy can neither drive the terminal nor reorder a line.
 fn escape(text: &str) -> String {
-    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
-    text.chars()
-        .map(|c| {
-            if c.is_control() || bidi(c) {
-                format!("\\u{{{:04x}}}", u32::from(c))
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
-}
-
-fn cut(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text.to_string(),
-    }
+    crate::format::escape_unless(text, |c| {
+        !c.is_control() && !crate::format::reorders_display(c)
+    })
 }
 
 /// Two JSON values the contract treats as equal: numbers compare by value, so
@@ -665,9 +778,10 @@ struct ActionDecl {
 
 struct SettingDecl {
     key: String,
-    /// A `null` default: the setting may hold no value, so `null` is a valid
-    /// current value.
-    nullable: bool,
+    /// The declared `default`, `None` when the declaration omits the key. A
+    /// present `null` default means the setting may hold no value, so `null`
+    /// is a valid current value; an absent default marks nothing.
+    default: Option<Value>,
     account_scope: bool,
     typ: String,
     options: Vec<Value>,
@@ -688,6 +802,13 @@ impl SettingDecl {
             "string" => v.is_string(),
             _ => false,
         }
+    }
+
+    /// Whether a `null` current value is valid: the declaration carries an
+    /// explicit `null` default. An absent default marks nothing, so `null` is
+    /// not admitted for it.
+    fn nullable(&self) -> bool {
+        self.default.as_ref().is_some_and(Value::is_null)
     }
 
     /// A valid value other than `current`, for the destructive run's
@@ -808,6 +929,7 @@ fn check_expecting(
     let usage = c.usage(&declared, &accounts.views);
     c.config(&declared);
     c.missing_ids(&declared);
+    c.method_and_cap();
     c.login_flow(None);
     c.events(&declared);
     c.inference_routes(&declared);
@@ -831,7 +953,7 @@ impl Checker<'_> {
                 [s.clone(), quoted[1..quoted.len() - 1].to_string()]
             })
             .fold(text.to_string(), |t, s| t.replace(&s, "<redacted>"));
-        cut(&escape(&redacted), max)
+        crate::format::truncate(&escape(&redacted), max + 1)
     }
 
     fn violation(&mut self, route: &str, expected: String, got: String) {
@@ -1131,15 +1253,39 @@ impl Checker<'_> {
                 anyhow::bail!("nothing answers at {}; is the proxy running?", self.base)
             }
             Err(e) => {
-                self.violation(
-                    ROUTE,
-                    format!(
-                        "an answer inside the daemon probe's bounds ({} s to connect, {} s to answer)",
-                        crate::gateway::HEALTH_CONNECT_SECS,
-                        crate::gateway::HEALTH_RESPONSE_SECS
+                // A timeout is what the daemon's own probe reports a wedged
+                // proxy as, so only it keeps the bounds wording; every other
+                // transport failure names its own kind instead of a time bound
+                // it never hit.
+                let (expected, got) = match &e {
+                    ureq::Error::Timeout(_) => (
+                        format!(
+                            "an answer inside the daemon probe's bounds ({} s to connect, {} s to answer)",
+                            crate::gateway::HEALTH_CONNECT_SECS,
+                            crate::gateway::HEALTH_RESPONSE_SECS
+                        ),
+                        format!("no answer ({e})"),
                     ),
-                    format!("no answer ({e})"),
-                );
+                    ureq::Error::Protocol(_) => (
+                        "bytes that are HTTP".to_string(),
+                        format!("bytes that are not HTTP ({e})"),
+                    ),
+                    ureq::Error::Io(io)
+                        if matches!(
+                            io.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        (
+                            "a whole answer".to_string(),
+                            format!("the connection closed early ({e})"),
+                        )
+                    }
+                    _ => ("an answer".to_string(), format!("no answer ({e})")),
+                };
+                self.violation(ROUTE, expected, got);
                 return Ok(None);
             }
         };
@@ -1489,9 +1635,10 @@ impl Checker<'_> {
         };
         self.opt(route, s, at, "inactive_hint", Kind::Str);
         self.opt(route, s, at, "restart", Kind::Bool);
+        let default = s.get("default").cloned();
         let decl = SettingDecl {
             key: key?,
-            nullable: s.get("default").is_some_and(Value::is_null),
+            default,
             account_scope: scope? == "account",
             typ: typ?,
             options,
@@ -1553,7 +1700,7 @@ impl Checker<'_> {
                         "undeclared".to_string(),
                     );
                 }
-                Some(decl) if !(decl.admits(value) || (value.is_null() && decl.nullable)) => {
+                Some(decl) if !(decl.admits(value) || (value.is_null() && decl.nullable())) => {
                     self.violation(
                         route,
                         format!("{path}: a valid {} value", decl.typ),
@@ -1561,6 +1708,23 @@ impl Checker<'_> {
                     );
                 }
                 Some(_) => {}
+            }
+        }
+        // Every declared setting's current value is rendered (account card,
+        // config view), so a missing one is a departure whichever scope it is
+        // declared at.
+        for decl in declared
+            .settings
+            .iter()
+            .filter(|s| s.account_scope == account_scope)
+        {
+            self.report.checks += 1;
+            if values.get(&decl.key).is_none() {
+                self.violation(
+                    route,
+                    format!("{}: the setting's current value", join(at, &decl.key)),
+                    "nothing".to_string(),
+                );
             }
         }
     }
@@ -1639,23 +1803,7 @@ impl Checker<'_> {
         }
         let settings = self.req(route, account, at, "settings", Kind::Obj).cloned();
         if let Some(settings) = &settings {
-            let settings_at = join(at, "settings");
-            self.settings_values(route, settings, &settings_at, declared, true);
-            // The card renders every account setting's current value, and the
-            // destructive run restores from it.
-            for decl in declared.settings.iter().filter(|s| s.account_scope) {
-                self.report.checks += 1;
-                if settings.get(&decl.key).is_none() {
-                    self.violation(
-                        route,
-                        format!(
-                            "{}: the setting's current value",
-                            join(&settings_at, &decl.key)
-                        ),
-                        "nothing".to_string(),
-                    );
-                }
-            }
+            self.settings_values(route, settings, &join(at, "settings"), declared, true);
         }
         Some(AccountView {
             id: id?,
@@ -1998,6 +2146,25 @@ impl Checker<'_> {
         }
     }
 
+    /// A known control path under a method it does not serve answers 405, and
+    /// a control body over the core's 4096-byte cap answers 413. Both aim at a
+    /// path that opens nothing, so a conformant proxy stays untouched.
+    fn method_and_cap(&mut self) {
+        let route = format!("PUT {CONTROL}/accounts");
+        let answer = self.admin_call(&route, Method::Put, "/accounts", None);
+        self.control_error(&route, answer, 405, "method_not_allowed", None);
+
+        let route = format!("PATCH {CONTROL}/accounts/{{id}} (oversized body)");
+        let body = json!({"settings": one("pad", json!("x".repeat(5000)))});
+        let answer = self.admin_call(
+            &route,
+            Method::Patch,
+            &format!("/accounts/{MISSING_ID}"),
+            Some(&body),
+        );
+        self.control_error(&route, answer, 413, "payload_too_large", None);
+    }
+
     /// Start one login flow (a re-bind of `account` when given), read it back,
     /// cancel it, and see it gone. A flow the proxy opened under any answer is
     /// cancelled, so no run leaves one polling upstream. The flow's
@@ -2039,14 +2206,33 @@ impl Checker<'_> {
                     self.poll_hints(&read, &view);
                 }
             }
+            // A paste is sent only when the flow is POSITIVELY poll-only:
+            // `modes` is a non-empty array of only "poll". Any other shape
+            // leaves the flow's doors unknown, and a paste into a paste-taking
+            // flow reaches upstream, so it is never sent.
+            let poll_only = body
+                .as_ref()
+                .and_then(|body| body.get("modes"))
+                .and_then(Value::as_array)
+                .is_some_and(|modes| {
+                    !modes.is_empty() && modes.iter().all(|m| m.as_str() == Some("poll"))
+                });
+            if poll_only {
+                let paste = format!("POST {CONTROL}/accounts/login/{{flow}} (paste)");
+                let answer = self.admin_call(
+                    &paste,
+                    Method::Post,
+                    &path,
+                    Some(&json!({"code": "zz-check-paste"})),
+                );
+                self.control_error(&paste, answer, 409, "flow_not_paste", None);
+            }
         }
         let cancel = format!("DELETE {CONTROL}/accounts/login/{{flow}}");
         if let Some(answer) = self.admin_call(&cancel, Method::Delete, &path, None) {
             self.status(&cancel, &answer, 204);
         }
-        if started {
-            self.cancelled(&path);
-        }
+        self.cancelled(&path);
     }
 
     fn flow_start(&mut self, route: &str, body: &Value) {
@@ -2080,12 +2266,16 @@ impl Checker<'_> {
     }
 
     /// Cancel a flow a refusal should never have opened; the refusal's own
-    /// status already names that departure.
+    /// status already names that departure. The cancel is itself checked, and
+    /// the flow read back as gone, so a proxy that keeps either is caught.
     fn cancel_stray(&mut self, flow: Option<String>) {
         if let Some(flow) = flow {
             let cancel = format!("DELETE {CONTROL}/accounts/login/{{flow}} (stray flow)");
             let path = format!("/accounts/login/{flow}");
-            self.admin_call(&cancel, Method::Delete, &path, None);
+            if let Some(answer) = self.admin_call(&cancel, Method::Delete, &path, None) {
+                self.status(&cancel, &answer, 204);
+            }
+            self.cancelled(&path);
         }
     }
 
@@ -2309,24 +2499,68 @@ impl Checker<'_> {
                 self.skip(format!("setting {}: no other valid value to set", decl.key));
                 continue;
             };
-            for (value, label) in [(&alt, "set"), (&original, "restore")] {
-                let route = format!("PATCH {CONTROL}/accounts/{{id}} ({label} {})", decl.key);
-                let answer = self.admin_call(
-                    &route,
-                    Method::Patch,
-                    path,
-                    Some(&json!({"settings": one(&decl.key, value.clone())})),
-                );
-                if let Some(body) = self.expect_json(&route, answer, 200) {
-                    self.equals(
-                        &route,
-                        body.get("settings").and_then(|s| s.get(&decl.key)),
-                        &format!("settings.{}", decl.key),
-                        value,
-                    );
+            self.patch_setting(path, &decl.key, &alt, "set");
+            // `null` resets a key to its default. The reset starts from a value
+            // other than the default, so a proxy that keeps the value is caught;
+            // where the value just set IS the default, set another value first.
+            // A declaration with no `default` has nothing to reset to, so the
+            // reset leg is skipped; the set and restore still run.
+            if let Some(default) = decl.default.clone() {
+                if !same(&alt, &default) {
+                    self.reset_setting(path, &decl.key, &default);
+                } else if let Some(from) = decl.alternative(&default) {
+                    self.patch_setting(path, &decl.key, &from, "set");
+                    self.reset_setting(path, &decl.key, &default);
+                } else {
+                    self.skip(format!(
+                        "setting {}: no value other than the default to reset from",
+                        decl.key
+                    ));
                 }
+            } else {
+                self.skip(format!("setting {}: no default to reset to", decl.key));
             }
+            self.patch_setting(path, &decl.key, &original, "restore");
             current.insert(decl.key.clone(), original);
+        }
+    }
+
+    /// `PATCH /accounts/{id}` setting `key` to `value`, read back equal.
+    fn patch_setting(&mut self, path: &str, key: &str, value: &Value, label: &str) {
+        let route = format!("PATCH {CONTROL}/accounts/{{id}} ({label} {key})");
+        let answer = self.admin_call(
+            &route,
+            Method::Patch,
+            path,
+            Some(&json!({"settings": one(key, value.clone())})),
+        );
+        if let Some(body) = self.expect_json(&route, answer, 200) {
+            self.equals(
+                &route,
+                body.get("settings").and_then(|s| s.get(key)),
+                &format!("settings.{key}"),
+                value,
+            );
+        }
+    }
+
+    /// `PATCH /accounts/{id}` with `key: null`, read back at its declared
+    /// `default`.
+    fn reset_setting(&mut self, path: &str, key: &str, default: &Value) {
+        let route = format!("PATCH {CONTROL}/accounts/{{id}} (reset {key})");
+        let answer = self.admin_call(
+            &route,
+            Method::Patch,
+            path,
+            Some(&json!({"settings": one(key, Value::Null)})),
+        );
+        if let Some(body) = self.expect_json(&route, answer, 200) {
+            self.equals(
+                &route,
+                body.get("settings").and_then(|s| s.get(key)),
+                &format!("settings.{key}"),
+                default,
+            );
         }
     }
 

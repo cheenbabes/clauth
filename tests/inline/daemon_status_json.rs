@@ -17,20 +17,6 @@ use utoipa::PartialSchema;
 use utoipa::openapi::RefOr;
 use utoipa::openapi::schema::Schema;
 
-#[test]
-fn iso_from_ms_preserves_unsigned_timestamp_range() {
-    for (ms, iso) in [
-        (0, "1970-01-01T00:00:00+00:00"),
-        (999, "1970-01-01T00:00:00+00:00"),
-        (1_000, "1970-01-01T00:00:01+00:00"),
-        (1_789_257_600_999, "2026-09-13T00:00:00+00:00"),
-        (i64::MAX as u64, "292278994-08-17T07:12:55+00:00"),
-        (u64::MAX, "584556019-04-03T14:25:51+00:00"),
-    ] {
-        assert_eq!(iso_from_ms(ms), iso, "ms = {ms}");
-    }
-}
-
 /// The typed body as a `Value`, for the tests that assert published values;
 /// key order and byte shape are pinned by the `*_bytes` tests.
 fn status_value(
@@ -83,9 +69,14 @@ fn build_status_top_level_shape_and_active() {
         [
             "active_codex_profile",
             "active_profile",
+            "binary_removed",
+            "binary_replaced",
             "clauth_version",
             "codex_fallback_chain",
             "codex_wrap_off",
+            // Additive (#93): the model families Claude Code bills against
+            // usage credits.
+            "credit_billed_families",
             "gateway",
             "generated_at",
             "pending_switch",
@@ -93,6 +84,7 @@ fn build_status_top_level_shape_and_active() {
             "proxies",
             "refresh_interval_ms",
             "schema",
+            "tps",
             "wrap_off",
         ],
     );
@@ -116,6 +108,9 @@ fn build_status_top_level_shape_and_active() {
             "auto_start_queue",
             "base_url",
             "bell_threshold",
+            // Additive (#93): the usage-credit cap, no dollar amounts.
+            "credit_capped",
+            "extra_usage",
             "fallback",
             "fetch_status",
             "fetched_at",
@@ -125,6 +120,7 @@ fn build_status_top_level_shape_and_active() {
             "next_refresh_at",
             "provider",
             "rolling_token",
+            "spend",
             "stale",
             "third_party",
             "tier",
@@ -148,6 +144,64 @@ fn build_status_top_level_shape_and_active() {
         .unwrap()
         .clone();
     assert_eq!(home["active"], false);
+}
+
+/// The status pass builds the claude and codex entries off ONE job-store read
+/// (the `gc_runtime_trees` snapshot precedent), never one read per profile.
+#[test]
+fn the_status_pass_reads_the_job_store_once() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    config.state.active_profile = Some("work".into());
+    config.state.refresh_interval_ms = 300_000;
+
+    crate::claude_jobs::reset_job_trees_reads();
+    build_status(&config, config.state.refresh_interval_ms, None, false);
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "the whole pass reads the store once, never once per profile"
+    );
+}
+
+/// A job naming a tree under `work/` makes `work`'s row read live while `home`
+/// stays idle: the row derives `has_live_session` from the same per-pass job
+/// snapshot, not from the marker alone.
+#[test]
+fn a_job_under_one_profile_reads_live_only_that_profiles_row() {
+    let home = HomeSandbox::new();
+    let work_dir = crate::profile::profile_dir(&ProfileName::from("work")).expect("work dir");
+    let runtime = work_dir.join("runtime-4242-0");
+    std::fs::create_dir_all(&runtime).expect("mkdir runtime tree");
+    crate::testutil::write_claude_job(home.home(), "37560ded", &runtime);
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    let v = status_value(&config, 300_000, None, false);
+    let row = |n: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == n)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        row("work")["has_live_session"],
+        true,
+        "a job under work/ is a live work session"
+    );
+    assert_eq!(
+        row("home")["has_live_session"],
+        false,
+        "a job under work/ is nobody's home session"
+    );
 }
 
 #[test]
@@ -458,6 +512,114 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
     for name in ["a", "b", "c"] {
         assert!(queue_of(&v, name).is_null());
     }
+}
+
+/// A plan with no 5h limit holds no published queue slot on EITHER arm, and
+/// the members that can open a window size the gap: the daemonless arm reads
+/// the disk usage cache, the live arm the daemon's in-memory usage store. A
+/// call site handing the roster a constant closure would publish the marked
+/// member's slot and size every other member's `next_open_at` off an inflated
+/// `N`.
+#[test]
+fn a_plan_with_no_five_hour_limit_holds_no_published_queue_slot_on_either_arm() {
+    use crate::usage::UsageInfo;
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    crate::testutil::register_names(&["a", "b", "m"]);
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "m".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("m")],
+    };
+    let marked = UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &"m".into(),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &marked,
+    );
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    // Daemonless arm: the disk usage cache is the marked source.
+    let v = status_value(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "m").is_null(),
+        "the disk arm publishes no slot for a plan with no 5h limit"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(queue_of(&v, "b")["position"], 2);
+
+    // Live arm: the daemon's in-memory usage store is the marked source.
+    let anchor = 1_780_000_000i64;
+    let usage: HashMap<String, UsageInfo> = HashMap::from([("m".to_string(), marked.clone())]);
+    let empty_status = HashMap::new();
+    let empty_next = HashMap::new();
+    let empty_streaks = HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        third_party_streaks: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+    };
+    let v = status_value(&config, 300_000, Some(&live), false);
+    assert!(
+        queue_of(&v, "m").is_null(),
+        "the live arm publishes no slot for a plan with no 5h limit"
+    );
+    let published = queue_of(&v, "b")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+        "the gap comes from the two members that can open a window"
+    );
+
+    // Control: the same roster with nothing marked keeps N = 3.
+    let unmarked = LiveSignals {
+        usage: &Default::default(),
+        ..live
+    };
+    let v = status_value(&config, 300_000, Some(&unmarked), false);
+    assert_eq!(
+        queue_of(&v, "m")["position"],
+        3,
+        "unmarked control: m takes the third slot"
+    );
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(3, 300_000)),
+        "unmarked control: the gap is sized by three"
+    );
 }
 
 /// An api-key profile's freshness derives from ITS cache
@@ -1200,6 +1362,71 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
 }
 
+/// The fetch status a daemon publishes for `profile`, whose live OAuth status
+/// reads `Fresh`, with a dead-login record written against `fingerprint`.
+fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> serde_json::Value {
+    let name = profile.name.clone();
+    crate::testutil::register_names(&[name.as_str()]);
+    crate::profile_cache::write_auth_expired(&name, fingerprint);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    let status = HashMap::from([(name.to_string(), FetchStatus::Fresh)]);
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+    let live = LiveSignals {
+        status: &status,
+        third_party_status: &Default::default(),
+        third_party_streaks: &Default::default(),
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &Default::default(),
+        gateway: None,
+        proxies: None,
+    };
+    status_value(&config, 300_000, Some(&live), false)["profiles"][0]["fetch_status"].clone()
+}
+
+/// A refused setup token beside a stored pair: the pair keeps the `/usage`
+/// poll fresh, while every session a switch starts runs on the refused token
+/// it installs ahead of the pair, so the daemon says so as the single-shot
+/// does.
+#[test]
+fn build_status_reads_a_refused_setup_token_over_a_fresh_pair() {
+    let _home = HomeSandbox::new();
+    let mut p = oauth_profile("minted");
+    p.has_long_lived_sidecar = true;
+    p.setup_token_digest = Some(0x5e7);
+    assert!(crate::usage::dead_login_is_setup_token(&p));
+    assert_eq!(
+        fetch_status_over_a_fresh_live_status(p, 0x5e7),
+        "AuthExpired"
+    );
+}
+
+/// A hybrid's record is its key's, and its OAuth leg's live status keeps the
+/// precedence the TUI's merge gives it.
+#[test]
+fn build_status_keeps_a_hybrids_fresh_oauth_leg_over_its_keys_record() {
+    let _home = HomeSandbox::new();
+    let mut p = oauth_profile("hybrid");
+    p.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    p.api_key = Some("hybrid-key".to_string());
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&p).expect("a hybrid's key fingerprint");
+    assert_eq!(
+        fetch_status_over_a_fresh_live_status(p, fingerprint),
+        "Fresh"
+    );
+}
+
 /// The daemonless surfaces (`clauth status --json`, `clauth list`) derive
 /// freshness from the usage cache's mtime, so a warm cache behind a DEAD
 /// console session published `fetch_status: "Fresh"` — a live measurement over
@@ -1448,6 +1675,43 @@ fn published_entries_deserialize_into_the_typed_contract() {
     assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
 }
 
+/// The typed entry carries its long-window PRESENCE label in-memory (`7d`, else
+/// `30d`), so the push sender reads it off the entry instead of re-reading the
+/// profile's cache every tick — and it never leaks into the published body.
+#[test]
+fn the_entry_carries_the_long_window_presence_label_unpublished() {
+    let _home = HomeSandbox::new();
+    // A monthly-only third-party account: label `30d`, one published 30d row.
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(url.to_string()), Some("k".into()));
+    qwen.provider = crate::providers::Provider::from_base_url(url);
+    crate::profile::save_profile(&qwen).expect("save the qwen profile");
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![qwen],
+    };
+    crate::testutil::register_names(&["qwen"]);
+    crate::testutil::write_captured_third_party_cache("qwen", crate::testutil::QWEN_MONTHLY_CACHE);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    assert_eq!(entries[0].long_window_label, Some("30d"));
+
+    let v = status_value(&config, config.state.refresh_interval_ms, None, false);
+    assert!(
+        !v["profiles"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("long_window_label"),
+        "the presence label is an in-memory field, never published"
+    );
+}
+
 /// The codex half of the feed is ADDITIVE (decision 10): the top-level
 /// `active_profile`/`wrap_off` stay the CLAUDE slots, the per-harness ones sit
 /// beside them, and codex entries are APPENDED so a reader that predates codex
@@ -1573,7 +1837,9 @@ fn codex_entries_fall_back_to_the_id_token_plan_and_publish_broken() {
             "dead",
             1_700_000_000_000,
             "2026-08-13T00:00:00Z".into(),
-            &invalidated
+            &invalidated,
+            &crate::testutil::fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
         ),
         crate::codex_auth::StandbyOutcome::Failed
     );
@@ -1770,6 +2036,70 @@ fn daemonless_status_drops_a_canceled_account_from_its_usage_cache() {
     );
 }
 
+/// Daemonless `status --json` drops an account its organization refuses off
+/// the disk plan the same way, and the survivor closes up. The control: with no
+/// refusal on that plan the account keeps its place.
+#[test]
+fn daemonless_status_drops_an_organization_refused_account_from_its_usage_cache() {
+    use crate::profile_cache::write_profile_cache;
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b")],
+    };
+    let write_plan = |status: Option<&str>| {
+        write_profile_cache(
+            &ProfileName::from("a"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                plan: Some(PlanInfo {
+                    subscription_status: status.map(str::to_string),
+                    ..PlanInfo::default()
+                }),
+                ..UsageInfo::default()
+            },
+        );
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+    write_plan(None);
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        queue_of(&v, "a")["position"],
+        1,
+        "control: an unrefused plan keeps its place"
+    );
+    write_plan(Some(crate::usage::ORG_REFUSED_STATUS));
+    let v = status_value(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "a").is_null(),
+        "`status --json` drops the account its organization refuses"
+    );
+    assert_eq!(
+        queue_of(&v, "b")["position"],
+        1,
+        "the survivor closes up to position 1"
+    );
+}
+
 /// Byte-parity pin for the `fallback` object: key order, `None` → `null`,
 /// `Some` → the object, and a threshold with more significant digits than `f32`
 /// carries so a narrowing of the field changes the bytes.
@@ -1823,6 +2153,10 @@ fn status_body_matches_legacy_json_bytes() {
         clauth_version: "9.9.9".to_string(),
         gateway: None,
         proxies: Vec::new(),
+        tps: None,
+        credit_billed_families: vec!["fable".to_string(), "mythos".to_string()],
+        binary_replaced: true,
+        binary_removed: true,
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -1861,7 +2195,17 @@ fn status_body_matches_legacy_json_bytes() {
                         resets_at: None,
                     },
                 ],
+                long_window_label: Some("7d"),
                 third_party: Some(ThirdPartyAvailability { available: true }),
+                spend: Some(CapBlock {
+                    enabled: true,
+                    percent: Some(62.0),
+                }),
+                extra_usage: Some(CapBlock {
+                    enabled: true,
+                    percent: Some(12.428),
+                }),
+                credit_capped: false,
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -1882,7 +2226,11 @@ fn status_body_matches_legacy_json_bytes() {
                 bell_threshold: None,
                 fallback: None,
                 windows: vec![],
+                long_window_label: None,
                 third_party: None,
+                spend: None,
+                extra_usage: None,
+                credit_capped: false,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -1906,7 +2254,11 @@ fn status_body_matches_legacy_json_bytes() {
                 bell_threshold: None,
                 fallback: None,
                 windows: vec![],
+                long_window_label: None,
                 third_party: None,
+                spend: None,
+                extra_usage: None,
+                credit_capped: false,
             },
         ],
     };
@@ -1914,7 +2266,8 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"profiles":["#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
+        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -1923,17 +2276,19 @@ fn status_body_matches_legacy_json_bytes() {
         r#""bell_threshold":92.345678901,"fallback":{"position":1,"threshold":92.345678901,"armed":true},"#,
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
-        r#""third_party":{"available":true}},"#,
+        r#""third_party":{"available":true},"spend":{"enabled":true,"percent":62.0},"#,
+        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
-        r#""windows":[],"third_party":null},"#,
+        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
-        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null}]}"#,
+        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"spend":null,"#,
+        r#""extra_usage":null,"credit_capped":false}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -1951,13 +2306,18 @@ fn status_body_matches_legacy_json_bytes() {
         clauth_version: "9.9.9".to_string(),
         gateway: None,
         proxies: Vec::new(),
+        tps: None,
+        credit_billed_families: Vec::new(),
+        binary_replaced: false,
+        binary_removed: false,
         profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"profiles":[]}"#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
+        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2012,9 +2372,12 @@ fn status_body_derives_the_single_shot_queue_anchor_from_usage_history() {
 
     let config = crate::profile::load_config().unwrap();
     let interval_ms = 300_000u64;
-    let members = crate::usage::auto_start_queue_members(&config, &[], |n| {
-        crate::profile_json::is_canceled_cached(n)
-    });
+    let members = crate::usage::auto_start_queue_members(
+        &config,
+        &[],
+        crate::profile_json::is_canceled_cached,
+        crate::usage::no_five_hour_limit_cached,
+    );
     let anchor = crate::usage::history_anchor(
         &config
             .profiles
@@ -2171,6 +2534,7 @@ fn status_body_never_leaks_a_credential() {
     let reading = |utilization: f64| crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
             email: None,
@@ -2210,6 +2574,7 @@ fn status_body_never_leaks_a_credential() {
                 resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 2 * 3600)),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,
@@ -2539,6 +2904,7 @@ fn status_schema_agrees_with_the_serialized_body() {
     let oauth_reading = crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
             email: None,
@@ -2546,6 +2912,17 @@ fn status_schema_agrees_with_the_serialized_body() {
         five_hour: Some(window(42.0, 3)),
         seven_day: Some(window(13.0, 72)),
         fetched_at: Some(crate::usage::now_ms() - 60_000),
+        // Both credit blocks, one with an unread percent, so the walk reads
+        // `CapBlock` with a number and with a `null`.
+        spend: Some(crate::usage::SpendInfo {
+            enabled: true,
+            percent: Some(12.0),
+            ..Default::default()
+        }),
+        extra_usage: Some(crate::usage::ExtraUsage {
+            is_enabled: true,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     crate::profile_cache::write_profile_cache(
@@ -2570,6 +2947,7 @@ fn status_schema_agrees_with_the_serialized_body() {
                 resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 2 * 3600)),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,
@@ -2598,8 +2976,24 @@ fn status_schema_agrees_with_the_serialized_body() {
         body.profiles.iter().any(|e| !e.windows.is_empty()),
         "fixture never populates a window"
     );
-
     let value = serde_json::to_value(&body).unwrap();
+    assert!(
+        value["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["spend"]["percent"].is_number()),
+        "fixture never populates a credit block with a percent"
+    );
+    assert!(
+        value["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["extra_usage"].is_object() && p["extra_usage"]["percent"].is_null()),
+        "fixture never populates a credit block with an unread percent"
+    );
+
     schema_agrees_with_type::<StatusBody>(&value);
 }
 
@@ -2970,4 +3364,506 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
     assert_eq!(proxies[1]["version"], "1.2.0");
     assert_eq!(proxies[1]["contract"], "1.0");
     assert_eq!(proxies[1]["pid"], 4242);
+}
+
+/// The daemon republishes the lease holder's tps cache as one additive `tps`
+/// slot: the cache minus its `days`, plus `age_secs`; schema stays 2. No cache
+/// publishes `tps: null`, never a fabricated zero.
+#[test]
+fn build_status_republishes_the_tps_cache_as_an_additive_slot() {
+    let home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let none = status_value(&config, 300_000, None, false);
+    assert_eq!(none["tps"], serde_json::Value::Null, "no cache: null");
+
+    let now = crate::usage::now_ms();
+    let generated_at = chrono::DateTime::from_timestamp_millis(i64::try_from(now - 3_000).unwrap())
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+        .to_string();
+    let live = |rate: f64, speed: Option<f64>| crate::tps::Figures {
+        live: crate::tps::Figure { rate, speed },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: generated_at.clone(),
+        total: live(67.0, Some(92.0)),
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert("work".into(), live(67.0, Some(92.0)));
+    snap.sessions.insert(
+        "s1".into(),
+        crate::tps::SessionFigures {
+            account: Some("work".into()),
+            figures: live(67.0, Some(92.0)),
+        },
+    );
+    snap.days
+        .entry("2026-10-15".into())
+        .or_default()
+        .entry("work".into())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".into(),
+            crate::tps::DaySum {
+                output: 1222,
+                gen_ms: 13_597,
+                ..Default::default()
+            },
+        );
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(v["schema"], 2, "an additive field never bumps the schema");
+    let tps = &v["tps"];
+    assert_eq!(tps["generated_at"], generated_at.as_str());
+    assert_eq!(tps["total"]["live"]["rate"], 67.0);
+    assert_eq!(tps["accounts"]["work"]["live"]["speed"], 92.0);
+    assert_eq!(tps["sessions"]["s1"]["account"], "work");
+    assert_eq!(tps["sessions"]["s1"]["live"]["rate"], 67.0);
+    assert!(tps.get("days").is_none(), "days stay in the cache: {tps}");
+    let age = tps["age_secs"].as_u64().expect("age_secs is a number");
+    assert!((3..=5).contains(&age), "age off generated_at: {age}");
+}
+
+// ── the usage-credit cap (#93) ───────────────────────────────────────────────
+
+/// Each profile publishes its `spend` and `extra_usage` blocks as
+/// `{enabled, percent}` (null without the block) plus the derived
+/// `credit_capped`, and the body names the credit-billed families. No dollar
+/// amount reaches the feed (wiki/Daemon.md: names, tiers, percentages,
+/// timestamps only).
+#[test]
+fn build_status_publishes_the_credit_cap_without_amounts() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile("capped"),
+            oauth_profile("stale"),
+            oauth_profile("stale-full"),
+            oauth_profile("unread"),
+            oauth_profile("bare"),
+        ],
+    };
+    crate::testutil::register_names(&["capped", "stale", "stale-full", "unread", "bare"]);
+    let spend = |enabled, used, limit, percent| crate::usage::SpendInfo {
+        enabled,
+        used: Some(used),
+        limit: Some(limit),
+        percent: Some(percent),
+        currency: Some("USD".to_string()),
+    };
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("capped"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(spend(true, 50.0, 50.0, 100.0)),
+            extra_usage: Some(crate::usage::ExtraUsage {
+                is_enabled: true,
+                monthly_limit: Some(25.0),
+                used_credits: Some(3.107),
+                utilization: Some(12.428),
+                currency: Some("USD".to_string()),
+                ..Default::default()
+            }),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    // kerry's billing-off shape (2026-07-17): a stale limit, never a cap.
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("stale"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(spend(false, 31.07, 50.0, 62.0)),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    // The same billing-off account with its stale limit fully used: every
+    // figure reads spent, and `enabled` alone says it is no cap. Its
+    // `extra_usage` block is on with nothing read.
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("stale-full"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(spend(false, 50.0, 50.0, 100.0)),
+            extra_usage: Some(crate::usage::ExtraUsage {
+                is_enabled: true,
+                ..Default::default()
+            }),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    // Billing on, nothing read: no figure to publish, no cap to claim.
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("unread"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                ..Default::default()
+            }),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    std::fs::write(
+        crate::profile::home_dir().unwrap().join(".claude.json"),
+        br#"{"cachedGrowthBookFeatures":{"tengu_calm_seal":["Mythos"]}}"#,
+    )
+    .unwrap();
+
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(v["schema"], 2, "an additive field never bumps the schema");
+    assert_eq!(
+        v["credit_billed_families"],
+        serde_json::json!(["fable", "mythos"])
+    );
+    let entry = |name: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
+            .clone()
+    };
+
+    let capped = entry("capped");
+    assert_eq!(
+        capped["spend"],
+        serde_json::json!({"enabled": true, "percent": 100.0})
+    );
+    assert_eq!(
+        capped["extra_usage"],
+        serde_json::json!({"enabled": true, "percent": 12.428})
+    );
+    assert_eq!(capped["credit_capped"], true);
+
+    let stale = entry("stale");
+    assert_eq!(
+        stale["spend"],
+        serde_json::json!({"enabled": false, "percent": 62.0})
+    );
+    assert!(
+        stale["extra_usage"].is_null(),
+        "no block, no object: {stale}"
+    );
+    assert_eq!(stale["credit_capped"], false);
+
+    let stale_full = entry("stale-full");
+    assert_eq!(
+        stale_full["spend"],
+        serde_json::json!({"enabled": false, "percent": 100.0})
+    );
+    assert_eq!(
+        stale_full["extra_usage"],
+        serde_json::json!({"enabled": true, "percent": null}),
+        "an unread percent publishes null, never a fabricated 0"
+    );
+    assert_eq!(stale_full["credit_capped"], false, "billing off is no cap");
+
+    let unread = entry("unread");
+    assert_eq!(
+        unread["spend"],
+        serde_json::json!({"enabled": true, "percent": null}),
+        "an unread spend percent publishes null, never a fabricated 0"
+    );
+    assert_eq!(unread["credit_capped"], false, "nothing read is no cap");
+
+    let bare = entry("bare");
+    assert!(bare["spend"].is_null(), "no cache, no object: {bare}");
+    assert!(bare["extra_usage"].is_null(), "no cache, no object: {bare}");
+    assert_eq!(bare["credit_capped"], false);
+
+    let body = serde_json::to_string(&v).unwrap();
+    for amount in [
+        "31.07",
+        "3.107",
+        "25.0",
+        "50.0",
+        "monthly_limit",
+        "used_credits",
+        "\"used\"",
+        "\"limit\"",
+    ] {
+        assert!(
+            !body.contains(amount),
+            "no dollar amount reaches the feed: {amount}"
+        );
+    }
+}
+
+/// The `peaks` object fixture, shared by value across the feed tests.
+fn peaks_fixture() -> serde_json::Value {
+    let pair = |speed: f64, rate: f64| {
+        serde_json::json!({
+            "speed": {"value": speed, "at": "2026-10-19T21:14:03.120+00:00", "account": "kerry", "model": "claude-opus-5-5"},
+            "rate": {"value": rate, "at": "2026-10-19T21:02:10.000+00:00"},
+        })
+    };
+    let half = |speed: f64, rate: f64| {
+        let mut h = pair(speed, rate);
+        h["accounts"] = serde_json::json!({"kerry": pair(speed, rate - 1.0)});
+        h["models"] = serde_json::json!({"claude-opus-5-5": pair(speed, rate - 2.0)});
+        h
+    };
+    serde_json::json!({"today": half(412.3, 1803.0), "ever": half(612.0, 3104.0)})
+}
+
+/// `status.json`'s `tps` slot republishes the cache's `peaks` as is.
+#[test]
+fn the_tps_slot_republishes_the_caches_peaks() {
+    let home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let mut cache = serde_json::to_value(crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    })
+    .unwrap();
+    cache["peaks"] = peaks_fixture();
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let slot = serde_json::to_value(tps_slot().expect("a fresh cache yields a slot")).unwrap();
+    assert_eq!(slot["peaks"], peaks_fixture(), "slot: {slot}");
+}
+
+/// The `TpsSlot` OpenAPI schema and a populated serialized slot agree key for
+/// key (the `peaks` object included): the walk would red on a wire/schema
+/// drift the value-only feed tests cannot see.
+#[test]
+fn the_tps_slot_schema_agrees_with_a_populated_slot() {
+    let home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let mut cache = serde_json::to_value(crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    })
+    .unwrap();
+    cache["peaks"] = peaks_fixture();
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let slot = tps_slot().expect("a fresh cache yields a slot");
+    let value = serde_json::to_value(&slot).unwrap();
+    schema_agrees_with_type::<TpsSlot>(&value);
+}
+
+/// The producer's attribution timeline is producer-only state in its own
+/// file: it never reaches the `status.json` `tps` slot nor the full body
+/// `GET /api/v1/status` serves (both are this one body).
+#[test]
+fn the_status_body_never_publishes_the_tps_attribution_timeline() {
+    let home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let now = crate::usage::now_ms();
+    let snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    };
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+    // The timeline lives in its own file, never in the cache the feed reads.
+    std::fs::write(
+        home.home()
+            .join(".clauth")
+            .join(crate::tps::TPS_ATTRIBUTION_FILE),
+        r#"{"version":1,"entries":[{"session":"s","since":0,"member":"work","pos":null}]}"#,
+    )
+    .unwrap();
+
+    let slot = serde_json::to_value(tps_slot().expect("a fresh cache yields a slot")).unwrap();
+    assert!(
+        slot.get("entries").is_none(),
+        "the slot hides the timeline: {slot}"
+    );
+
+    let body = status_value(&config, 300_000, None, false);
+    assert!(
+        body.get("entries").is_none(),
+        "the body hides the timeline: {body}"
+    );
+    assert!(
+        body["tps"].get("entries").is_none(),
+        "the tps slot hides the timeline: {}",
+        body["tps"]
+    );
+}
+
+/// `binary_replaced` is the writer's own plugin-heal stand-down verdict, never
+/// a version compare: a same-path rename-replace (a rebuild at the same
+/// version) publishes `true`, an untouched recorded binary `false`.
+#[cfg(unix)]
+#[test]
+fn binary_replaced_publishes_the_writers_own_stand_down_verdict() {
+    let home = HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        v["binary_replaced"],
+        serde_json::json!(false),
+        "an unchanged binary publishes false"
+    );
+
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        v["binary_replaced"],
+        serde_json::json!(true),
+        "a replaced binary publishes true"
+    );
+    assert_eq!(
+        v["binary_removed"],
+        serde_json::json!(false),
+        "a file at the path is never a removal"
+    );
+
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        (&v["binary_replaced"], &v["binary_removed"]),
+        (&serde_json::json!(true), &serde_json::json!(true)),
+        "a removed binary keeps binary_replaced true (changed or gone) and marks the removal"
+    );
+}
+
+/// A daemonless republish carries a daemon's backdated stamp, so its writer's
+/// own changed binary (replaced or removed) never reaches the feed: the same
+/// writer publishes `true` under its own stamp and `false` under the backdated
+/// one.
+#[cfg(unix)]
+#[test]
+fn a_backdated_republish_never_publishes_its_writers_replaced_binary() {
+    let home = HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+
+    let feed = |stamp: Option<&str>| -> serde_json::Value {
+        serde_json::from_slice(
+            &crate::daemon::status_feed_json(&config, None, stamp).expect("feed serializes"),
+        )
+        .expect("feed parses")
+    };
+    assert_eq!(
+        feed(None)["binary_replaced"],
+        serde_json::json!(true),
+        "the writer's own stamp carries its verdict"
+    );
+    assert_eq!(
+        feed(Some("2026-09-13T00:00:00+00:00"))["binary_replaced"],
+        serde_json::json!(false),
+        "a backdated stamp vouches for a daemon, so the writer's verdict stays out"
+    );
+
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+    assert_eq!(
+        feed(None)["binary_removed"],
+        serde_json::json!(true),
+        "the writer's own stamp carries its removal"
+    );
+    assert_eq!(
+        feed(Some("2026-09-13T00:00:00+00:00"))["binary_removed"],
+        serde_json::json!(false),
+        "a backdated stamp keeps the writer's removal out too"
+    );
+}
+
+/// A probed account's figures age at its probe interval, a polled one's at
+/// the poll interval: the same reading is fresh and still due on the first,
+/// cached and overdue on the second, and only the second goes stale first.
+#[test]
+fn build_status_ages_a_probed_account_at_its_probe_interval() {
+    let _home = HomeSandbox::new();
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
+    probed.usage_probe = true;
+    probed.has_long_lived_sidecar = true;
+    probed.usage_probe_interval_ms = 450_000;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![probed, oauth_profile("polled")],
+    };
+    crate::testutil::register_names(&["probed", "polled"]);
+    let write = |age_secs: u64| {
+        for name in ["probed", "polled"] {
+            crate::profile_cache::write_profile_cache(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &crate::usage::UsageInfo {
+                    five_hour: Some(crate::usage::UsageWindow {
+                        utilization: 31.0,
+                        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                    }),
+                    fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+                    ..Default::default()
+                },
+            );
+        }
+    };
+    let entry = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
+            .clone()
+    };
+
+    write(200);
+    let v = status_value(&config, 90_000, None, false);
+    let (probed, polled) = (entry(&v, "probed"), entry(&v, "polled"));
+    assert_eq!(probed["fetch_status"], "Fresh");
+    assert_eq!(polled["fetch_status"], "Cached");
+    assert!(!probed["next_refresh_at"].is_null(), "{probed}");
+    assert!(polled["next_refresh_at"].is_null(), "{polled}");
+
+    // Past the poll's threshold (2 × 5 min + 90 s), inside the probe's
+    // (2 × 10 min + 10 min).
+    write(1000);
+    let v = status_value(&config, 90_000, None, false);
+    assert_eq!(entry(&v, "probed")["stale"], false);
+    assert_eq!(entry(&v, "polled")["stale"], true);
 }

@@ -202,6 +202,7 @@ fn codex_json_view(name: &str) -> serde_json::Value {
         "tier": serde_json::Value::Null,
         "oauth": serde_json::Value::Null,
         "active": active,
+        "tps": serde_json::Value::Null,
     })
 }
 
@@ -340,7 +341,10 @@ fn session_auth_for(
 /// `cwd_is_real_home` shape); a side that cannot resolve falls back to the
 /// plain compare.
 fn dir_is_claude_dir(dir: &Path, claude_dir: &Path) -> bool {
-    match (dir.canonicalize(), claude_dir.canonicalize()) {
+    match (
+        crate::canonical::identity(dir),
+        crate::canonical::identity(claude_dir),
+    ) {
         (Ok(a), Ok(b)) => a == b,
         _ => dir == claude_dir,
     }
@@ -375,8 +379,17 @@ fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
 }
 
 fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    // A regular file only, bounded: the credentials path is read every
+    // session-scope `profiles` call and every bare-marker tally tick, and an
+    // `open` on a FIFO blocks forever (a device read never ends). A
+    // non-regular or unreadable file reads `None`, the arm an unreadable
+    // credentials file already takes: the resolution proceeds credential-less.
+    // The cap is the Keychain blob ceiling, not the job-record one: a
+    // credentials file carries Claude Code's `mcpOAuth` block beside the login
+    // and grows far past a job record's size.
+    let bytes =
+        crate::runtime::read_regular_capped(path, crate::runtime::CREDENTIALS_READ_CAP).ok()??;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// [`resolve_profile_candidate`] filtered so a user-disabled account is never
@@ -579,6 +592,7 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
     let profile = resolved
         .and_then(|(name, _)| config.find(&crate::profile::ProfileName::from(name.clone())));
+    let profile_name = resolved.map(|(name, _)| name.as_str());
     let mut value = serde_json::json!({
         "profile": profile.map(|p| &p.name),
         "source": resolved.map(|(_, s)| s.as_str()),
@@ -586,6 +600,7 @@ fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_j
         "tier": profile.and_then(tier_label),
         "oauth": profile.map(Profile::is_oauth),
         "active": profile.is_some_and(|p| config.is_active(&p.name)),
+        "tps": tps_view(profile_name),
     });
     if profile.is_some()
         && let Some(status) = crate::credential_sync::status()
@@ -593,6 +608,47 @@ fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_j
         value["credential_sync"] = serde_json::json!(status);
     }
     value
+}
+
+/// The `--json` tps field for the resolved profile, read from the producer's
+/// cache only (no self-tail): `null` with no cache or one older than
+/// [`crate::tps::STALE_AFTER_MS`]. `speed`/`rate` are the profile's live
+/// figures; `session` is the current Claude Code session's live figures when
+/// `CLAUDE_CODE_SESSION_ID` names one in the cache; `peaks.today` is the
+/// profile's own today peaks from the cache's `peaks.today.accounts`.
+fn tps_view(profile: Option<&str>) -> serde_json::Value {
+    tps_view_at(profile, crate::usage::now_ms())
+}
+
+/// [`tps_view`] with the clock fixed, so tests can pin the staleness edge.
+fn tps_view_at(profile: Option<&str>, now_ms: u64) -> serde_json::Value {
+    let Some(snap) = crate::tps::load_cache() else {
+        return serde_json::Value::Null;
+    };
+    let Some(age_ms) = snap.age_ms(now_ms) else {
+        return serde_json::Value::Null;
+    };
+    if age_ms > crate::tps::STALE_AFTER_MS {
+        return serde_json::Value::Null;
+    }
+    let figures = profile.and_then(|name| snap.accounts.get(name));
+    let peaks = profile.and_then(|name| snap.peaks.today.accounts.get(name));
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .and_then(|sid| snap.sessions.get(&sid))
+        .map(|s| {
+            serde_json::json!({
+                "speed": s.figures.live.speed,
+                "rate": s.figures.live.rate,
+            })
+        });
+    serde_json::json!({
+        "speed": figures.and_then(|f| f.live.speed),
+        "rate": figures.map_or(0.0, |f| f.live.rate),
+        "session": session,
+        "peaks": serde_json::json!({"today": peaks.cloned().unwrap_or_default()}),
+        "age_secs": age_ms / 1000,
+    })
 }
 
 // ---- Keychain evidence (macOS): the tier's read, behind a ~30 s TTL cache ----
@@ -706,7 +762,15 @@ fn keychain_cache_entry(
 
 #[cfg(any(target_os = "macos", test))]
 fn read_keychain_cache_entry(dir: &Path, service: &str) -> Option<KeychainEvidenceEntry> {
-    let bytes = std::fs::read(keychain_cache_entry_path(dir, service)).ok()?;
+    // A regular file only, bounded like `read_credentials` and by the same
+    // ceiling: the entry wraps one credential blob, so it can run as large.
+    // A non-regular or unreadable entry reads `None`, the arm an absent or
+    // unparseable entry already takes ("no evidence").
+    let bytes = crate::runtime::read_regular_capped(
+        &keychain_cache_entry_path(dir, service),
+        crate::runtime::CREDENTIALS_READ_CAP,
+    )
+    .ok()??;
     serde_json::from_slice(&bytes).ok()
 }
 

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 #![allow(unsafe_code)]
 
 //! Guard coverage for `delegate`'s merged `prompt` (text or a path, validated
@@ -167,6 +167,25 @@ fn work_dir(home: &std::path::Path) -> std::path::PathBuf {
     let dir = home.join("work");
     std::fs::create_dir_all(&dir).expect("create work dir");
     dir
+}
+
+/// A prompt path that does not resolve names the cwd in its plain spelling:
+/// on Windows the resolved base is a `\\?\` verbatim path, which the refusal
+/// would otherwise show.
+#[test]
+fn a_missing_prompt_names_the_cwd_in_its_plain_spelling() {
+    let home = HomeSandbox::new();
+    let cwd = crate::testutil::plain_path(&work_dir(home.home()));
+    let err = super::read_prompt_file(Some(cwd.to_str().unwrap()), "absent.txt")
+        .expect_err("absent prompt");
+    let os = std::fs::canonicalize(cwd.join("absent.txt")).expect_err("absent file");
+    assert_eq!(
+        err,
+        format!(
+            "prompt `absent.txt` does not resolve under cwd '{}': {os}; check the path, or pass the prompt as text",
+            cwd.display()
+        )
+    );
 }
 
 // ── prompt: one arg, two ways ────────────────────────────────────────────────
@@ -555,6 +574,39 @@ fn subagent_type_is_passed_as_the_agent_flag() {
     );
 }
 
+/// `subagent_type` reaches the spawn as the caller spelled it: clauth neither
+/// strips nor refuses a prefix — the child resolves the name and clauth holds
+/// no roster to map against — so the argv the child receives carries the
+/// call's value verbatim.
+#[cfg(unix)]
+#[test]
+fn a_prefixed_subagent_type_reaches_the_spawn_unchanged() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let fake = FakeClaude::new(&home);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        subagent_type: Some("agents:rev".to_string()),
+        ..base()
+    });
+    // The shim prints no stream-json, so the envelope may be an error: the run
+    // under test is the argv, not the result.
+    let _ = result;
+    let spawns = fake.spawns();
+    assert!(!spawns.is_empty(), "the delegate spawned claude");
+    for (dir, argv) in &spawns {
+        assert!(
+            argv.contains("--agent agents:rev"),
+            "the prefixed spelling reaches the child exactly as the call spelled it ({dir}): {argv}"
+        );
+    }
+}
+
 /// The session-identity flags are clauth-owned, not a typed-vs-raw duplicate:
 /// a raw spelling would land AFTER the pin (`args` run last) and move the
 /// child off the id `CLAUTH_DELEGATE_SESSION_ID` names. Every spelling that
@@ -723,6 +775,10 @@ fn result_file_writes_the_envelope_and_returns_path_and_sha256() {
     assert!(
         text.starts_with("result written to ") && text.contains("sha256 "),
         "the reply carries path and sha256, not the inline body: {text}",
+    );
+    assert!(
+        text.contains("first line: cwd does not exist"),
+        "the reply names the result's first line beside the path: {text}",
     );
     let path = text
         .split_once("result written to ")
@@ -1924,6 +1980,7 @@ fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
         Some("claude-opus"),
         Some(10),
         1_000,
+        None,
     );
     let names = vec!["solo".to_string()];
     let envelope = || Ok(serde_json::json!({ "result": "boom" }));
@@ -2059,8 +2116,7 @@ fn an_unfunded_target_is_refused_at_routing_time() {
         first_text(&result),
         "delegate to `broke` failed: cannot fund a run: broke — api balance: \
          0.00 CNY (balance too low) (cached 1h 30m ago); name another account; \
-         target `broke`: no 5h/7d limits; api balance: 0.00 CNY (balance too \
-         low) (cached 1h 30m ago)",
+         target `broke`: api balance: 0.00 CNY (balance too low) (cached 1h 30m ago)",
         "the refusal names the account, the provider's figure, the verdict, \
          the cache age and the fix, and the headroom clause dates the same \
          cache"
@@ -2129,7 +2185,7 @@ fn a_target_with_no_third_party_cache_passes_preflight() {
     let pn = crate::profile::ProfileName::from("oauth");
     let profile = config.find(&pn).expect("seeded profile resolves");
     assert_eq!(
-        super::preflight_target(profile, &config, &pn),
+        super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[]),
         Ok(()),
         "no cache is no verdict: preflight passes"
     );
@@ -2149,7 +2205,7 @@ fn a_first_party_profile_with_a_stale_third_party_cache_passes() {
     let pn = crate::profile::ProfileName::from("plain");
     let profile = config.find(&pn).expect("seeded profile resolves");
     assert_eq!(
-        super::preflight_target(profile, &config, &pn),
+        super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[]),
         Ok(()),
         "a cache the fetch legs would never refresh is no verdict here: \
          preflight passes"
@@ -2180,7 +2236,8 @@ fn the_keyless_sentence_outranks_the_unfunded_one() {
     let config = crate::profile::load_config().expect("config loads");
     let pn = crate::profile::ProfileName::from("nokey");
     let profile = config.find(&pn).expect("seeded profile resolves");
-    let reason = super::preflight_target(profile, &config, &pn).expect_err("refused");
+    let reason = super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[])
+        .expect_err("refused");
     assert_eq!(
         reason, "profile has no api key: nokey (run `clauth login nokey --api-key <key>`)",
         "the keyless sentence is the refusal, not the unfunded one"

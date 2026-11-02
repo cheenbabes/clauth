@@ -434,7 +434,7 @@ fn same_profile_cli_switch_repairs_a_managed_file_without_recapture() {
         crate::which::resolve_global(&config).unwrap().1,
         crate::which::Source::ManagedPredecessor
     );
-    crate::actions::switch_profile_cli(config, &name).unwrap();
+    crate::actions::switch_profile_cli(config, &name, std::io::empty()).unwrap();
     let live: ClaudeCredentials = crate::profile::read_json_file(&path).unwrap();
     assert_eq!(live.access_token(), Some("B"));
 }

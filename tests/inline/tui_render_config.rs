@@ -274,6 +274,67 @@ fn capture_and_logout_hints_state_the_act_alone() {
     );
 }
 
+/// Over an unreadable `credentials.json`, an api-key account's log-out hint
+/// names the file it clears; the api key, when present, is still named too.
+/// Guard pin: the copy is the whole disclosure, so the strings are pinned whole.
+#[test]
+fn logout_hint_over_a_torn_store_names_the_file() {
+    let mut snap = Snap::blank("a");
+    snap.login_is_oauth = false;
+    snap.has_unreadable_store = true;
+    snap.has_api_key = true;
+    assert_eq!(
+        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        Some("clears the stored API key and the unreadable credentials.json"),
+    );
+    snap.has_api_key = false;
+    assert_eq!(
+        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        Some("clears the unreadable credentials.json"),
+    );
+}
+
+/// The log-out hint renders only on the focused row, and focus seeds a draft
+/// that blanks the snap's text fields: the key's presence must survive it.
+#[test]
+fn torn_store_logout_hint_survives_an_open_draft() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, UnreadableStoreReason};
+    for (key, want) in [
+        (
+            Some("sk-secret"),
+            "clears the stored API key and the unreadable credentials.json",
+        ),
+        (None, "clears the unreadable credentials.json"),
+    ] {
+        let mut p = Profile::new(
+            "api-torn".to_string(),
+            Some("https://api.example.com".to_string()),
+            key.map(str::to_string),
+        );
+        p.unreadable_credentials_store = Some(UnreadableStoreReason::Parse);
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec!["api-torn".into()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        });
+        app.profile_cursor.set(0);
+        for with_text in [true, false] {
+            assert_eq!(
+                row_hint(
+                    ConfigRow::DeleteCreds,
+                    &build_snap(&app, &app.readings_snapshot(), with_text)
+                )
+                .as_deref(),
+                Some(want),
+                "key={key:?}, with_text={with_text}"
+            );
+        }
+    }
+}
+
 // ── `disabled` row (account-action button, same class as `Delete`) ─────────
 
 /// Disabling is the real-impact direction: it renders in the exact same
@@ -550,7 +611,18 @@ fn setup_status_row_renders_only_while_disabled() {
             profiles: Vec::new(),
         });
         term.draw(|f| {
-            draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false);
+            draw_settings_rows(
+                f,
+                f.area(),
+                &app,
+                &[],
+                0,
+                &snap,
+                SettingsRowsTail {
+                    actions_focused: false,
+                    toast_rects: &[],
+                },
+            );
         })
         .unwrap();
         crate::testutil::buffer_rows(term.backend().buffer())
@@ -603,8 +675,21 @@ fn email_header(
         profiles: Vec::new(),
     });
     let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
-    term.draw(|f| draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false))
-        .unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            f.area(),
+            &app,
+            &[],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: false,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
     let buf = term.backend().buffer().clone();
     (crate::testutil::buffer_rows(&buf), buf)
 }
@@ -825,6 +910,70 @@ fn snap_email_names_no_one_after_a_copy_back() {
     assert_eq!(snap_email(Some(oauth_login()), Some("u-1"), true), None);
 }
 
+/// The seeded arm of A17: a login whose install seeded the plan (address paired
+/// with the matching anchor) wrote no `/profile` stamp, so the email line stays
+/// hidden until the next successful `/profile` stamps the plan.
+#[test]
+fn snap_email_stays_hidden_after_a_seeded_login_until_the_stamp() {
+    use crate::profile::{AccountId, AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(oauth_login());
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save the roster");
+    // The seed's disk state: the plan (address paired with the login's uuid) and
+    // the matching anchor, but NO `/profile` stamp.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &AccountId::from("u-1"),
+    );
+    let seeded_usage = crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            email: Some(crate::usage::AccountEmail {
+                address: "cloudy@example.com".to_string(),
+                account: AccountId::from("u-1"),
+            }),
+            ..crate::usage::PlanInfo::default()
+        }),
+        ..crate::usage::UsageInfo::default()
+    };
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), seeded_usage);
+
+    assert_eq!(
+        build_snap(&app, &app.readings_snapshot(), true).email,
+        None,
+        "the seeded plan has no stamp, so the email line stays hidden"
+    );
+
+    // The next successful `/profile` writes the stamp; the seeded address shows.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+        &1_u64,
+    );
+    assert_eq!(
+        build_snap(&app, &app.readings_snapshot(), true).email,
+        Some("cloudy@example.com".to_string()),
+        "once the stamp lands, the seeded address names the login"
+    );
+}
+
 /// A credentials file without an OAuth pair holds no login to name.
 #[test]
 fn snap_email_names_no_one_without_an_oauth_pair() {
@@ -834,8 +983,45 @@ fn snap_email_names_no_one_without_an_oauth_pair() {
     assert_eq!(snap_email(Some(empty), Some("u-1"), false), None);
 }
 
-// ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
+/// A job naming a tree under `work/` makes `work`'s Setup snapshot read live
+/// while `home` stays idle: the snapshot derives `has_live_session` from the
+/// per-tick job snapshot, not from the marker alone.
+#[test]
+fn a_job_under_one_profile_reads_live_only_that_profiles_snapshot() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let home = crate::testutil::HomeSandbox::new();
+    let work_dir = crate::profile::profile_dir(&ProfileName::from("work")).expect("work dir");
+    let runtime = work_dir.join("runtime-4242-0");
+    std::fs::create_dir_all(&runtime).expect("mkdir runtime tree");
+    crate::testutil::write_claude_job(home.home(), "37560ded", &runtime);
 
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["work".into(), "home".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            Profile::new("work".to_string(), None, None),
+            Profile::new("home".to_string(), None, None),
+        ],
+    });
+    // Refresh the per-tick job snapshot the way poll_live_sessions does.
+    app.job_trees = crate::claude_jobs::job_trees();
+    app.handed_off = crate::runtime::handed_off_live_members(&app.job_trees);
+
+    app.profile_cursor.set(0);
+    assert!(
+        build_snap(&app, &app.readings_snapshot(), true).has_live_session,
+        "a job under work/ is a live work session"
+    );
+    app.profile_cursor.set(1);
+    assert!(
+        !build_snap(&app, &app.readings_snapshot(), true).has_live_session,
+        "a job under work/ is nobody's home session"
+    );
+}
+
+// ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
 // A comfortable horizon is a plain accent value; the last 30 days warn as a
 // pill; expired and mis-filled escalate to a DANGER pill plus a `└` fix line
 // (the operator thinks the split is armed and it isn't). Unstamped says so.
@@ -859,7 +1045,14 @@ fn long_lived_token_row_counts_down_and_escalates() {
     };
 
     // Comfortable horizon: a plain accent value, no pill, one line.
-    let comfy = session_token_lines(&S::LongLived(Some(now + 340 * day)), false, "acct", now, w);
+    let comfy = session_token_lines(
+        &S::LongLived(Some(now + 340 * day)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_eq!(comfy.len(), 1);
     let comfy_t = text(&comfy);
     assert!(comfy_t.contains("token"), "{comfy_t}");
@@ -871,7 +1064,14 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&comfy, theme::accent()));
 
     // Last 30 days: a WARNING pill, still one line, no fix.
-    let soon = session_token_lines(&S::LongLived(Some(now + 12 * day)), false, "acct", now, w);
+    let soon = session_token_lines(
+        &S::LongLived(Some(now + 12 * day)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_eq!(soon.len(), 1);
     assert!(
         text(&soon).contains("[ expires in ~12d ]"),
@@ -881,19 +1081,26 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&soon, theme::warning()), "last 30 days warn");
 
     // Expired: DANGER pill + a `└` re-mint fix line.
-    let dead = session_token_lines(&S::LongLived(Some(now - day)), false, "acct", now, w);
+    let dead = session_token_lines(&S::LongLived(Some(now - day)), false, false, "acct", now, w);
     assert_eq!(dead.len(), 2, "expired = pill + fix line");
     let dead_t = text(&dead);
     assert!(dead_t.contains("[ expired ]"), "{dead_t}");
     assert!(
-        dead_t.contains("re-mint with claude setup-token"),
+        dead_t.contains("re-mint with clauth login acct --setup-token"),
         "{dead_t}"
     );
     assert!(has_color(&dead, theme::danger()), "expired is DANGER");
 
     // Expired within the last 24h: truncating division gives 0 days; it must
     // read as expired, not "~0d / warning".
-    let just_dead = session_token_lines(&S::LongLived(Some(now - day / 2)), false, "acct", now, w);
+    let just_dead = session_token_lines(
+        &S::LongLived(Some(now - day / 2)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     let just_dead_t = text(&just_dead);
     assert!(
         just_dead_t.contains("[ expired ]"),
@@ -905,7 +1112,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Unstamped long-lived: a plain accent value.
-    let unstamped = session_token_lines(&S::LongLived(None), false, "acct", now, w);
+    let unstamped = session_token_lines(&S::LongLived(None), false, false, "acct", now, w);
     assert_eq!(unstamped.len(), 1);
     assert!(
         text(&unstamped).contains("no recorded expiry"),
@@ -914,7 +1121,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Mis-filled (rotating pair): DANGER pill + fix, split disengaged.
-    let misfilled = session_token_lines(&S::NotLongLived, false, "acct", now, w);
+    let misfilled = session_token_lines(&S::NotLongLived, false, false, "acct", now, w);
     assert_eq!(misfilled.len(), 2, "mis-filled = pill + fix line");
     let mis_t = text(&misfilled);
     assert!(mis_t.contains("[ mis-filled ]"), "{mis_t}");
@@ -926,6 +1133,47 @@ fn long_lived_token_row_counts_down_and_escalates() {
         has_color(&misfilled, theme::danger()),
         "a disengaged sidecar is DANGER"
     );
+}
+
+/// A refused setup token reads `[ token rejected ]` in DANGER with the re-mint
+/// fix the cards show, ahead of every other state: a comfortable horizon, an
+/// expired token and a mis-filled sidecar all read it. The control: the same
+/// comfortable row unrefused counts down.
+#[test]
+fn a_refused_setup_token_row_reads_token_rejected_with_its_re_mint_fix() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    use crate::claude::SessionTokenStatus as S;
+    let day = 86_400_000_i64;
+    let now = 1_700_000_000_000_i64;
+    let w = 60usize;
+    let text = |ls: &[Line<'static>]| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    };
+    let comfy = S::LongLived(Some(now + 340 * day));
+    let unrefused = text(&session_token_lines(&comfy, false, false, "acct", now, w));
+    assert!(
+        unrefused.contains("long-lived · ~340d left"),
+        "control: {unrefused}"
+    );
+    for status in [comfy, S::LongLived(Some(now - day)), S::NotLongLived] {
+        let refused = session_token_lines(&status, false, true, "acct", now, w);
+        assert_eq!(refused.len(), 2, "pill + fix line");
+        let refused_t = text(&refused);
+        assert!(refused_t.contains("[ token rejected ]"), "{refused_t}");
+        assert!(
+            refused_t.contains("re-mint with clauth login acct --setup-token"),
+            "{refused_t}"
+        );
+        assert!(
+            refused
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg == theme::danger().fg),
+            "a refused token is DANGER"
+        );
+    }
 }
 
 /// The action next to that status row. Same button class as `Delete` /
@@ -1262,6 +1510,67 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
     );
 }
 
+/// `build_snap` marks the token row of an account whose setup token the server
+/// refused, so the row names the refusal rather than count the token down.
+/// The control: the same account with no refusal on record.
+#[test]
+fn snap_marks_a_refused_setup_tokens_row() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tok"]);
+    let mut tok = crate::testutil::blank_profile(&crate::profile::ProfileName::from("tok"));
+    crate::testutil::make_probed_account(&mut tok);
+    let fp = crate::usage::dead_login_fingerprint(&tok).expect("the setup token's fingerprint");
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![tok.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![tok],
+    });
+    assert!(
+        !build_snap(&app, &app.readings_snapshot(), true).token_rejected,
+        "control: with no refusal on record the row counts down"
+    );
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert("tok".to_string(), fp);
+    assert!(build_snap(&app, &app.readings_snapshot(), true).token_rejected);
+}
+
+/// A setup token refused beside a stored pair is as dead on the token row: a
+/// switch installs the token ahead of the pair. The control: the same account
+/// with the pair and no refusal on record.
+#[test]
+fn snap_marks_a_setup_token_refused_beside_a_pair() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    let app_of = |tok: crate::profile::Profile| {
+        App::new(AppConfig {
+            state: AppState {
+                profiles: vec![tok.name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![tok],
+        })
+    };
+    crate::testutil::register_names(&["tok"]);
+    let mut tok = crate::testutil::blank_profile(&crate::profile::ProfileName::from("tok"));
+    tok.credentials = Some(crate::testutil::oauth_pair("tok"));
+    tok.has_long_lived_sidecar = true;
+    crate::profile::save_profile(&tok).expect("save the profile");
+    crate::testutil::write_long_lived_sidecar(&tok.name);
+    let app = app_of(tok.clone());
+    assert!(
+        !build_snap(&app, &app.readings_snapshot(), true).token_rejected,
+        "control: with no refusal on record the row counts down"
+    );
+    crate::testutil::refuse_setup_token(&mut tok);
+    let app = app_of(tok);
+    assert!(build_snap(&app, &app.readings_snapshot(), true).token_rejected);
+}
+
 /// The ROLLING half of the token row, previously untested end to end: the
 /// countdown counts to the RE-STAMP (expiry minus `ROLLING_RESTAMP_HORIZON_MS`),
 /// never to the expiry — the leg renews 2h ahead, so an expiry-based label
@@ -1280,7 +1589,14 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
     };
 
     // 5h of bearer life = 3h until the 2h-ahead re-stamp fires.
-    let fresh = session_token_lines(&S::LongLived(Some(now + 5 * hour)), true, "acct", now, w);
+    let fresh = session_token_lines(
+        &S::LongLived(Some(now + 5 * hour)),
+        true,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_eq!(fresh.len(), 1);
     assert!(
         text(&fresh).contains("rolling · re-stamps in ~3h"),
@@ -1290,7 +1606,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
 
     // Inside the horizon: the re-stamp is due NOW, and saying "~0h" would
     // read as a countdown that stopped.
-    let due = session_token_lines(&S::LongLived(Some(now + hour)), true, "acct", now, w);
+    let due = session_token_lines(&S::LongLived(Some(now + hour)), true, false, "acct", now, w);
     assert!(
         text(&due).contains("rolling · re-stamp due"),
         "{}",
@@ -1305,6 +1621,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
     let inside = session_token_lines(
         &S::LongLived(Some(now + 2 * hour + hour / 2)),
         true,
+        false,
         "acct",
         now,
         w,
@@ -1317,7 +1634,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
 
     // Expired: the stalled DANGER state, with the fix line naming the live
     // profile and the re-arm verb.
-    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, "acct", now, w);
+    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, false, "acct", now, w);
     // Whitespace-normalized: the tooltip wraps, padding line breaks with
     // spaces mid-sentence.
     let stalled_t = text(&stalled)
@@ -1331,7 +1648,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
     );
 
     // No recorded expiry: named as rolling, not as the mint.
-    let unstamped = session_token_lines(&S::LongLived(None), true, "acct", now, w);
+    let unstamped = session_token_lines(&S::LongLived(None), true, false, "acct", now, w);
     assert!(
         text(&unstamped).contains("rolling · no recorded expiry"),
         "{}",
@@ -1363,8 +1680,21 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
         state: AppState::default(),
         profiles: Vec::new(),
     });
-    term.draw(|f| draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false))
-        .unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            f.area(),
+            &app,
+            &[],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: false,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
     let joined = crate::testutil::buffer_rows(term.backend().buffer())
         .join(" ")
         .split_whitespace()
@@ -1405,7 +1735,7 @@ fn login_labels_read_the_same_for_every_flow() {
     assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 }
 
-/// cloudy-tui "Keys and commands inside prose" on the token row: both fix
+/// Keys and commands inside prose on the token row: both fix
 /// lines' commands render ACCENT, never bold.
 #[test]
 fn session_token_fix_lines_style_their_commands() {
@@ -1416,14 +1746,21 @@ fn session_token_fix_lines_style_their_commands() {
     let hour = 3_600_000_i64;
     let w = 100;
 
-    let dead = session_token_lines(&S::LongLived(Some(now - hour)), false, "acct", now, w);
+    let dead = session_token_lines(
+        &S::LongLived(Some(now - hour)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_prose_part(
         &lines_buffer(dead, 100),
-        "re-mint with claude setup-token",
-        "claude setup-token",
+        "re-mint with clauth login acct --setup-token",
+        "clauth login acct --setup-token",
         false,
     );
-    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, "acct", now, w);
+    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, false, "acct", now, w);
     assert_prose_part(
         &lines_buffer(stalled, 100),
         "· clauth rolling-token acct re-arms",
@@ -1551,13 +1888,41 @@ fn the_alert_editor_names_its_range_and_turns_danger_on_a_refused_buffer() {
     }
 }
 
+/// While typing, the `probe every` field carries its band under it, faint
+/// while the buffer would save and DANGER while it would be refused, as the
+/// `alert at` twin does.
+#[test]
+fn the_probe_editor_names_its_band_and_turns_danger_on_a_refused_buffer() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (raw, refused) in [
+        ("90", false),
+        ("90s", false),
+        ("60", false),
+        ("450", false),
+        ("59", true),
+        ("451", true),
+        ("", true),
+        ("abc", true),
+    ] {
+        let lines = probe_range_tooltip(&InputState::new(raw), WIDE);
+        assert_eq!(lines.len(), 1, "{raw:?}");
+        assert_eq!(line_text(&lines[0]), " └ 60s-450s", "{raw:?}");
+        let want = if refused {
+            theme::danger().fg
+        } else {
+            theme::faint().fg
+        };
+        assert_eq!(lines[0].spans[1].style.fg, want, "{raw:?}");
+    }
+}
+
 /// A control character in an edited value renders escaped in the Setup editor
 /// body, and the shared caret-column count matches that escaped body, so the
 /// native cursor never drifts right of the caret.
 #[test]
 fn a_control_character_value_renders_escaped_in_the_setup_editor() {
     let input = InputState::new("x\ty");
-    let spans = value_spans(&input, true, false);
+    let spans = value_spans(&input, true, false, 80);
     let body: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(
         body, "x\\ty",
@@ -1742,7 +2107,7 @@ fn mint_armed_app(home: &crate::testutil::HomeSandbox) -> App {
         profiles: vec![],
     });
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
     app
@@ -1816,4 +2181,390 @@ fn the_mint_armed_key_row_desktop_rows_match_the_pre_s9_render() {
         let got = mint_key_rows(&app, *w);
         assert_eq!(got, *expected, "mint key row at {w} cols");
     }
+}
+
+/// S10: entering and leaving edit on a hint-bearing Setup field moves no
+/// other row. The selected `base url` row keeps its hint line while editing,
+/// so every frame row but the field's own and the footer's matches the
+/// resting frame, and leaving edit restores the resting frame whole.
+#[test]
+fn a_setup_field_keeps_its_hint_line_through_edit_entry_and_exit() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::Tab;
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new("https://api.example.com");
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(app.profile_count());
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("the new-account form lists base url");
+
+    let (w, h) = (100u16, 30u16);
+    let frame = |app: &App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|fr| crate::tui::render::draw(fr, app)).unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let set_active = |app: &mut App, row: Option<ConfigRow>| {
+        app.config_draft.as_mut().expect("a draft is open").active = row;
+    };
+
+    let resting = frame(&app);
+    let field_row = resting
+        .iter()
+        .position(|r| r.contains("base url"))
+        .unwrap_or_else(|| panic!("base url renders:\n{}", resting.join("\n")));
+    assert!(
+        resting[field_row + 1].contains("└ "),
+        "the selected field's hint sits under it:\n{}",
+        resting.join("\n")
+    );
+
+    set_active(&mut app, Some(ConfigRow::BaseUrl));
+    let editing = frame(&app);
+    let footer = h as usize - 1;
+    for (i, (rest, edit)) in resting.iter().zip(&editing).enumerate() {
+        if i == field_row || i == footer {
+            continue;
+        }
+        assert_eq!(
+            edit,
+            rest,
+            "row {i} holds still on edit entry\nresting:\n{}\nediting:\n{}",
+            resting.join("\n"),
+            editing.join("\n")
+        );
+    }
+
+    set_active(&mut app, None);
+    assert_eq!(
+        frame(&app),
+        resting,
+        "leaving edit restores the resting frame"
+    );
+}
+
+/// The `+ new` form with `base url` holding `value`, focused and editing.
+fn editing_base_url(value: &str) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new(value);
+    draft.active = Some(ConfigRow::BaseUrl);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = crate::tui::app::Tab::Setup;
+    app.profile_cursor.set(app.profile_count());
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("the new-account form lists base url");
+    app
+}
+
+/// S10: an over-wide `base url` scrolls inside its row. At End the caret sits
+/// inside the pane with the last grapheme (a two-cell rocket) whole before it,
+/// down to 20 columns where the key cell clamps; one ← (the real key) lands on
+/// the rocket and moves no drawn cell of the row (the window follows the
+/// caret, never pins it); Home shows the value's start again.
+#[test]
+fn an_over_wide_setup_field_scrolls_inside_its_row() {
+    use crate::testutil::{draw_caret, key, right_border, symbol_at};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let value = format!("https://api.example.com/{}🚀", "v1/".repeat(30));
+    for w in [20u16, 22, 24, 25, 28, 45, 80] {
+        let mut app = editing_base_url(&value);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 30)).unwrap();
+        let draw = |f: &mut ratatui::Frame<'_>, app: &App| crate::tui::render::draw(f, app);
+
+        let (end, buf) = draw_caret(&mut term, |f| draw(f, &app));
+        let border = right_border(&buf, end.y);
+        assert!(
+            end.x + 2 <= border,
+            "[{w}] End stays inside the field ({end:?}, border {border})"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x - 2, end.y),
+            "🚀",
+            "[{w}] the rocket draws whole before End"
+        );
+        let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
+
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Left));
+        let (left, buf) = draw_caret(&mut term, |f| draw(f, &app));
+        assert_eq!(
+            left,
+            ratatui::layout::Position::new(end.x - 2, end.y),
+            "[{w}] one left steps over the rocket's two cells"
+        );
+        assert_eq!(
+            symbol_at(&buf, left.x, left.y),
+            "🚀",
+            "[{w}] the caret sits on it"
+        );
+        assert_eq!(
+            crate::testutil::buffer_rows(&buf)[left.y as usize],
+            end_row,
+            "[{w}] a move inside the window leaves the row alone"
+        );
+
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Home));
+        let (home, buf) = draw_caret(&mut term, |f| draw(f, &app));
+        assert_eq!(home.y, end.y, "[{w}] Home stays on the field row");
+        assert_eq!(
+            symbol_at(&buf, home.x, home.y),
+            "h",
+            "[{w}] Home sits on `h`"
+        );
+        assert!(
+            home.x + 2 <= right_border(&buf, home.y),
+            "[{w}] Home stays inside the field"
+        );
+    }
+}
+
+/// S10 (cloudy's range rule, 2026-10-14): typing in `alert at` swaps the
+/// row's hint for its range tooltip, and the rows below move by exactly the
+/// height difference (the alert-off hint takes 3 / 2 / 1 lines, the range
+/// 2 / 1 / 1 at 28 / 45 / 80 columns); leaving edit restores the resting
+/// frame.
+#[test]
+fn the_alert_editor_swaps_its_hint_for_its_range_while_typing() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let cases: [(u16, isize, &[&str]); 3] = [
+        (28, -1, &[" └ 0-100 % · empty turns", "   it off"]),
+        (45, -1, &[" └ 0-100 % · empty turns it off"]),
+        (80, 0, &[" └ 0-100 % · empty turns it off"]),
+    ];
+    for (w, delta, range) in cases {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
+        });
+        app.tab = crate::tui::app::Tab::Setup;
+        app.profile_cursor.set(0);
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            app.config_draft.is_some(),
+            "↵ descends into the account card"
+        );
+        app.config_action_cursor = crate::tui::app::config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::BellThreshold)
+            .expect("the alert row is listed");
+        let frame = |app: &App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 60)).unwrap();
+            term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+            crate::testutil::buffer_rows(term.backend().buffer())
+        };
+        let at = |rows: &[String], label: &str| {
+            rows.iter()
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| panic!("[{w}] {label} renders:\n{}", rows.join("\n")))
+        };
+
+        let resting = frame(&app);
+        let field = at(&resting, "alert at");
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
+        let editing = frame(&app);
+        crate::testutil::assert_rows_below_shift(
+            &resting,
+            &editing,
+            field,
+            at(&resting, "base url"),
+            delta,
+            4,
+            &w.to_string(),
+        );
+        // The range lines from the column before the `└` leader to the pane's
+        // right border.
+        let lead = editing[field + 1]
+            .chars()
+            .position(|c| c == '└')
+            .unwrap_or_else(|| {
+                panic!("[{w}] the range line leads with └:\n{}", editing.join("\n"))
+            });
+        for (k, want) in range.iter().enumerate() {
+            let cells: Vec<char> = editing[field + 1 + k].chars().collect();
+            let text: String = cells[lead - 1..cells.len() - 1].iter().collect();
+            assert_eq!(
+                text.trim_end(),
+                *want,
+                "[{w}] range line {k} under the field"
+            );
+        }
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(
+            frame(&app),
+            resting,
+            "[{w}] leaving edit restores the resting frame"
+        );
+    }
+}
+
+/// S10: the `alert at` editor keeps its typed value and caret inside the
+/// field on a narrow pane: its key cell clamps like the other Setup fields',
+/// leaving room for `95` and the ` %` unit.
+#[test]
+fn the_alert_editor_caret_stays_inside_the_field_on_a_narrow_pane() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::testutil::{draw_caret, key, right_border, symbol_at};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    for w in [20u16, 22, 24, 25, 28] {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
+        });
+        app.tab = crate::tui::app::Tab::Setup;
+        app.profile_cursor.set(0);
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
+        app.config_action_cursor = crate::tui::app::config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::BellThreshold)
+            .expect("the alert row is listed");
+        for code in [KeyCode::Enter, KeyCode::Char('9'), KeyCode::Char('5')] {
+            crate::tui::app::handle_key(&mut app, key(code));
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 60)).unwrap();
+        let (end, buf) = draw_caret(&mut term, |f| crate::tui::render::draw(f, &app));
+        let border = right_border(&buf, end.y);
+        assert!(
+            end.x + 2 <= border,
+            "[{w}] End stays inside the field ({end:?}, border {border})"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x - 1, end.y),
+            "5",
+            "[{w}] End follows `95`"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x + 1, end.y),
+            "%",
+            "[{w}] the unit trails the caret"
+        );
+    }
+}
+
+/// A Setup form field's caret that lands inside a drawn toast hides the native
+/// cursor this frame, and it hides under an open modal too. Three stacked
+/// DANGER toasts cover the `base url` field's caret column at 45x14.
+#[test]
+fn a_toast_over_a_setup_field_caret_hides_the_native_cursor() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Modal, Tab,
+        ToastKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new("https://api.example.com");
+    draft.active = Some(ConfigRow::BaseUrl);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(app.profile_count());
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("the new-account form lists base url");
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the setup caret shows with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for name in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{name}\n{wide}\n{name} tail"));
+    }
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the setup caret hides under a toast"
+    );
+
+    // While a modal is open the whole frame is the blocker, so the body caret
+    // must hide too instead of blinking on the modal; the blocker ignores
+    // which modal is open.
+    app.toasts.clear();
+    app.open_modal(Modal::LossWarning(LossWarningState {
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Fallback),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::NewAccountForm],
+        },
+    }));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "the setup caret hides under an open modal"
+    );
+}
+
+#[test]
+fn the_auto_start_toggle_paints_its_parts_in_split_colours() {
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let mut snap = Snap::blank("a");
+        for on in [true, false] {
+            snap.auto_start = on;
+            let line = one_row(
+                ConfigRow::AutoStart,
+                false,
+                false,
+                None,
+                &snap,
+                &InputState::new(""),
+            );
+            crate::testutil::assert_split_toggle(&line, on);
+        }
+    }
+}
+
+/// An editing field sits on its row's selection tint: no sunken buffer fill.
+#[test]
+fn an_editing_setup_field_paints_no_sunken_fill() {
+    let snap = Snap::blank("a");
+    let input = InputState::new("alpha");
+    let line = one_row(ConfigRow::Name, true, true, None, &snap, &input);
+    let text = line_text(&line);
+    assert!(text.contains("alpha"), "the edit buffer renders: {text}");
+    assert!(
+        line.spans
+            .iter()
+            .all(|s| s.style.bg != Some(crate::tui::theme::bg_sunken())),
+        "no span of an editing row paints BG_SUNKEN: {:?}",
+        line.spans
+    );
 }

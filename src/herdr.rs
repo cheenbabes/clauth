@@ -620,6 +620,15 @@ impl HerdrAgentSession {
     }
 }
 
+impl HerdrPane {
+    /// The pane's `agent_session_id`: the session id herdr detected by id, when
+    /// it detected one. The one accessor every "pane whose agent session is X"
+    /// predicate shares.
+    pub(crate) fn agent_session_id(&self) -> Option<&str> {
+        self.agent_session.as_ref().and_then(|s| s.session_id())
+    }
+}
+
 /// `herdr pane list`'s `result.panes`, or `None` when the stdout is not the
 /// envelope. The caller checks the call succeeded first.
 pub(crate) fn parse_pane_list(stdout: &[u8]) -> Option<Vec<HerdrPane>> {
@@ -804,7 +813,7 @@ fn heal_detached_if_enabled(enabled: bool) {
     assert!(
         std::env::var_os("HERDR_SHIM_STATE").is_some(),
         "heal_detached would probe the operator's real `herdr` and reinstall \
-         their real plugin — stage a herdr shim beside a `HERDR_SHIM_STATE` pin, or call \
+         their real plugin. Stage a herdr shim beside a `HERDR_SHIM_STATE` pin, or call \
          `arm_heal_throttle_for_test` if the heal is not what the test is about"
     );
     #[cfg(test)]
@@ -1270,8 +1279,12 @@ fn sidebar_state(doc: &toml::Value) -> SidebarState {
 /// user-owned comes through here intact, and the verdicts below report it
 /// as hand-owned instead of re-adding it.
 fn plan_config(existing: &str, key: &str, delegate_row_text: bool) -> Result<ConfigPlan> {
-    let doc: toml::Value = toml::from_str(existing)
-        .context("herdr's config.toml does not parse; fix it before wiring clauth into it")?;
+    let doc: toml::Value = toml::from_str(existing).map_err(|e| {
+        crate::format::parse_refusal(
+            "herdr's config.toml does not parse; fix it before wiring clauth into it",
+            crate::format::toml_parse_position(existing, &e),
+        )
+    })?;
 
     let mut plan = ConfigPlan {
         append: String::new(),

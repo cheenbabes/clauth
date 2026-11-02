@@ -431,7 +431,12 @@ impl Backend for Native {
                     .context("missing incoming OAuth login")?;
                 match crate::claude::follow_live_file_login(&[token], oauth)? {
                     crate::claude::LiveSlotFollow::Followed => {}
-                    crate::claude::LiveSlotFollow::Unreadable(e) => return Err(e.into()),
+                    crate::claude::LiveSlotFollow::Unreadable(pos) => {
+                        return Err(crate::format::parse_refusal(
+                            "live .credentials.json could not be parsed",
+                            pos,
+                        ));
+                    }
                     _ => anyhow::bail!("live login could not be synchronized"),
                 }
                 Ok(())

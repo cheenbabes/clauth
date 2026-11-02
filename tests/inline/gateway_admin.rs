@@ -302,6 +302,8 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
             reset_5h: Some(1000),
             utilization_7d: Some(0.25),
             reset_7d: Some(2000),
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
             plan: Some("max".to_string()),
             status: Some("healthy".to_string()),
         }
@@ -320,6 +322,8 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
             reset_5h: None,
             utilization_7d: None,
             reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
             plan: None,
             status: None,
         }
@@ -334,6 +338,48 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
     assert_eq!(
         providers[4].auth,
         PoolAuth::Unknown("future_oauth".to_string())
+    );
+}
+
+/// One pool row as shunt `v0.48.0` (the version floor) serializes an account
+/// the pool has never selected: `AccountSnapshot`'s field set at that tag
+/// (`git show v0.48.0:src/accounts.rs`), every `Option` written as `null` (no
+/// `skip_serializing_if` there), no `paused` (added in `v0.52.0`) and no
+/// `plan` (the pool route inserts it only when one resolves).
+const FLOOR_POOL_BODY: &str = r#"{"providers":[
+  {"provider":"claude","auth":"claude_oauth","accounts":[
+    {"name":"a1","has_state":false,"available":true,"near_quota":false,"cooldown_secs_remaining":null,"cooldown_fable_secs_remaining":null,"priority":100,"disabled":false,"headroom_secs":null,"utilization_5h":null,"reset_5h":null,"utilization_7d":null,"reset_7d":null,"utilization_7d_oi":null,"reset_7d_oi":null,"status":null,"needs_relogin":false}
+  ]}
+]}"#;
+
+#[test]
+fn a_floor_version_pool_row_without_paused_parses_as_unpaused() {
+    let home = HomeSandbox::new();
+    write_token(&home, TOKEN);
+    let (base, seen) = serve_endpoints_raw(1, |_, _| (200, FLOOR_POOL_BODY.to_string()));
+    let record = record_at(&home, listener_addr(&base));
+    let providers = list_pool(&record).expect("a 0.48.0 pool row parses");
+    seen.join().expect("listener");
+    assert_eq!(providers.len(), 1);
+    assert_eq!(
+        providers[0].accounts,
+        vec![PoolAccount {
+            name: "a1".to_string(),
+            available: true,
+            near_quota: false,
+            cooldown_secs_remaining: None,
+            needs_relogin: false,
+            paused: false,
+            disabled: false,
+            utilization_5h: None,
+            reset_5h: None,
+            utilization_7d: None,
+            reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
+            plan: None,
+            status: None,
+        }]
     );
 }
 
@@ -463,7 +509,8 @@ fn each_operation_builds_its_agent_from_its_routes_bound() {
         .expect("add recorded its bound");
     assert_eq!(add_bound, Duration::from_secs(20));
 
-    // refresh: 60 s, its own (shunt bounds nothing there).
+    // refresh: 600 s, its own (past one whole antigravity refresh, discovery
+    // and onboarding included; shunt bounds a claude refresh by nothing).
     let (base, seen) = serve_endpoints_raw(1, |_, _| {
         (
             200,
@@ -479,7 +526,7 @@ fn each_operation_builds_its_agent_from_its_routes_bound() {
         .find(|(route, _)| *route == AdminRoute::Refresh)
         .map(|(_, bound)| bound)
         .expect("refresh recorded its bound");
-    assert_eq!(refresh_bound, Duration::from_secs(60));
+    assert_eq!(refresh_bound, Duration::from_secs(600));
 }
 
 // ── transport failures ──────────────────────────────────────────────────────
@@ -1093,6 +1140,58 @@ fn a_read_only_key_is_named_and_no_recovery_runs() {
 
 #[cfg(unix)]
 #[test]
+fn a_retrys_403_is_the_read_only_key() {
+    let home = HomeSandbox::new();
+    write_token(&home, TOKEN);
+    let calls = stub_dir(&home).join("calls");
+    let config = home.home().join("etc").join("shunt.toml");
+    let original_ino = Arc::new(AtomicU64::new(0));
+    let (base, seen) = serve_endpoints_raw(4, {
+        let config = config.clone();
+        let original_ino = Arc::clone(&original_ino);
+        move |path, _| {
+            let ino = fs::metadata(&config).map(|m| m.ino()).unwrap_or(0);
+            let reloaded = ino != 0 && ino != original_ino.load(Ordering::SeqCst);
+            match path {
+                // The reload lands, the read clears, and the mutation's
+                // retry then meets a read-only key.
+                "/admin/api/routes" if reloaded => (200, "{}".to_string()),
+                "/admin/api/routes" => (401, "unauthorized".to_string()),
+                _ if reloaded => (403, "forbidden".to_string()),
+                _ => (401, "unauthorized".to_string()),
+            }
+        }
+    });
+    let record = checked_admin_record(&home, listener_addr(&base), &calls);
+    original_ino.store(fs::metadata(&config).expect("meta").ino(), Ordering::SeqCst);
+    let err =
+        remove_pool_account(&record, PoolFamily::Claude, &name("acct")).expect_err("read-only");
+    let typed = err
+        .downcast_ref::<ShuntAdminError>()
+        .expect("a typed ShuntAdminError");
+    assert!(
+        matches!(typed, ShuntAdminError::ReadOnlyKey),
+        "a retry's 403 is the read-only variant like the first send's, got {typed:?}"
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        "clauth's gateway admin token is read-only, so it cannot change pool accounts"
+    );
+    assert_eq!(fs::read_to_string(&calls).expect("calls"), "call\n");
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        raw.iter().map(|r| request_path(r)).collect::<Vec<_>>(),
+        vec![
+            "/admin/api/accounts/claude/acct",
+            "/admin/api/routes",
+            "/admin/api/accounts/claude/acct"
+        ],
+        "the mutation, one clearing poll, then exactly one retry"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn the_pool_listing_never_recovers_a_401() {
     let home = HomeSandbox::new();
     write_token(&home, TOKEN);
@@ -1119,4 +1218,34 @@ fn the_pool_listing_never_recovers_a_401() {
     let raw = seen.join().expect("listener");
     assert_eq!(raw.len(), 1, "the read alone, no recovery");
     assert_eq!(request_path(&raw[0]), "/admin/api/pool");
+}
+
+/// shunt's pool row carries the fable-scoped weekly window beside 5h and 7d
+/// (`AccountSnapshot`'s `utilization_7d_oi` / `reset_7d_oi`, present since the
+/// 0.48.0 floor): the listing keeps both, and an absent pair reads `None`.
+#[test]
+fn the_pool_listing_keeps_the_fable_weekly_window() {
+    let home = HomeSandbox::new();
+    write_token(&home, TOKEN);
+    let body = r#"{"providers":[
+  {"provider":"claude","auth":"claude_oauth","accounts":[
+    {"name":"a1","available":true,"near_quota":false,"needs_relogin":false,"paused":false,"disabled":false,"utilization_5h":0.5,"reset_5h":1000,"utilization_7d":0.25,"reset_7d":2000,"utilization_7d_oi":0.125,"reset_7d_oi":3000},
+    {"name":"a2","available":true,"near_quota":false,"needs_relogin":false,"paused":false,"disabled":false}
+  ]}
+]}"#;
+    let (base, seen) = serve_endpoints_raw(1, move |_, _| (200, body.to_string()));
+    let record = record_at(&home, listener_addr(&base));
+    let providers = list_pool(&record).expect("listing");
+    seen.join().expect("listener");
+    let accounts = &providers[0].accounts;
+    assert_eq!(
+        (accounts[0].utilization_7d_oi, accounts[0].reset_7d_oi),
+        (Some(0.125), Some(3000)),
+        "the fable weekly window rides the row"
+    );
+    assert_eq!(
+        (accounts[1].utilization_7d_oi, accounts[1].reset_7d_oi),
+        (None, None),
+        "an absent pair reads as no window"
+    );
 }

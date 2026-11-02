@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentgear"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773c81a11f35a3842caf3403c9993f3d0d1d9d672d9fb3c4454080c04dfa040f"
+checksum = "ce1ef0eb25ce67cf4d706dea8bf67236bac27937c41e2075882e11e832d01b97"
 dependencies = [
  "agentgear-derive",
  "brotli",
@@ -30,9 +30,9 @@ dependencies = [
 
 [[package]]
 name = "agentgear-derive"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d41224cc1e599031fb55ba3603c0f3cf16b6ab42c20e138e943097e6b18424b"
+checksum = "bb1155487cdf35f0972d52bafab4563d01f547571aadb8ef1e815562df0bc8f6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -356,7 +356,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clauth"
-version = "0.17.0-found.2"
+version = "0.18.0-found.1"
 dependencies = [
  "agentgear",
  "anyhow",
@@ -365,6 +365,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "dirs",
+ "dunce",
  "getrandom 0.4.3",
  "hex",
  "httparse",
@@ -374,6 +375,7 @@ dependencies = [
  "os_info",
  "ratatui",
  "regex",
+ "ring",
  "rmcp",
  "rpassword",
  "rustls",
@@ -671,6 +673,12 @@ checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dyn-clone"
@@ -2099,9 +2107,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2590,9 +2598,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "pin-project-lite",
@@ -2917,9 +2925,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

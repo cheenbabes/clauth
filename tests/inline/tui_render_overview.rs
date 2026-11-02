@@ -8,7 +8,8 @@ use ratatui::style::Modifier;
 
 use crate::fallback::BlockedReason;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
-use crate::usage::{FetchLeg, FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
+use crate::testutil::{countdown_reset_in, reset_in};
+use crate::usage::{FetchLeg, FetchStatus, UsageInfo};
 use std::collections::BTreeMap;
 
 /// Build a `ReadingsSnapshot` seed the render helpers read, keyed by name.
@@ -23,11 +24,6 @@ fn snap_with_stats(
 ) -> ReadingsSnapshot {
     s.third_party.insert(name.to_string(), st);
     s
-}
-
-/// ISO reset `secs` in the future.
-fn reset_in(secs: i64) -> String {
-    epoch_secs_to_iso(now_epoch_secs() + secs)
 }
 
 /// A slow burner whose reset lands well before it would top out reads as a
@@ -142,7 +138,7 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     let profile = &app.config().profiles[0];
     let (five, seven) = overview_windows(profile, &readings);
     let five = five.expect("5h bar synthesizes a window");
-    let seven = seven.expect("7d bar synthesizes a window");
+    let seven = seven.expect("7d bar synthesizes a window").window;
 
     assert!(
         app.active_burn_rate(
@@ -267,6 +263,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
         resets_at: Some(reset_in(reset_secs)),
         used: None,
         total: None,
+        inference_quota: false,
     };
     let stats = crate::providers::ThirdPartyStats {
         is_available: true,
@@ -285,6 +282,8 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             base_url: Some("https://api.example.com".into()),
             api_key: Some("k".into()),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -296,10 +295,14 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
         },
         snap_with_stats(ReadingsSnapshot::default(), "tp", stats),
@@ -318,12 +321,14 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
                 label: format!("{currency} balance"),
                 value: String::new(),
                 kind: crate::providers::StatRowKind::Heading,
+                raw: None,
             });
         }
         rows.push(crate::providers::StatRow {
             label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
             value: (*t).to_string(),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         });
     }
     let stats = crate::providers::ThirdPartyStats {
@@ -340,6 +345,8 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             base_url: Some("https://api.deepseek.com/anthropic".into()),
             api_key: Some("k".into()),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -351,10 +358,14 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: Some(crate::providers::Provider::DeepSeek),
         },
         snap_with_stats(ReadingsSnapshot::default(), name, stats),
@@ -400,7 +411,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
     let usage = UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: util,
-            resets_at: Some(reset_in(reset_secs)),
+            resets_at: Some(countdown_reset_in(reset_secs)),
         }),
         ..UsageInfo::default()
     };
@@ -410,6 +421,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: Some(threshold),
@@ -421,14 +434,27 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
+}
+
+/// [`profile`] with a stored OAuth login — the chain/caption fixtures use it
+/// so a login-less member stays the exception; the per-account row fixtures
+/// leave [`profile`] credential-less on purpose.
+fn polled(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
+    let (mut p, r) = profile(name, threshold, util, reset_secs);
+    p.credentials = Some(crate::testutil::oauth_pair(name));
+    (p, r)
 }
 
 fn config_with(
@@ -492,8 +518,8 @@ fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
 #[test]
 fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("a", 95.0, 100.0, 3600);
-    let (b, b_readings) = profile("b", 95.0, 100.0, 1800);
+    let (a, a_readings) = polled("a", 95.0, 100.0, 3600);
+    let (b, b_readings) = polled("b", 95.0, 100.0, 1800);
     let (config, readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("a"),
@@ -514,8 +540,8 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
 #[test]
 fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("a", 95.0, 100.0, 900);
-    let (b, b_readings) = profile("b", 95.0, 100.0, 3600);
+    let (a, a_readings) = polled("a", 95.0, 100.0, 900);
+    let (b, b_readings) = polled("b", 95.0, 100.0, 3600);
     let (mut config, readings) =
         config_with(vec![(a, a_readings), (b, b_readings)], None, vec!["a", "b"]);
     config.state.switch_off_when_spent = true;
@@ -615,10 +641,73 @@ fn healthy_chain_hides_resumes_hint() {
     assert!(resumes_line(&lines).is_none());
 }
 
+/// The Overview's chain rows carry the blocked-reason markers the Fallback rows
+/// do, so a member clauth cannot measure reads `◆` here too. Without a render
+/// pin the arm could be deleted and every test would stay green. The Overview's
+/// ACCOUNT rows carry no blocked-reason mark at all, which is why the wiki names
+/// the chain rows.
+#[test]
+fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // No reading for `blind`: nothing polls a member whose sessions run on a
+    // long-lived token with no OAuth pair behind it.
+    let rows = |armed: bool| {
+        let (ok, ok_readings) = polled("ok", 95.0, 10.0, 3600);
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 3600);
+        // The member the scenario describes holds a long-lived token with no
+        // OAuth pair behind it: the app cache carries the sidecar fact the
+        // render path reads, while the profile records the loaded sidecar so
+        // `holds_login` reads it as a login. Without the sidecar the same
+        // member is the logged-out shape instead.
+        blind.has_long_lived_sidecar = armed;
+        let (config, readings) = config_with(
+            vec![(ok, ok_readings), (blind, ReadingsSnapshot::default())],
+            Some("ok"),
+            vec!["ok", "blind"],
+        );
+        let mut app = App::new(config);
+        if armed {
+            app.session_tokens.insert(
+                "blind".into(),
+                crate::claude::SessionTokenStatus::LongLived(None),
+            );
+        }
+        fallback_flow_lines(&app, 60, &readings).0
+    };
+
+    let lines = rows(true);
+    let row = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("blind"))
+        .expect("the chain row for the unmeasured member");
+    assert!(row.contains('◆'), "the row carries the marker: {row:?}");
+    let marker = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.content == "◆")
+        .expect("the marker span");
+    assert_eq!(
+        marker.style.fg,
+        theme::warning().fg,
+        "at the warning hue, not stale's faint"
+    );
+    let logged_out_row = rows(false)
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("blind"))
+        .expect("the chain row for the logged-out member");
+    assert!(
+        logged_out_row.contains('×'),
+        "the same absent reading without a session token is the logged-out shape: {logged_out_row:?}"
+    );
+}
+
 // ── overview row state cues ──────────────────────────────────────────────
 
 /// Marker column: a broken login (×) outranks both the bell (!) and the
-/// active dot (●) — usage alerts are moot until re-login.
+/// active mark (✻) — usage alerts are moot until re-login.
 #[test]
 fn broken_login_marker_outranks_bell_and_active() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -633,7 +722,7 @@ fn broken_login_marker_outranks_bell_and_active() {
     let text = line_text(&line);
     assert!(text.contains('×'), "broken login renders ×: {text}");
     assert!(!text.contains('!'), "bell yields to ×: {text}");
-    assert!(!text.contains('●'), "active dot yields to ×: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ×: {text}");
     let marker = line.spans.iter().find(|s| s.content == "×").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
@@ -653,7 +742,7 @@ fn bell_marker_shows_when_login_is_fine() {
     assert!(!text.contains('×'), "{text}");
 }
 
-/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (●):
+/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (✻):
 /// the next switch would sign sessions out, so it beats a usage alert.
 #[test]
 fn token_danger_marker_outranks_bell_and_active() {
@@ -670,13 +759,13 @@ fn token_danger_marker_outranks_bell_and_active() {
     let text = line_text(&line);
     assert!(text.contains('⊘'), "mis-filled token renders ⊘: {text}");
     assert!(!text.contains('!'), "bell yields to ⊘: {text}");
-    assert!(!text.contains('●'), "active dot yields to ⊘: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ⊘: {text}");
     let marker = line.spans.iter().find(|s| s.content == "⊘").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
 
 /// A canceled subscription (⊖) is dead-first: the org 403s every request, so it
-/// outranks the broken-login ×, the token ⊘, the bell !, and the active ● all at
+/// outranks the broken-login ×, the token ⊘, the bell !, and the active ✻ all at
 /// once (matching the Fallback ladder where `Canceled` beats `AuthBroken`). The
 /// auth_broken + bell + active fixture proves the canceled arm fires FIRST — if it
 /// yielded, the × would show instead. `⊖` is shared with `Disabled` and split on
@@ -689,6 +778,7 @@ fn canceled_marker_is_dead_first() {
     let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
     a_readings.usage.get_mut("a").unwrap().plan = Some(PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
@@ -703,7 +793,7 @@ fn canceled_marker_is_dead_first() {
     assert!(text.contains('⊖'), "canceled renders ⊖: {text}");
     assert!(!text.contains('×'), "broken login yields to ⊖: {text}");
     assert!(!text.contains('!'), "bell yields to ⊖: {text}");
-    assert!(!text.contains('●'), "active dot yields to ⊖: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ⊖: {text}");
     let marker = line.spans.iter().find(|s| s.content == "⊖").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
@@ -761,7 +851,10 @@ fn long_lived_token_expired_marks() {
 fn cached_row_colors_countdown_amber_and_underlines_nothing() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    // A login puts the account on the OAuth leg's work list; a logged-out one
+    // carries the not-current mark in this slot instead of a countdown.
+    a.credentials = Some(oauth_creds());
     a_readings
         .fetch_status
         .insert("a".to_string(), FetchStatus::Cached);
@@ -797,7 +890,8 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
 fn failed_row_colors_countdown_red() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
     a_readings
         .fetch_status
         .insert("a".to_string(), FetchStatus::Failed);
@@ -936,6 +1030,8 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -947,6 +1043,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
@@ -960,6 +1057,9 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
                     ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
         },
         ReadingsSnapshot::default(),
@@ -1020,6 +1120,7 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
     // fallback tier a credential-less profile happens to default to.
     let plan = crate::usage::PlanInfo {
         tier: crate::usage::PlanTier::Pro,
+        plan_display_name: None,
         subscription_status: None,
         codex_plan: None,
         email: None,
@@ -1123,15 +1224,18 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
             .iter()
             .filter(|s| !s.content.trim().is_empty())
             .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
-            .map(|s| s.content.to_string())
+            .map(|s| s.content.trim().to_string())
             .collect()
     };
 
+    // The one hue a disabled row keeps is the not-current mark: it exists to say
+    // the dim figures beside it are a cached reading, so flattening it would
+    // erase the only cue that they are not current.
     let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
     assert_eq!(
         non_dim(&disabled_line),
-        Vec::<String>::new(),
-        "every colored span on a disabled row must flatten to dim"
+        vec![NOT_CURRENT_MARK.to_string()],
+        "every colored span on a disabled row flattens to dim but the not-current mark"
     );
 
     // The control row must still carry hue, or the assertion above is vacuous.
@@ -1161,9 +1265,9 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
 fn disabled_row_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
     // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
-    // below it. The tier auto-detects from `$COLORTERM`, which CI leaves unset,
-    // so an unpinned tier renders every row flat. That makes the assertion
-    // below vacuous and fails its control.
+    // below it. A test build's tier defaults to `Full`, and the sandbox pins it
+    // explicitly, so the wave renders and the disabled-vs-enabled control below
+    // is real.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
@@ -1225,8 +1329,8 @@ const KIND_SPAN: usize = 5;
 #[test]
 fn no_tier_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
-    // The wave is Full-tier only; an unpinned tier renders every row flat and
-    // makes the equality below vacuous. Same guard the disabled-row pin carries.
+    // The wave is Full-tier only; the test build defaults to `Full` and the
+    // sandbox pins it explicitly. Same guard the disabled-row pin carries.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     // `something_new` is a claim clauth cannot classify, so the row has no tier
     // at all; `max` is the same row WITH one.
@@ -1361,14 +1465,15 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
 }
 
 /// A disabled account is never polled, so its refresh countdown would tick to
-/// zero and then claim a refresh forever. The slot renders blank — at full
+/// zero and then claim a refresh forever. The slot shows no countdown — at full
 /// width, so no column downstream shifts.
 #[test]
-fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
+fn disabled_row_claims_no_refresh_at_full_width() {
     let _home = crate::testutil::HomeSandbox::new();
     let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
-    let (b, b_readings) = profile("b", 95.0, 10.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 10.0, 3600);
+    b.credentials = Some(oauth_creds());
     let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
     let app = App::new(config);
     // Both profiles carry a live countdown in the shared map.
@@ -1418,6 +1523,445 @@ fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
         text(&disabled_line).chars().count(),
         text(&enabled_line).chars().count(),
         "blanking the timer must not collapse the slot"
+    );
+}
+
+// ── not-current mark: an unpolled row drawing a cached reading ────────────
+
+/// The glyph an unpolled row that draws a cached reading carries in its
+/// countdown slot.
+const NOT_CURRENT_MARK: &str = "⋯";
+
+/// The spans on a row whose trimmed content is the not-current mark.
+fn mark_spans(line: &Line<'static>) -> Vec<Span<'static>> {
+    line.spans
+        .iter()
+        .filter(|s| s.content.trim() == NOT_CURRENT_MARK)
+        .cloned()
+        .collect()
+}
+
+/// A refresh countdown matched by shape (a digit followed by `s`); see
+/// `disabled_row_claims_no_refresh_at_full_width` for why never by value.
+fn has_refresh_countdown(line: &Line<'static>) -> bool {
+    line_text(line)
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_digit() && w[1] == b's')
+}
+
+/// A Z.ai account with no api key and cached 5h/7d bars, named `tp`: no fetch
+/// leg's work list holds a keyless provider account, so its bars are the last
+/// reading clauth cached.
+fn keyless_provider_profile() -> (Profile, ReadingsSnapshot) {
+    let (mut p, readings) = third_party_profile(40.0, 20.0);
+    p.base_url = Some("https://api.z.ai/api/anthropic".into());
+    p.api_key = None;
+    p.provider = Some(crate::providers::Provider::Zai);
+    (p, readings)
+}
+
+/// Every way an account falls off both fetch legs' work lists while its row
+/// still draws a reading: disabled (OAuth bars, DeepSeek balance), keyless
+/// provider, logged-out OAuth. Each carries one amber `⋯` where the countdown
+/// sits, at both theme tiers, and keeps the row's width. A polled sibling with
+/// a scheduled refresh keeps its countdown and gets no mark.
+#[test]
+fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut disabled_oauth, disabled_oauth_readings) = profile("a", 95.0, 10.0, 3600);
+    disabled_oauth.disabled = true;
+    disabled_oauth.credentials = Some(oauth_creds());
+    // `profile` builds a credential-less OAuth account: logged out.
+    let logged_out = profile("c", 95.0, 10.0, 3600);
+    let (mut disabled_deepseek, disabled_deepseek_readings) = deepseek_profile("d", &["1.71 USD"]);
+    disabled_deepseek.disabled = true;
+    let (mut polled, polled_readings) = profile("p", 95.0, 10.0, 3600);
+    polled.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(
+        vec![
+            (disabled_oauth, disabled_oauth_readings),
+            keyless_provider_profile(),
+            logged_out,
+            (disabled_deepseek, disabled_deepseek_readings),
+            (polled, polled_readings),
+        ],
+        None,
+        vec![],
+    );
+    let unpolled = [
+        (0, "disabled oauth"),
+        (1, "keyless provider"),
+        (2, "logged-out oauth"),
+        (3, "disabled deepseek balance"),
+    ];
+    let polled_idx = 4;
+
+    let mut mark_fg_per_tier = Vec::new();
+    for tier in [theme::Tier::Full, theme::Tier::Compatible] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let app = App::new(config.clone());
+        // Every row holds a scheduled refresh in the shared map, so only the
+        // work-list rule can keep a countdown off the unpolled rows.
+        if let Ok(mut m) = app.next_refresh_per_profile.lock() {
+            for name in ["a", "c", "p"] {
+                m.insert(
+                    FetchLeg::OAuth.key(ProfileName::from(name)),
+                    now_ms() + 42_000,
+                );
+            }
+            for name in ["tp", "d"] {
+                m.insert(
+                    FetchLeg::ThirdParty.key(ProfileName::from(name)),
+                    now_ms() + 42_000,
+                );
+            }
+        }
+        let widths = OverviewWidths::new(110, &app, &readings);
+        let row = |idx: usize| render_overview_row(&app, idx, &widths, false, true, &readings);
+
+        let control = row(polled_idx);
+        assert!(
+            has_refresh_countdown(&control),
+            "control ({tier:?}): the polled row shows its countdown: {}",
+            line_text(&control)
+        );
+        assert!(
+            mark_spans(&control).is_empty(),
+            "a polled row carries no not-current mark ({tier:?}): {}",
+            line_text(&control)
+        );
+
+        for (idx, what) in unpolled {
+            let line = row(idx);
+            let marks = mark_spans(&line);
+            assert_eq!(
+                marks.len(),
+                1,
+                "a {what} row drawing a reading carries one `⋯` ({tier:?}): {}",
+                line_text(&line)
+            );
+            assert_eq!(
+                marks[0].style.fg,
+                Some(theme::warning_color()),
+                "the {what} row's `⋯` is amber ({tier:?})"
+            );
+            assert!(
+                !has_refresh_countdown(&line),
+                "the {what} row claims no refresh ({tier:?}): {}",
+                line_text(&line)
+            );
+            assert_eq!(
+                line.width(),
+                control.width(),
+                "the {what} row's mark keeps the slot's width in cells ({tier:?})"
+            );
+        }
+        mark_fg_per_tier.push(theme::warning_color());
+    }
+    assert_ne!(
+        mark_fg_per_tier[0], mark_fg_per_tier[1],
+        "control: the two tier pins resolve different colors, so both legs ran"
+    );
+}
+
+/// A setup token the probe refused marks the account's name with `⊘`, as an
+/// expired or mis-filled setup token does (the same credential, the same
+/// re-mint), and its countdown slot stays blank: it rests, so no countdown
+/// follows. A probed row whose token serves wears no mark, and neither does a
+/// dead api key's row, whose fix is another.
+#[test]
+fn a_refused_setup_token_marks_its_name_and_leaves_the_countdown_blank() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let probed = |name: &str, status: FetchStatus| {
+        // 30s past the hour, so the row's `1h 0m` holds while the test runs.
+        let (mut p, mut r) = profile(name, 95.0, 10.0, 3630);
+        p.usage_probe = true;
+        p.has_long_lived_sidecar = true;
+        p.setup_token_digest = Some(7);
+        r.fetch_status.insert(name.to_string(), status);
+        (p, r)
+    };
+    let dead_key = {
+        let (p, mut r) = third_party_profile(40.0, 20.0);
+        r.fetch_status
+            .insert(p.name.to_string(), FetchStatus::AuthExpired);
+        (p, r)
+    };
+    let key_name = dead_key.0.name.clone();
+    let key_fp = crate::usage::profile_credential_fingerprint(&dead_key.0).expect("a key");
+    let (config, readings) = config_with(
+        vec![
+            probed("refused", FetchStatus::AuthExpired),
+            probed("live", FetchStatus::Fresh),
+            dead_key,
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    if let Ok(mut m) = app.third_party_broken.lock() {
+        m.insert("refused".to_string(), 7);
+        m.insert(key_name.to_string(), key_fp);
+    }
+    // The tick that lands the refusal publishes a countdown before the verdict
+    // lands, so the refused row's slot must stay blank with one in the map.
+    if let Ok(mut m) = app.next_refresh_per_profile.lock() {
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("refused")),
+            now_ms() + 42_000,
+        );
+    }
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let row = |idx: usize| {
+        line_text(&render_overview_row(
+            &app, idx, &widths, false, true, &readings,
+        ))
+    };
+
+    let refused = row(0);
+    assert_eq!(
+        refused,
+        "  ⊘ refused    —                     [█░░░░░░░░░] 10% (1h 0m)                    —                         "
+    );
+    assert!(!refused.contains(NOT_CURRENT_MARK), "{refused}");
+    assert!(!has_refresh_countdown(&render_overview_row(
+        &app, 0, &widths, false, true, &readings
+    )));
+
+    let live = row(1);
+    assert!(!live.contains('⊘'), "{live}");
+    assert_eq!(
+        live.chars().count(),
+        refused.chars().count(),
+        "the mark keeps the slot"
+    );
+
+    let dead_key = row(2);
+    assert!(!dead_key.contains('⊘'), "{dead_key}");
+}
+
+/// The mark says the figures beside it are old; a row with nothing cached has
+/// no figures, so its slot stays blank however unpolled the account is. A
+/// polled account whose first refresh is not scheduled yet gets no mark either:
+/// a leg will fetch it.
+#[test]
+fn a_row_with_no_reading_or_a_polled_account_gets_no_not_current_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut disabled_empty, _) = profile("a", 95.0, 10.0, 3600);
+    disabled_empty.disabled = true;
+    disabled_empty.credentials = Some(oauth_creds());
+    let (keyless_empty, _) = keyless_provider_profile();
+    let (logged_out_empty, _) = profile("c", 95.0, 10.0, 3600);
+    let (mut polled_unscheduled, polled_readings) = profile("p", 95.0, 10.0, 3600);
+    polled_unscheduled.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(
+        vec![
+            (disabled_empty, ReadingsSnapshot::default()),
+            (keyless_empty, ReadingsSnapshot::default()),
+            (logged_out_empty, ReadingsSnapshot::default()),
+            (polled_unscheduled, polled_readings),
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    for (idx, what) in [
+        (0, "disabled oauth with nothing cached"),
+        (1, "keyless provider with nothing cached"),
+        (2, "logged-out oauth with nothing cached"),
+        (
+            3,
+            "polled oauth with a reading and no refresh scheduled yet",
+        ),
+    ] {
+        let line = render_overview_row(&app, idx, &widths, false, true, &readings);
+        assert!(
+            mark_spans(&line).is_empty(),
+            "a {what} row carries no `⋯`: {}",
+            line_text(&line)
+        );
+    }
+    // Fixture control: the polled row really draws its reading, so its missing
+    // mark is the work-list rule and not an empty row.
+    let polled_line = render_overview_row(&app, 3, &widths, false, true, &readings);
+    assert!(
+        line_text(&polled_line).contains("10%"),
+        "control: the polled row draws its 5h reading: {}",
+        line_text(&polled_line)
+    );
+}
+
+/// "Draws a reading" means what the row draws at this width: a pane too narrow
+/// for the 7d column hides a 7d-only reading, so that row is dashes and keeps a
+/// blank slot; the same row at full width draws its 7d bar and carries the mark.
+#[test]
+fn a_narrow_pane_hiding_the_7d_column_leaves_a_7d_only_row_unmarked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (logged_out, _) = profile("s7", 95.0, 10.0, 3600);
+    let seven_only = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (config, readings) = config_with(
+        vec![(
+            logged_out,
+            snap_with_usage(ReadingsSnapshot::default(), "s7", seven_only),
+        )],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+
+    let narrow = OverviewWidths::new(50, &app, &readings);
+    assert_eq!(
+        narrow.seven_day, 0,
+        "fixture control: 50 cells drop the 7d column"
+    );
+    let narrow_line = render_overview_row(&app, 0, &narrow, false, true, &readings);
+    assert!(
+        mark_spans(&narrow_line).is_empty(),
+        "a row whose only reading sits in a hidden column draws dashes, so no `⋯`: {}",
+        line_text(&narrow_line)
+    );
+
+    let wide = OverviewWidths::new(110, &app, &readings);
+    assert!(
+        wide.seven_day > 0,
+        "fixture control: 110 cells keep the 7d column"
+    );
+    let wide_line = render_overview_row(&app, 0, &wide, false, true, &readings);
+    assert_eq!(
+        mark_spans(&wide_line).len(),
+        1,
+        "control: the same row drawing its 7d bar carries the mark: {}",
+        line_text(&wide_line)
+    );
+
+    // Every 7d tier the shrink loop can pick, the narrowest (`%` only) and the
+    // bar without its reset included: whenever the column draws, its figure is
+    // on the row and the mark is beside it; whenever it is gone, no mark.
+    let mut tiers_seen = std::collections::BTreeSet::new();
+    for width in 40..=120u16 {
+        let widths = OverviewWidths::new(width, &app, &readings);
+        let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+        let marks = mark_spans(&line).len();
+        if widths.seven_day > 0 {
+            tiers_seen.insert(widths.seven_day);
+            assert!(
+                line_text(&line).contains("30%"),
+                "fixture control at {width} cells: the 7d column draws its figure: {}",
+                line_text(&line)
+            );
+            assert_eq!(marks, 1, "{width} cells draw the 7d figure, so one `⋯`");
+        } else {
+            assert_eq!(marks, 0, "{width} cells hide the 7d column, so no `⋯`");
+        }
+    }
+    assert!(
+        tiers_seen.len() >= 2,
+        "fixture control: the sweep crosses a narrow 7d tier and the full one: {tiers_seen:?}"
+    );
+}
+
+/// A row's snapshot entry is not a drawn reading: an unpolled provider account
+/// whose cached stats hold rows but no 5h/7d bars draws dashes (no `⋯`), and an
+/// unpolled DeepSeek account whose stats hold no balance row draws `—` in its
+/// balance cell (no `⋯`). Each sits beside its drawing twin as the control.
+#[test]
+fn an_unpolled_row_with_stats_but_nothing_drawn_gets_no_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (keyless, mut keyless_readings) = keyless_provider_profile();
+    if let Some(stats) = keyless_readings.third_party.get_mut("tp") {
+        stats.bars.clear();
+        stats.rows.push(crate::providers::StatRow {
+            label: "credits".into(),
+            value: "12.00 USD".into(),
+            kind: crate::providers::StatRowKind::Body,
+            raw: None,
+        });
+    }
+    let (mut ds_empty, ds_empty_readings) = deepseek_profile("d0", &[]);
+    ds_empty.disabled = true;
+    let (mut ds_balance, ds_balance_readings) = deepseek_profile("d1", &["1.71 USD"]);
+    ds_balance.disabled = true;
+    let (config, readings) = config_with(
+        vec![
+            (keyless, keyless_readings),
+            (ds_empty, ds_empty_readings),
+            (ds_balance, ds_balance_readings),
+        ],
+        None,
+        vec![],
+    );
+    assert!(
+        readings
+            .third_party
+            .get("tp")
+            .is_some_and(|s| s.bars.is_empty()),
+        "fixture control: the keyless row holds stats with no bars"
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let row = |idx: usize| render_overview_row(&app, idx, &widths, false, true, &readings);
+
+    for (idx, what) in [
+        (0, "keyless provider with stats and no bars"),
+        (1, "disabled deepseek with no balance row"),
+    ] {
+        let line = row(idx);
+        assert!(
+            mark_spans(&line).is_empty(),
+            "a {what} draws no figure, so no `⋯`: {}",
+            line_text(&line)
+        );
+    }
+    assert_eq!(
+        mark_spans(&row(2)).len(),
+        1,
+        "control: a disabled deepseek drawing its balance carries the mark: {}",
+        line_text(&row(2))
+    );
+}
+
+/// The third-party leg admits only a profile its entry constructor builds an
+/// entry for: a plain api key with no endpoint and no provider is on neither
+/// fetch leg, so a cached OAuth reading on its row (left from a login it no
+/// longer holds) is marked. A key alone is not the leg's membership rule.
+#[test]
+fn a_key_with_no_endpoint_is_unpolled_and_its_cached_reading_is_marked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut keyed, keyed_readings) = profile("k", 95.0, 10.0, 3600);
+    keyed.api_key = Some("sk-fixture".into());
+    let (mut polled, polled_readings) = profile("p", 95.0, 10.0, 3600);
+    polled.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(
+        vec![(keyed, keyed_readings), (polled, polled_readings)],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let keyed_line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    assert_eq!(
+        mark_spans(&keyed_line).len(),
+        1,
+        "a key with no endpoint fetches nothing, so its drawn reading is marked: {}",
+        line_text(&keyed_line)
+    );
+    let polled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
+    assert!(
+        mark_spans(&polled_line).is_empty(),
+        "control: a logged-in sibling is polled: {}",
+        line_text(&polled_line)
     );
 }
 
@@ -1508,11 +2052,13 @@ fn disabled_and_past_reset_row_stays_fully_dim() {
         .iter()
         .filter(|s| !s.content.trim().is_empty())
         .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
-        .map(|s| s.content.to_string())
+        .map(|s| s.content.trim().to_string())
         .collect();
+    // The not-current mark is the one span a disabled row keeps in color: it is
+    // what says the dim figures are a cached reading.
     assert_eq!(
         non_dim,
-        Vec::<String>::new(),
+        vec![NOT_CURRENT_MARK.to_string()],
         "a disabled row's bar must flatten fully to dim, not stay half-faint"
     );
 }
@@ -1559,6 +2105,7 @@ fn chain_row_switch_hint_rides_the_target_row() {
             last: 0,
             name_w: 8,
             gauge_w: GAUGE_W,
+            reading_w: 3,
             thr_w: 3,
             figure_inline: true,
             reason: None,
@@ -1608,6 +2155,7 @@ fn chain_row_renders_every_projected_hop_with_the_return_glyph() {
                 last: 0,
                 name_w: 8,
                 gauge_w: GAUGE_W,
+                reading_w: 3,
                 thr_w: 3,
                 figure_inline: true,
                 reason: None,
@@ -1641,8 +2189,8 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     // `ghost` sits in the chain with no profile behind it, so its row renders
     // the short `missing` arm. Leading with it proves the column is measured off
     // the WIDEST row rather than whichever one happens to come first.
-    let (short, short_readings) = profile("ab", 100.0, 10.0, 3600);
-    let (long, long_readings) = profile("a-much-longer-name", 100.0, 10.0, 3600);
+    let (short, short_readings) = polled("ab", 100.0, 10.0, 3600);
+    let (long, long_readings) = polled("a-much-longer-name", 100.0, 10.0, 3600);
     let (mut config, readings) = config_with(
         vec![(short, short_readings), (long, long_readings)],
         Some("ab"),
@@ -1729,6 +2277,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
             last: 0,
             name_w: 8,
             gauge_w: GAUGE_W,
+            reading_w: 3,
             thr_w: 3,
             figure_inline: true,
             reason: Some(BlockedReason::AuthBroken),
@@ -1764,6 +2313,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
                 last: 0,
                 name_w: 8,
                 gauge_w: GAUGE_W,
+                reading_w: 3,
                 thr_w: 3,
                 figure_inline: true,
                 reason: Some(BlockedReason::AuthBroken),
@@ -1835,14 +2385,15 @@ fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
     let col = header
         .find("live")
         .expect("the accounts table carries a `live` header");
-    line_text(row).chars().skip(col).collect()
+    line_text(row).chars().skip(col).take(widths.live).collect()
 }
 
 /// The column answers "how many `clauth start` sessions are on this account",
 /// with `⇄` marking that at least one of them can be moved by the chain. It is
-/// DISTINCT from the leading `●`, which marks the one profile a bare `claude`
-/// authenticates as — an account can carry either, both, or neither. That split
-/// is why the header reads `live`: `active` is the `●` sense app-wide.
+/// DISTINCT from the leading active mark (✻), which names the one profile a bare
+/// `claude` authenticates as — an account can carry either, both, or neither.
+/// That split is why the header reads `live`: `active` is the mark's sense
+/// app-wide.
 #[test]
 fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1891,7 +2442,7 @@ fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
         // 37200s = 10h 20m → `humanize_duration` emits the 7-char form.
         usage.seven_day = Some(UsageWindow {
             utilization: 95.0,
-            resets_at: Some(reset_in(37_200)),
+            resets_at: Some(countdown_reset_in(37_200)),
         });
     }
     let (config, readings) = config_with(vec![(p, p_readings)], Some("main"), vec![]);
@@ -2024,23 +2575,74 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
 /// This inner width is 4 cells narrower than the terminal width the render
 /// smoke test sweeps: the accounts panel takes 2 border cells + 2 horizontal
 /// padding cells. Floors here therefore read 4 lower than that test's.
+/// Swept at the stock label budget and at two-decimal readings, which widen
+/// every usage tier.
 #[test]
 fn live_column_width_is_monotone_in_inner_width() {
-    for max_name in 8..=22 {
-        let mut prev = None;
-        for total in 30..=200 {
-            let width = live_column_width(max_name, total);
-            if let Some(prev_w) = prev
-                && width != prev_w
-            {
-                assert_eq!(
-                    (prev_w, width),
-                    (0, LIVE_W),
-                    "live column must only appear (0 -> LIVE_W), never drop or \
-                     flip, at name {max_name}, total {total} ({prev_w} -> {width})",
-                );
+    let decimals = LabelWidths { five: 6, seven: 6 };
+    for labels in [LabelWidths::default(), decimals] {
+        for max_name in 8..=22 {
+            let mut prev = None;
+            for total in 30..=200 {
+                let width = live_column_width(max_name, total, labels);
+                if let Some(prev_w) = prev
+                    && width != prev_w
+                {
+                    assert_eq!(
+                        (prev_w, width),
+                        (0, LIVE_W),
+                        "live column must only appear (0 -> LIVE_W), never drop or \
+                         flip, at name {max_name}, total {total}, labels {labels:?} \
+                         ({prev_w} -> {width})",
+                    );
+                }
+                prev = Some(width);
             }
-            prev = Some(width);
+        }
+    }
+}
+
+/// The speed column's width gate sweeps like the live column's: only
+/// 0 -> TPS_W transitions as the inner width grows (never a drop), the column
+/// never appears without the live column, and it never appears while the 7d
+/// stamp is shed. Swept at the stock label budget and at two-decimal readings,
+/// which widen every usage tier.
+#[test]
+fn tps_column_width_is_monotone_in_inner_width() {
+    let decimals = LabelWidths { five: 6, seven: 6 };
+    for labels in [LabelWidths::default(), decimals] {
+        let (_, seven_excess) = labels.excess();
+        for max_name in 8..=22 {
+            let mut prev = None;
+            for total in 30..=200 {
+                let width = tps_column_width(max_name, total, labels);
+                if let Some(prev_w) = prev
+                    && width != prev_w
+                {
+                    assert_eq!(
+                        (prev_w, width),
+                        (0, TPS_W),
+                        "tps column must only appear (0 -> TPS_W), never drop or \
+                         flip, at name {max_name}, total {total}, labels {labels:?} \
+                         ({prev_w} -> {width})",
+                    );
+                }
+                prev = Some(width);
+                if width > 0 {
+                    assert!(
+                        live_column_width(max_name, total, labels) > 0,
+                        "tps on implies live on, at name {max_name}, total {total}, \
+                         labels {labels:?}"
+                    );
+                    let (_, _, _, seven_day) = overview_tiers(max_name, total, labels);
+                    assert_eq!(
+                        seven_day,
+                        SEVEN_DAY_MAX + seven_excess,
+                        "tps on implies the 7d stamp is unshed, at name {max_name}, \
+                         total {total}, labels {labels:?}"
+                    );
+                }
+            }
         }
     }
 }
@@ -2096,7 +2698,7 @@ fn deepseek_balance_sheds_brackets_before_it_ever_cuts() {
 fn a_long_chain_name_renders_whole_on_desktop() {
     let _home = crate::testutil::HomeSandbox::new();
     let name = "abcdefghijklmnopqrstuvwxyz";
-    let a = profile(name, 95.0, 10.0, 3600);
+    let a = polled(name, 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some(name), vec![name]);
     let app = App::new(config);
     for w in [80usize, 160] {
@@ -2108,7 +2710,7 @@ fn a_long_chain_name_renders_whole_on_desktop() {
             .expect("the member row renders");
         assert_eq!(
             row,
-            " ╶ 1 abcdefghijklmnopqrstuvwxyz  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%"
+            " ╶ 1 abcdefghijklmnopqrstuvwxyz  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%"
         );
     }
 }
@@ -2119,7 +2721,7 @@ fn a_long_chain_name_renders_whole_on_desktop() {
 #[test]
 fn the_stay_caption_wraps_without_overrunning_the_first_line() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
+    let a = polled("a", 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     // Every caption line, chip included, stays within the pane: the round-1
@@ -2348,6 +2950,41 @@ fn deepseek_multi_currency_shows_all_above_zero() {
     );
 }
 
+/// A DeepSeek balance right-aligns each amount to the widest amount (pad on the
+/// LEFT), so the currency follows exactly one space after the widest amount and
+/// a shorter amount is left-padded: `[  1.71 USD]` over `[197.50 CNY]`, never
+/// `[1.71   USD]`.
+#[test]
+fn deepseek_balance_amounts_right_align_to_the_widest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(
+        vec![
+            deepseek_profile("short", &["1.71 USD"]),
+            deepseek_profile("long", &["197.50 CNY"]),
+        ],
+        Some("short"),
+        vec![],
+    );
+    let app = App::new(config);
+    for terminal in [80u16, 120u16] {
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app, &readings);
+        let short_row = render_overview_row(&app, 0, &widths, false, false, &readings);
+        let long_row = render_overview_row(&app, 1, &widths, false, false, &readings);
+        let short_cell = five_hour_cell_text(&widths, true, &short_row);
+        let long_cell = five_hour_cell_text(&widths, true, &long_row);
+        assert_eq!(
+            short_cell.trim_end(),
+            "[  1.71 USD]",
+            "the short amount left-pads at {terminal} cols: {short_cell:?}"
+        );
+        assert_eq!(
+            long_cell.trim_end(),
+            "[197.50 CNY]",
+            "the widest amount anchors the column at {terminal} cols: {long_cell:?}"
+        );
+    }
+}
+
 /// When only one currency is above 0, only that one shows — the zero-balance
 /// currency is dropped.
 #[test]
@@ -2483,8 +3120,8 @@ fn deepseek_amount_w_spans_all_currencies() {
 
 /// `c` cycles the Overview's harness filter, and `label_name` names the
 /// harness the panel is showing for the left meta slot beside the bare
-/// `ACCOUNTS` title. Nameless while both show, so the unfiltered panel renders
-/// no left slot.
+/// `ACCOUNTS` title. Nameless while every section shows, so the unfiltered
+/// panel renders no left slot. Four states: all → claude → codex → shunt.
 #[test]
 fn the_harness_filter_cycles_and_names_itself() {
     use crate::tui::app::HarnessFilter;
@@ -2505,7 +3142,17 @@ fn the_harness_filter_cycles_and_names_itself() {
     assert_eq!(codex.label_name(), Some("codex"));
     assert!(codex.shows_codex() && !codex.shows_claude());
 
-    assert_eq!(codex.next(), HarnessFilter::All, "three states, then back");
+    let shunt = codex.next();
+    assert_eq!(
+        shunt.label_name(),
+        Some("shunt"),
+        "the fourth state names the shunt pool"
+    );
+    assert!(
+        !shunt.shows_claude() && !shunt.shows_codex(),
+        "the shunt filter hides the claude and codex rows"
+    );
+    assert_eq!(shunt.next(), HarnessFilter::All, "four states, then back");
     assert!(HarnessFilter::All.shows_claude() && HarnessFilter::All.shows_codex());
 }
 
@@ -2557,6 +3204,13 @@ fn the_accounts_title_row_carries_the_harness_filter() {
         accounts_title_row(&app, 25),
         "╭─ ACCOUNTS ─ codex ────╮",
         "the codex filter names the harness it shows"
+    );
+
+    app.harness_filter = HarnessFilter::Codex.next();
+    assert_eq!(
+        accounts_title_row(&app, 25),
+        "╭─ ACCOUNTS ─ shunt ────╮",
+        "the shunt filter names the pool it shows"
     );
 }
 
@@ -3070,6 +3724,89 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
     );
 }
 
+/// A codex cache written before `fetched_at` existed still dates its windows:
+/// the row's age falls back to the cache file's mtime, so the pane reads
+/// `◌ read <age> ago` over cached bars instead of `◌ not read yet` (T6 docs
+/// review F9). A stamped cache keeps its own stamp.
+#[test]
+fn codex_rows_date_an_unstamped_cache_by_its_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let body = |used: u32| {
+        crate::usage::map_codex_usage(
+            &format!(
+                r#"{{"plan_type":"plus","rate_limit":{{"primary_window":{{"used_percent":{used},"limit_window_seconds":18000,"reset_after_seconds":600}}}}}}"#
+            ),
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps")
+    };
+    let unstamped = body(42);
+    assert_eq!(unstamped.fetched_at, None, "the pre-T6 cache shape");
+    let cx1 = crate::profile::ProfileName::from("cx1");
+    crate::profile_cache::write_profile_cache(
+        &cx1,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &unstamped,
+    );
+    let mtime_ms: u64 = 1_760_000_000_000;
+    let path =
+        crate::profile_cache::profile_cache_path(&cx1, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms),
+    );
+    let stamp_ms: u64 = 1_750_000_000_000;
+    let mut stamped = body(7);
+    stamped.fetched_at = Some(stamp_ms);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cx2"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &stamped,
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(
+        rows.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+        vec![Some(mtime_ms), Some(stamp_ms)],
+        "the unstamped cache reads its mtime; the stamped one its own stamp"
+    );
+}
+
+/// A codex cache stamped past the clock dates its windows by the file's mtime,
+/// the usage seeds' rule: a future stamp proves the clock moved, never that
+/// the read is fresh (T6 residue review R4).
+#[test]
+fn codex_rows_date_a_future_stamped_cache_by_its_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut info = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    let day_ms: u64 = 86_400_000;
+    info.fetched_at = Some(crate::usage::now_ms() + day_ms);
+    let cx1 = crate::profile::ProfileName::from("cx1");
+    crate::profile_cache::write_profile_cache(&cx1, crate::profile_cache::USAGE_CACHE_FILE, &info);
+    let mtime_ms: u64 = 1_760_000_000_000;
+    let path =
+        crate::profile_cache::profile_cache_path(&cx1, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms),
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(
+        rows.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+        vec![Some(mtime_ms)],
+        "a stamp past the clock reads the file's mtime"
+    );
+}
+
 /// The plan cell's fallback: a captured-but-never-polled account still shows
 /// its tier off the store's id_token `chatgpt_plan_type` claim, and the cached
 /// `wham/usage` plan wins the moment a poll has answered.
@@ -3134,6 +3871,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         }),
         seven_day: None,
         resets: None,
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
     let app = App::new(config);
@@ -3179,9 +3917,13 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
         five_hour: None,
         seven_day: None,
         resets,
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
-    let app = App::new(config);
+    let mut app = App::new(config);
+    // The chip renders only while the widths charge its slot, which needs a
+    // visible codex row carrying a reset.
+    app.codex_rows = vec![row(Some(2))];
     let text = |line: ratatui::text::Line<'_>| -> String {
         line.spans.iter().map(|s| s.content.clone()).collect()
     };
@@ -3194,6 +3936,172 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
     assert!(
         !text(render_codex_row(&row(None), &wide, false)).contains("↺"),
         "no available reset (the constructor floors zero to None): no chip"
+    );
+}
+
+/// The cell sitting under the `t/s` header on `row`, padding included; empty
+/// when the column is dropped. Mirrors `five_hour_cell_text` so the pin proves
+/// the cell sits under its own header, not just that a blank exists somewhere.
+fn tps_column_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    if widths.tps == 0 {
+        return String::new();
+    }
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("t/s")
+        .expect("the accounts table carries a `t/s` header");
+    line_text(row).chars().skip(col).take(widths.tps).collect()
+}
+
+/// The banked-reset chip trails the t/s column the same way it trails `live`:
+/// a dim `↺ N` must never land under `t/s` and read as that row's speed. Pinned
+/// by column position through the header at a width with the t/s column on and
+/// one with it off — the chip adds the blank t/s slot only where the column is.
+#[test]
+fn a_codex_reset_chip_never_sits_under_the_tps_header() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(2),
+        fetched_at: None,
+    };
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    // The chip renders only while the widths charge its slot.
+    app.codex_rows = vec![row.clone()];
+
+    // t/s column on: the chip sits one gap past the blank t/s cell.
+    let wide = OverviewWidths::new(200, &app, &readings);
+    assert_eq!((wide.live, wide.tps), (LIVE_W, TPS_W));
+    let line = render_codex_row(&row, &wide, false);
+    assert_eq!(
+        tps_column_text(&wide, &line),
+        " ".repeat(wide.tps),
+        "the t/s cell stays blank under the t/s header"
+    );
+    let tps_col = line_text(&overview_header(&wide, false))
+        .find("t/s")
+        .expect("the accounts table carries a `t/s` header");
+    let text = line_text(&line);
+    let chip_col = text
+        .chars()
+        .position(|c| c == '↺')
+        .expect("two banked resets render the chip");
+    assert_eq!(
+        chip_col,
+        tps_col + wide.tps + wide.gap,
+        "the chip starts one gap past the t/s column"
+    );
+
+    // t/s column off: the chip still trails the live slot, one gap past it.
+    let narrow = OverviewWidths::new(100, &app, &readings);
+    assert_eq!((narrow.live, narrow.tps), (LIVE_W, 0));
+    let line = render_codex_row(&row, &narrow, false);
+    let live_col = line_text(&overview_header(&narrow, false))
+        .find("live")
+        .expect("the accounts table carries a `live` header");
+    let text = line_text(&line);
+    let chip_col = text
+        .chars()
+        .position(|c| c == '↺')
+        .expect("two banked resets render the chip");
+    assert_eq!(
+        chip_col,
+        live_col + narrow.live + narrow.gap,
+        "the chip starts one gap past the live column when t/s is dropped"
+    );
+}
+
+/// The trailing `↺ N` chip charge comes off the gap first, then the name down
+/// to its floor, and past that the chip sheds whole: the name column is
+/// untouched at wide panes, and the row never exceeds the pane. Codex-only
+/// roster, one- and two-digit counts.
+#[test]
+fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    let rows = || {
+        vec![
+            CodexRow {
+                name: crate::profile::ProfileName::from("cx1"),
+                active: false,
+                broken: false,
+                plan: Some("pro".to_string()),
+                five_hour: None,
+                seven_day: None,
+                resets: Some(12),
+                fetched_at: None,
+            },
+            CodexRow {
+                name: crate::profile::ProfileName::from("cx2"),
+                active: false,
+                broken: false,
+                plan: Some("plus".to_string()),
+                five_hour: None,
+                seven_day: None,
+                resets: Some(2),
+                fetched_at: None,
+            },
+        ]
+    };
+    app.codex_rows = rows();
+
+    // The gap absorbs the chip charge first: at these panes the name column is
+    // unchanged by a banked reset.
+    for inner in [132, 137, 140] {
+        let name_with = OverviewWidths::new(inner as u16, &app, &readings).name;
+        for r in &mut app.codex_rows {
+            r.resets = None;
+        }
+        let name_without = OverviewWidths::new(inner as u16, &app, &readings).name;
+        assert_eq!(name_with, name_without, "no name loss at inner {inner}");
+        app.codex_rows = rows();
+    }
+
+    // The base row fits at every width; wherever the chip is charged the whole
+    // row fits too.
+    for w in 60u16..=220 {
+        let inner = usize::from(w) - 4;
+        let widths = OverviewWidths::new(w - 4, &app, &readings);
+        let base = super::fixed_overview_width_cols(
+            widths.name,
+            widths.kind,
+            widths.five_hour,
+            widths.seven_day,
+            widths.live,
+            widths.tps,
+            widths.gap,
+        ) + super::TIMER_SLOT;
+        assert!(base <= inner, "the base row exceeds the pane at {w}");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        if rows.iter().any(|r| r.contains("↺")) {
+            // "↺ 12" — the widest chip in the fixture — sits one gap past the
+            // columns; a charged row never exceeds the pane.
+            let row_w = base + widths.gap + "↺ 12".chars().count();
+            assert!(row_w <= inner, "the charged row exceeds the pane at {w}");
+        }
+    }
+
+    // Below the name floor the chip sheds whole: inner 30 leaves no room even
+    // with the gap at its floor and the name at `NAME_READING_FLOOR`.
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        !rows.iter().any(|r| r.contains("↺")),
+        "the chip sheds whole below the name floor: {rows:?}"
     );
 }
 
@@ -3249,8 +4157,8 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
     );
     assert_eq!(
         live_text[..name_col + 3].iter().collect::<String>(),
-        "    cx2",
-        "a live chain keeps the blank marker cell"
+        "  ⏣ cx2",
+        "the active account's codex mark takes the marker cell"
     );
     let glyph = broken
         .spans
@@ -3262,6 +4170,28 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
         theme::danger().fg,
         "the broken glyph carries the same danger hue as the claude marker"
     );
+
+    // The dead credential outranks the active mark: an account that is both
+    // active and quarantined keeps its `×`.
+    let active_broken = render_codex_row(
+        &CodexRow {
+            active: true,
+            ..rows[0].clone()
+        },
+        &widths,
+        false,
+    );
+    let text = line_text(&active_broken);
+    assert!(
+        !text.contains('⏣'),
+        "a quarantined chain hides the codex mark: {text}"
+    );
+    let glyph = active_broken
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "×")
+        .expect("an active quarantined row keeps its broken glyph");
+    assert_eq!(glyph.style.fg, theme::danger().fg);
 }
 
 /// The 7d cell text, padding included, under the `7d` header; empty when the
@@ -3373,6 +4303,7 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
                     cache_read: 0.0,
                     cache_write: 0.0,
                     constraint: None,
+                    mode: None,
                     window_only: false,
                 },
                 crate::pricing::PriceEntry {
@@ -3384,6 +4315,7 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
                         start: start.to_owned(),
                         end: end.to_owned(),
                     }),
+                    mode: None,
                     window_only: false,
                 },
             ],
@@ -3403,10 +4335,10 @@ fn peak_profile(name: &str) -> (Profile, ReadingsSnapshot) {
     (p, p_readings)
 }
 
-/// An active profile on peak hours keeps its `●` — the active dot outranks
+/// An active profile on peak hours keeps its `✻` — the active mark outranks
 /// the peak marker, so `▲` never takes its slot.
 #[test]
-fn active_dot_outranks_the_peak_marker() {
+fn active_mark_outranks_the_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let (config, readings) = config_with(vec![peak_profile("a")], Some("a"), vec![]);
@@ -3415,12 +4347,12 @@ fn active_dot_outranks_the_peak_marker() {
     let widths = OverviewWidths::new(80, &app, &readings);
     let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
-    assert!(text.contains('●'), "active peak row keeps ●: {text}");
+    assert!(text.contains('✻'), "active peak row keeps ✻: {text}");
     assert!(
         !text.contains('▲'),
-        "the dot outranks the peak marker: {text}"
+        "the mark outranks the peak marker: {text}"
     );
-    let marker = line.spans.iter().find(|s| s.content == "●").unwrap();
+    let marker = line.spans.iter().find(|s| s.content == "✻").unwrap();
     assert_eq!(marker.style.fg, Some(theme::accent_2_color()));
 }
 
@@ -3442,8 +4374,8 @@ fn peak_marker_renders_on_inactive_rows() {
     let text = line_text(&line);
     assert!(text.contains('▲'), "inactive peak row renders ▲: {text}");
     assert!(
-        !text.contains('●'),
-        "no active dot on the inactive row: {text}"
+        !text.contains('✻'),
+        "no active mark on the inactive row: {text}"
     );
     let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
     assert_eq!(marker.style.fg, theme::warning().fg);
@@ -3473,9 +4405,9 @@ fn disabled_peak_row_dims_the_marker() {
 }
 
 /// A profile whose window is never active (off-peak by fixture) keeps its
-/// `●` and renders no `▲` — off-peak is the resting state and stays clean.
+/// `✻` and renders no `▲` — off-peak is the resting state and stays clean.
 #[test]
-fn off_peak_row_keeps_the_active_dot() {
+fn off_peak_row_keeps_the_active_mark() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     // An empty window ("12:00"–"12:00") is active at no hour.
@@ -3486,7 +4418,7 @@ fn off_peak_row_keeps_the_active_dot() {
     let text = line_text(&render_overview_row(
         &app, 0, &widths, false, true, &readings,
     ));
-    assert!(text.contains('●'), "off-peak active row keeps ●: {text}");
+    assert!(text.contains('✻'), "off-peak active row keeps ✻: {text}");
     assert!(!text.contains('▲'), "no peak marker off-peak: {text}");
 }
 
@@ -3522,7 +4454,7 @@ fn no_table_no_peak_marker() {
         &app, 0, &widths, false, true, &readings,
     ));
     assert!(!text.contains('▲'), "no table, no marker: {text}");
-    assert!(text.contains('●'), "the active dot is untouched: {text}");
+    assert!(text.contains('✻'), "the active mark is untouched: {text}");
 }
 
 // ── the accounts scrollbar measures every row the panel renders ───────────────
@@ -3648,24 +4580,702 @@ fn the_last_codex_row_and_thumb_follow_a_short_viewport() {
     assert_eq!(accounts_scrollbar_column(&app, 80, 8), "     ");
 }
 
-/// cloudy-tui "Keys and commands inside prose": the codex section's heading
-/// names its switch command in ACCENT, never bold, the rest of the line dim.
+/// The accounts list's rows with the panel border and padding cut off and
+/// trailing blanks trimmed, so a heading line reads as its own text.
+fn accounts_list_lines(app: &App, width: u16, height: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .iter()
+        .map(|row| {
+            row.trim_start_matches('│')
+                .trim_end_matches('│')
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The codex section's heading is the harness name alone (cloudy
+/// 2026-10-14: the `— switch with clauth <name>` tail is gone).
 #[test]
-fn the_codex_heading_styles_its_switch_command() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+fn the_codex_heading_is_the_harness_name_alone() {
     let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     crate::testutil::write_codex_roster(&["cx1"]);
     let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
     let app = App::new(config);
-    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
-    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
-    crate::testutil::assert_prose_part(
-        term.backend().buffer(),
-        "codex — switch with clauth <name>",
-        "clauth <name>",
-        false,
+    let lines = accounts_list_lines(&app, 100, 12);
+    assert!(
+        lines.iter().any(|line| line == "codex"),
+        "a heading line reads `codex` alone: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("switch with")),
+        "no switch hint on the heading: {lines:?}"
+    );
+}
+
+// ── the shunt pool section (B2; design record "Pool rows") ─────────────────
+
+/// A pool account with every flag clear and no readings: available, unpaused.
+fn pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
+    crate::gateway_admin::PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
+        plan: None,
+        status: None,
+    }
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+}
+
+/// Three providers, five pool rows: `alpha` (readings, available), `beta`
+/// (needs a re-login), `cx-work` (cooling down 240 s), `spare` (paused), `k1`
+/// (kimi, no actions).
+fn sample_pool() -> crate::tui::app::ShuntPool {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let now = now_epoch();
+    crate::tui::app::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![
+                PoolAccount {
+                    plan: Some("max".to_string()),
+                    utilization_5h: Some(0.12),
+                    reset_5h: Some(now + 3 * 3600),
+                    utilization_7d: Some(0.40),
+                    reset_7d: Some(now + 5 * 86_400),
+                    ..pool_account("alpha")
+                },
+                PoolAccount {
+                    available: false,
+                    needs_relogin: true,
+                    plan: Some("max".to_string()),
+                    ..pool_account("beta")
+                },
+            ],
+        },
+        PoolProvider {
+            name: "codex".to_string(),
+            auth: PoolAuth::Codex,
+            accounts: vec![
+                PoolAccount {
+                    available: false,
+                    cooldown_secs_remaining: Some(240),
+                    plan: Some("plus".to_string()),
+                    utilization_5h: Some(0.55),
+                    reset_5h: Some(now + 3600),
+                    ..pool_account("cx-work")
+                },
+                PoolAccount {
+                    available: false,
+                    paused: true,
+                    ..pool_account("spare")
+                },
+            ],
+        },
+        PoolProvider {
+            name: "kimi".to_string(),
+            auth: PoolAuth::Kimi,
+            accounts: vec![pool_account("k1")],
+        },
+    ])
+}
+
+/// One claude account plus [`sample_pool`], the pool read in.
+fn pool_app() -> App {
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = sample_pool();
+    app
+}
+
+/// Each provider in the listing gets one `shunt (<provider>)` section heading
+/// after the claude (and codex) rows, its accounts under it in listing order,
+/// and the title-right meta counts the pool rows.
+#[test]
+fn pool_rows_list_under_one_heading_per_provider() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = pool_app();
+    let lines = accounts_list_lines(&app, 100, 20);
+    let at = |pred: &dyn Fn(&str) -> bool, what: &str| {
+        lines
+            .iter()
+            .position(|line| pred(line))
+            .unwrap_or_else(|| panic!("{what} not drawn: {lines:?}"))
+    };
+    let order = [
+        at(&|l| l.contains("cl1"), "the claude row"),
+        at(&|l| l == "shunt (claude-main)", "the claude-main heading"),
+        at(&|l| l.contains("alpha"), "alpha"),
+        at(&|l| l.contains("beta"), "beta"),
+        at(&|l| l == "shunt (codex)", "the codex provider heading"),
+        at(&|l| l.contains("cx-work"), "cx-work"),
+        at(&|l| l.contains("spare"), "spare"),
+        at(&|l| l == "shunt (kimi)", "the kimi heading"),
+        at(&|l| l.contains("k1"), "k1"),
+    ];
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "claude rows, then each provider heading with its accounts: {lines:?}"
+    );
+    assert!(
+        accounts_title_row(&app, 60).ends_with(" 1 claude · 5 shunt ─╮"),
+        "the meta counts the five pool rows: {:?}",
+        accounts_title_row(&app, 60)
+    );
+}
+
+/// The foreground and modifiers of the first cell of the accounts-list line
+/// whose trimmed text is exactly `heading`, drawn with the Overview cursor on
+/// flat row `cursor`.
+fn heading_cell(
+    app: &mut App,
+    cursor: usize,
+    heading: &str,
+) -> (ratatui::style::Color, ratatui::style::Modifier) {
+    app.overview_cursor = cursor;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let (y, row) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.trim_start_matches('│').trim_end_matches('│').trim() == heading)
+        .unwrap_or_else(|| panic!("heading {heading:?} not drawn: {rows:?}"));
+    let x = row
+        .chars()
+        .position(|c| c != '│' && c != ' ')
+        .expect("a heading has text");
+    let cell = buf
+        .cell((
+            u16::try_from(x).expect("x fits"),
+            u16::try_from(y).expect("y fits"),
+        ))
+        .expect("cell in the buffer");
+    (cell.fg, cell.modifier)
+}
+
+/// The `codex` and every `shunt (<provider>)` heading render `TEXT_DIM + bold`
+/// at rest and `TEXT + bold` while the cursor rests on a row under it, the
+/// list section-header rule (cloudy 2026-10-15, over the mockup's plain dim);
+/// only the heading
+/// over the cursor lifts.
+#[test]
+fn a_section_heading_lifts_only_while_a_row_under_it_holds_the_cursor() {
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = pool_app();
+    // flat rows: cl1 0 · cx1 1 · alpha 2, beta 3 (claude-main) ·
+    // cx-work 4, spare 5 (codex) · k1 6 (kimi)
+    assert_eq!(app.main_items().len(), 7, "the fixture's flat rows");
+    let rest = (theme::text_dim_color(), Modifier::BOLD);
+    let lifted = (theme::text_color(), Modifier::BOLD);
+    let headings = [
+        "codex",
+        "shunt (claude-main)",
+        "shunt (codex)",
+        "shunt (kimi)",
+    ];
+    let cases: [(usize, Option<&str>); 6] = [
+        (0, None),
+        (1, Some("codex")),
+        (2, Some("shunt (claude-main)")),
+        (3, Some("shunt (claude-main)")),
+        (4, Some("shunt (codex)")),
+        (6, Some("shunt (kimi)")),
+    ];
+    for (cursor, lifted_heading) in cases {
+        for heading in headings {
+            let want = if Some(heading) == lifted_heading {
+                lifted
+            } else {
+                rest
+            };
+            assert_eq!(
+                heading_cell(&mut app, cursor, heading),
+                want,
+                "heading {heading:?} with the cursor on flat row {cursor}"
+            );
+        }
+    }
+}
+
+/// An unread pool's one heading has no row under it, so it stays at rest,
+/// `TEXT_DIM + bold`, wherever the cursor is.
+#[test]
+fn an_unread_pool_heading_rests_dim_and_bold() {
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = crate::tui::app::ShuntPool::NotRead("the gateway did not answer".to_string());
+    assert_eq!(
+        heading_cell(&mut app, 0, "shunt — not read: the gateway did not answer"),
+        (theme::text_dim_color(), Modifier::BOLD)
+    );
+}
+
+/// At narrow widths, under the shunt filter, the pool band alone sizes the
+/// usage columns: a `73.42%` reading still renders whole and its `%` lines up
+/// with a `5%` one, where a column sized for `100%` would cut it.
+#[test]
+fn a_narrow_shunt_view_sizes_its_columns_for_the_pool_band() {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 12.0, 30.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.harness_filter = crate::tui::app::HarnessFilter::Shunt;
+    let now = now_epoch();
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "p".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![
+            PoolAccount {
+                utilization_5h: Some(0.05),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.05),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("al")
+            },
+            PoolAccount {
+                utilization_5h: Some(0.7342),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.7342),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("be")
+            },
+        ],
+    }]);
+    for width in [34_u16, 45] {
+        // Untrimmed rows: the caret gutter keeps both rows' columns in step.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10))
+            .expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+            .expect("draw");
+        let lines = crate::testutil::buffer_rows(term.backend().buffer());
+        let row = |name: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.trim_start_matches('│')
+                        .trim_start_matches([' ', '❯'])
+                        .starts_with(&format!("{name} "))
+                })
+                .unwrap_or_else(|| panic!("{name} not drawn at {width}: {lines:?}"))
+                .clone()
+        };
+        let first_percent = |line: &str| line.chars().position(|c| c == '%');
+        let (al, be) = (row("al"), row("be"));
+        assert!(
+            be.contains("73.42%"),
+            "the wide reading renders whole at {width}: {be:?}"
+        );
+        assert_eq!(
+            first_percent(&al),
+            first_percent(&be),
+            "the band's `%` signs align at {width}:\n{al:?}\n{be:?}"
+        );
+    }
+}
+
+/// The pool rows are a band of their own in the usage columns, like the codex
+/// rows: each reading is left-padded to the band's widest, so a `5%` and a
+/// `73.42%` pool reading end their `%` in the same column, in the 5h and the 7d
+/// column alike, beside a claude row whose own readings stay short.
+#[test]
+fn pool_readings_align_their_percent_signs_within_their_band() {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 12.0, 30.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    let now = now_epoch();
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![
+            PoolAccount {
+                utilization_5h: Some(0.05),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.05),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("alpha")
+            },
+            PoolAccount {
+                utilization_5h: Some(0.7342),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.7342),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("beta")
+            },
+        ],
+    }]);
+    let lines = accounts_list_lines(&app, 140, 12);
+    let row = |name: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(name))
+            .unwrap_or_else(|| panic!("{name} not drawn: {lines:?}"))
+            .clone()
+    };
+    let percents = |line: &str| -> Vec<usize> {
+        line.chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '%')
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let (alpha, beta) = (row("alpha"), row("beta"));
+    assert!(
+        beta.contains("73.42%"),
+        "the wide reading renders whole: {beta:?}"
+    );
+    assert_eq!(percents(&alpha).len(), 2, "two readings on {alpha:?}");
+    assert_eq!(
+        percents(&alpha),
+        percents(&beta),
+        "the band's `%` signs align:\n{alpha:?}\n{beta:?}"
+    );
+}
+
+/// A pool row carries its state only through cues the claude and codex rows
+/// already use: the broken-login glyph in DANGER before a name that needs a
+/// re-login, a whole row dimmed while paused, a cooldown's remaining time in
+/// the timer slot in WARNING; no status word anywhere, the bars for readings.
+#[test]
+fn pool_row_status_rides_the_existing_row_cues() {
+    use crate::tui::theme;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let app = pool_app();
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+
+    let relogin =
+        crate::testutil::needle_cells(buf, &format!("{} beta", theme::dead_credential_glyph()))
+            .unwrap_or_else(|| panic!("beta carries the broken-login glyph: {rows:?}"));
+    assert_eq!(
+        relogin[0].fg,
+        theme::danger().fg.expect("danger color"),
+        "the glyph is DANGER"
+    );
+
+    let spare = crate::testutil::needle_cells(buf, "spare").expect("spare drawn");
+    assert!(
+        spare
+            .iter()
+            .all(|cell| cell.fg == theme::dim().fg.expect("dim color")),
+        "a paused account's name dims like a disabled claude account"
+    );
+
+    let cx_row = rows
+        .iter()
+        .find(|row| row.contains("cx-work"))
+        .expect("cx-work drawn");
+    assert!(
+        cx_row.contains(" 4m "),
+        "the cooldown's 240 s reads `4m` in the timer slot: {cx_row:?}"
+    );
+    let cooldown = crate::testutil::needle_cells(buf, "4m").expect("cooldown drawn");
+    assert!(
+        cooldown
+            .iter()
+            .all(|cell| cell.fg == theme::warning().fg.expect("warning color")),
+        "the cooldown is WARNING"
+    );
+
+    let alpha_row = rows
+        .iter()
+        .find(|row| row.contains("alpha"))
+        .expect("alpha drawn");
+    assert!(
+        alpha_row.contains("12%") && alpha_row.contains("40%") && alpha_row.contains("max"),
+        "alpha shows its plan and both readings as percentages: {alpha_row:?}"
+    );
+
+    for word in [
+        "relogin",
+        "cooling",
+        "paused",
+        "disabled",
+        "quota",
+        "available",
+    ] {
+        assert!(
+            !rows.iter().any(|row| row.contains(word)),
+            "no status word `{word}` on any row: {rows:?}"
+        );
+    }
+}
+
+/// A listing that cannot be read names no provider: one resting heading
+/// carries the reason, no pool rows, and the meta counts no shunt term.
+#[test]
+fn an_unread_pool_is_one_heading_with_its_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = crate::tui::app::ShuntPool::NotRead("the gateway is not running".to_string());
+    let lines = accounts_list_lines(&app, 100, 12);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("shunt"))
+            .collect::<Vec<_>>(),
+        vec!["shunt — not read: the gateway is not running"],
+        "one heading with the reason, no provider headings: {lines:?}"
+    );
+    assert!(
+        accounts_title_row(&app, 60).ends_with(" 1 claude ─╮"),
+        "no shunt term while the pool is not read: {:?}",
+        accounts_title_row(&app, 60)
+    );
+}
+
+/// Wire strings on a pool row (account name, plan, provider) reach the screen
+/// escaped, as the heading, menu, confirm and toasts already escape them: no
+/// bidi or control symbol lands in a cell.
+#[test]
+fn pool_names_off_the_wire_render_escaped() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    if let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool {
+        providers[0].name = "pro\u{202e}vider".to_string();
+        providers[0].accounts[0].name = "al\u{202e}pha".to_string();
+        providers[0].accounts[0].plan = Some("m\u{202e}x".to_string());
+    }
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let raw: Vec<String> = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .filter(|s| s.contains('\u{202e}'))
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "a raw bidi symbol reached the buffer: {raw:?}"
+    );
+}
+
+/// The running pool row shows the braille spinner in its marker slot.
+#[test]
+fn a_running_pool_row_shows_the_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let alpha_row = rows
+        .iter()
+        .find(|row| row.contains("alpha"))
+        .expect("alpha drawn");
+    assert!(
+        alpha_row.contains("⠋"),
+        "the running row shows the braille spinner: {alpha_row:?}"
+    );
+}
+
+/// The spinner keys on the account's `(family, name)`, never the row index, so
+/// a reorder under a running mutation cannot move it onto another account.
+#[test]
+fn the_spinner_follows_the_account_when_the_listing_reorders() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    if let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool {
+        providers[0].accounts.swap(0, 1);
+    }
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let alpha_row = rows
+        .iter()
+        .find(|row| row.contains("alpha"))
+        .expect("alpha drawn");
+    let beta_row = rows
+        .iter()
+        .find(|row| row.contains("beta"))
+        .expect("beta drawn");
+    assert!(
+        alpha_row.contains("⠋"),
+        "the spinner follows alpha across the reorder: {alpha_row:?}"
+    );
+    assert!(
+        !beta_row.contains("⠋"),
+        "the spinner does not land on beta (the old index): {beta_row:?}"
+    );
+}
+
+/// A selected paused pool row keeps the current-row bold over its dim color,
+/// the claude row's `bold_when` promotion.
+#[test]
+fn a_selected_paused_pool_row_keeps_the_current_row_bold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = pool_app();
+    app.overview_cursor = 4;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let spare =
+        crate::testutil::needle_cells(term.backend().buffer(), "spare").expect("spare drawn");
+    assert!(
+        spare
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::BOLD)),
+        "a selected paused row's label takes the current-row bold: {:?}",
+        spare.iter().map(|cell| cell.modifier).collect::<Vec<_>>()
+    );
+}
+
+/// A sub-minute cooldown reads its seconds, the arm the shared
+/// `duration_label` gained when the pool's formatter and the status feed's
+/// merged.
+#[test]
+fn a_sub_minute_cooldown_reads_seconds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    if let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool {
+        providers[0].accounts[0].cooldown_secs_remaining = Some(45);
+    }
+    let lines = accounts_list_lines(&app, 100, 20);
+    assert!(
+        lines.iter().any(|line| line.contains("45s")),
+        "a 45 s cooldown reads `45s` in the timer slot: {lines:?}"
+    );
+}
+
+/// No adopted gateway: no shunt section at all.
+#[test]
+fn no_adopted_gateway_draws_no_shunt_section() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = crate::tui::app::ShuntPool::Absent;
+    let lines = accounts_list_lines(&app, 100, 12);
+    assert!(
+        !lines.iter().any(|line| line.contains("shunt")),
+        "nothing names shunt: {lines:?}"
+    );
+}
+
+/// The shunt filter shows the pool rows alone; the meta still counts every
+/// section, as it does under the claude and codex filters.
+#[test]
+fn the_shunt_filter_shows_the_pool_rows_alone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    app.harness_filter = crate::tui::app::HarnessFilter::Codex.next();
+    let lines = accounts_list_lines(&app, 100, 20);
+    assert!(
+        !lines.iter().any(|line| line.contains("cl1")),
+        "no claude row under the shunt filter: {lines:?}"
+    );
+    for name in ["alpha", "beta", "cx-work", "spare", "k1"] {
+        assert!(
+            lines.iter().any(|line| line.contains(name)),
+            "{name} drawn under the shunt filter: {lines:?}"
+        );
+    }
+    assert!(
+        accounts_title_row(&app, 60).ends_with(" 1 claude · 5 shunt ─╮"),
+        "the meta counts every section: {:?}",
+        accounts_title_row(&app, 60)
+    );
+}
+
+/// The published cursor starts walk both bands: each pool row's rendered line
+/// accounts for the codex spacer + heading AND the per-provider shunt headings,
+/// so the page step (which reads these starts) can never land a selection off
+/// its row, and the scrollbar's total counts every rendered line.
+#[test]
+fn the_page_step_and_scrollbar_walk_a_list_with_all_three_sections() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let (config, readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = sample_pool();
+
+    // Full-height draw publishes the geometry the page step and scrollbar read.
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+        .expect("draw");
+    // items: cl1, cx1, alpha, beta, cx-work, spare, k1.
+    assert_eq!(
+        *app.overview_selector.starts.borrow(),
+        vec![0, 3, 6, 7, 9, 10, 12],
+        "each pool row's rendered line crosses both bands"
+    );
+    assert_eq!(
+        app.overview_selector.total.get(),
+        13,
+        "the scrollbar counts every rendered line, headings included"
+    );
+
+    // A short viewport with the cursor on the last pool row keeps the caret on
+    // that row.
+    app.overview_cursor = 6;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows[6].contains("❯") && rows[6].contains("k1"),
+        "the last pool row follows: {rows:?}"
+    );
+    assert!(
+        accounts_scrollbar_column(&app, 80, 8).contains('┃'),
+        "the scrollbar thumb shows the overflow"
     );
 }
 
@@ -3843,7 +5453,7 @@ fn a_hybrids_overview_bar_shows_the_provider_percentage() {
     let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert_eq!(
-        text, "  ● h             API                [█░░░░░░░░░]  10%      —              ",
+        text, "  ✻ h             API                [█░░░░░░░░░] 10%       —              ",
         "the hybrid's Overview row renders the provider percentage"
     );
 }
@@ -3872,6 +5482,7 @@ fn tp_bar(pct: f64) -> crate::providers::ThirdPartyStats {
             )),
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,
@@ -3979,8 +5590,8 @@ fn seed_heavy_burn(app: &mut App, name: &str) {
 /// so the margin that matters is the 30 s up to 540 s (a fixture landing on
 /// exactly 540 s rendered `8m` or `9m` by whether the clock moved a millisecond).
 fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
-    let (a, a_readings) = profile("alpha", 95.0, 52.5, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, bravo_pct, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 52.5, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, bravo_pct, 3600);
     let (mut config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("alpha"),
@@ -4010,17 +5621,17 @@ fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
     app
 }
 
-/// R1 (reviewer probe, ported): the DEFAULT config (burn-aware off) caption
-/// names the member the walk lands on when a healthy active crosses its
-/// threshold. The whole target row is pinned by equality.
+/// The DEFAULT config (burn-aware off) caption names the member the walk lands
+/// on when a healthy active crosses its threshold. The whole target row is
+/// pinned by equality.
 #[test]
-fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_active() {
+fn default_caption_names_the_next_member_for_a_healthy_burning_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = healthy_burning_alpha(10.0, false);
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~8m",
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱    10% / 95%   ↲ ~8m",
         "the default-config caption names the member the walk lands on at the crossing"
     );
 }
@@ -4048,9 +5659,9 @@ fn the_off_caption_warns_a_healthy_active_in_the_default_config() {
 #[test]
 fn the_projected_switch_skips_a_kick_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
@@ -4087,7 +5698,7 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "the caption must name the clear member, not the kick-rejected one"
     );
 }
@@ -4100,9 +5711,9 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
 #[test]
 fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
@@ -4139,7 +5750,7 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "the caption must prefer the fresh member over the dead-reading one"
     );
 }
@@ -4151,8 +5762,8 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
 #[test]
 fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
     let (mut config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("alpha"),
@@ -4177,7 +5788,7 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "burn-aware with the default floor still projects the crossing"
     );
 }
@@ -4189,11 +5800,11 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
 #[test]
 fn the_projected_switch_skips_a_live_key_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
     let (mut bravo, bravo_readings) = third_party_profile(10.0, 10.0);
     bravo.name = "bravo".into();
     let fp = crate::usage::profile_credential_fingerprint(&bravo).expect("fingerprint");
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (bravo, bravo_readings), (c, c_readings)],
         Some("alpha"),
@@ -4231,7 +5842,7 @@ fn the_projected_switch_skips_a_live_key_rejected_member() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "the caption skips the live key-rejected sibling and names the clear one"
     );
 }
@@ -4261,7 +5872,7 @@ fn the_deepseek_balance_cell_desktop_matches_the_pre_s9_render() {
 #[test]
 fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
+    let a = polled("a", 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     for w in [76usize, 156] {
@@ -4278,4 +5889,568 @@ fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
             "stay caption at inner {w} cells"
         );
     }
+}
+
+// ── tps: the overview `t/s` column ───────────────────────────────────────
+
+/// A fresh snapshot giving `a` a live speed of 92.4 and `b` none.
+fn tps_overview_snapshot(age_ms: u64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(
+        "a".into(),
+        crate::tps::Figures {
+            live: crate::tps::Figure {
+                rate: 67.2,
+                speed: Some(92.4),
+            },
+            ..Default::default()
+        },
+    );
+    snap
+}
+
+/// The `t/s` column sits after `live`: a cell carries the account's live speed,
+/// right-aligned, blank where absent, and the whole column drops before the
+/// 7d reset stamp (and before the live column).
+#[test]
+fn the_overview_tps_column_renders_blank_when_absent_and_drops_first() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("a", 80.0, 42.0, 3600);
+    let (b, b_readings) = profile("b", 80.0, 10.0, 3600);
+    let (config, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    let mut app = App::new(config);
+    app.set_tps(Some(tps_overview_snapshot(1_000)));
+
+    // Both columns fit at a wide width, with the full 7d stamp present; the
+    // header closes with the speed column.
+    let wide = OverviewWidths::new(200, &app, &readings);
+    assert_eq!((wide.live, wide.tps), (LIVE_W, TPS_W));
+    assert!(
+        wide.seven_day >= 26,
+        "the full 7d stamp holds: {}",
+        wide.seven_day
+    );
+    assert!(
+        line_text(&overview_header(&wide, false)).ends_with("t/s "),
+        "the header closes with the speed column"
+    );
+
+    // `a` carries its speed right-aligned, `b` a blank cell — never a dash for
+    // a figure the producer did not read.
+    assert_eq!(
+        line_text(&Line::from(super::tps_cell(&app, "a", TPS_W))),
+        "  92"
+    );
+    assert_eq!(
+        line_text(&Line::from(super::tps_cell(&app, "b", TPS_W))),
+        "    "
+    );
+
+    // The column drops whole with the 7d stamp: at 103 the stamp and the
+    // column hold; two columns narrower the stamp has shed and so has the t/s
+    // column (the live column still fits).
+    let stamped = OverviewWidths::new(103, &app, &readings);
+    assert!(stamped.seven_day >= 26, "{}", stamped.seven_day);
+    assert_eq!(stamped.tps, TPS_W);
+    let shed = OverviewWidths::new(101, &app, &readings);
+    assert!(shed.seven_day < 26, "{}", shed.seven_day);
+    assert_eq!(shed.tps, 0, "the t/s column drops with the 7d stamp");
+    assert_eq!(shed.live, LIVE_W, "the live column still holds");
+
+    // The row renders the right-aligned speed under the t/s header, and a
+    // blank cell for the account without one.
+    let row_a = line_text(&render_overview_row(
+        &app, 0, &wide, false, false, &readings,
+    ));
+    assert!(row_a.contains("  92"), "{row_a:?}");
+}
+
+/// The cell's figure abbreviates to a whole `k` once the formatted text would
+/// exceed the 4-cell column, capped at `999k`, never truncated into `…`.
+#[test]
+fn the_tps_cell_abbreviates_with_k_and_never_truncates() {
+    assert_eq!(crate::tps::format_figure_capped(9_999.4, TPS_W), "9999");
+    assert_eq!(crate::tps::format_figure_capped(9_999.6, TPS_W), "10k");
+    assert_eq!(crate::tps::format_figure_capped(12_800.0, TPS_W), "13k");
+    assert_eq!(crate::tps::format_figure_capped(1_200_000.0, TPS_W), "999k");
+}
+
+/// The row never exceeds the pane in any reset mode: the wall-clock bonus
+/// yields to the t/s column only when the post-bonus row still fits. Swept at
+/// a whole reading and at a two-decimal one (which widens the 5h tier's
+/// excess), so the saturation path above excess 0 is charged too.
+#[test]
+fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
+    use crate::profile::ResetDisplay;
+    let _home = crate::testutil::HomeSandbox::new();
+    for mode in [
+        ResetDisplay::Relative,
+        ResetDisplay::Clock,
+        ResetDisplay::Both,
+    ] {
+        for util in [42.0, 73.42] {
+            let (a, a_readings) = profile("a", 80.0, util, 3600);
+            let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec![]);
+            config.state.reset_display = Some(mode);
+            let mut app = App::new(config);
+            app.set_tps(Some(tps_overview_snapshot(1_000)));
+            for w in 95..=140u16 {
+                let widths = OverviewWidths::new(w, &app, &readings);
+                let row_w = super::fixed_overview_width_cols(
+                    widths.name,
+                    widths.kind,
+                    widths.five_hour,
+                    widths.seven_day,
+                    widths.live,
+                    widths.tps,
+                    widths.gap,
+                ) + super::TIMER_SLOT;
+                assert!(
+                    row_w <= w as usize,
+                    "{mode:?} at {w} (util {util}): {row_w} > {w}"
+                );
+            }
+        }
+    }
+}
+
+// ── active-account marks ─────────────────────────────────────────────────────
+
+/// A tps snapshot stamped now whose only account `name` consumes `rate`.
+fn burning_snapshot(name: &str, rate: f64) -> crate::tps::Snapshot {
+    let stamp =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(crate::usage::now_ms()).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    let figures = crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate,
+            speed: Some(40.0),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(name.into(), figures);
+    snap
+}
+
+const CLAUDE_WORKING_FRAMES: [&str; 6] = ["·", "✢", "*", "✶", "✻", "✽"];
+
+#[test]
+fn the_active_claude_row_rests_on_the_claude_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let text = line_text(&line);
+    assert!(!text.contains('●'), "the active dot is gone: {text}");
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "✻")
+        .unwrap_or_else(|| panic!("an idle active claude row carries `✻`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+
+    // Only a FRESH snapshot with a positive rate moves the mark. `0` at T=0
+    // would draw the cycle's first frame, so a mutant keyed on the snapshot's
+    // presence or on `speed` reds here instead of resting on `✻`.
+    app.tps = Some(snapshot_stamped_at(0, "a", 0.0));
+    app.tps_now_override = Some(0);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    assert!(
+        line.spans.iter().any(|s| s.content == "✻"),
+        "a fresh rate of 0 spends nothing: {}",
+        line_text(&line)
+    );
+
+    // A stale snapshot cannot claim spending either; its T=30 s frame is `·`.
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    app.tps_now_override = Some(crate::tps::STALE_AFTER_MS + 1);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    assert!(
+        line.spans.iter().any(|s| s.content == "✻"),
+        "a stale snapshot rests on `✻`: {}",
+        line_text(&line)
+    );
+}
+
+#[test]
+fn the_active_claude_row_animates_while_its_account_burns_tokens() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    // 448 ms snaps to itself and lands on index 2 (`*`), two frames from the
+    // rest glyph at index 4, so a mark that never moves reds here.
+    app.tps_now_override = Some(448);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let text = line_text(&line);
+    assert!(!text.contains('●'), "the active dot is gone: {text}");
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()))
+        .unwrap_or_else(|| panic!("a burning active claude row draws a working frame: {text}"));
+    assert_ne!(
+        mark.content.as_ref(),
+        "✻",
+        "a burning account's mark moves off the rest glyph: {text}"
+    );
+    assert_eq!(
+        mark.content.as_ref(),
+        "*",
+        "448 ms into the cycle is its third frame: {text}"
+    );
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+}
+
+#[test]
+fn an_inactive_claude_row_draws_no_active_mark_while_its_account_burns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            profile("a", 80.0, 10.0, 3600),
+            profile("b", 80.0, 10.0, 3600),
+        ],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.tps = Some(burning_snapshot("b", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 1, &widths, false, true, &readings);
+    let text = line_text(&line);
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()) || s.content == "●"),
+        "only the active account carries the mark: {text}"
+    );
+}
+
+#[test]
+fn the_active_codex_row_carries_the_codex_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: true,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    };
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_codex_row(&row, &widths, false);
+    let text = line_text(&line);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⏣")
+        .unwrap_or_else(|| panic!("the active codex row carries `⏣`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+    let inactive = render_codex_row(
+        &CodexRow {
+            active: false,
+            ..row
+        },
+        &widths,
+        false,
+    );
+    assert!(
+        !line_text(&inactive).contains('⏣'),
+        "an inactive codex row carries no mark: {}",
+        line_text(&inactive)
+    );
+}
+
+#[test]
+fn a_switching_rows_spinner_turns_orange() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![polled("a", 80.0, 10.0, 3600)], None, vec![]);
+    let app = App::new(config);
+    crate::usage::mark_activity(
+        &app.activity,
+        &ProfileName::from("a"),
+        crate::usage::ProfileActivity::Switching,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let spinner = line
+        .spans
+        .iter()
+        .find(|s| {
+            crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|f| s.content.contains(f))
+        })
+        .unwrap_or_else(|| panic!("a switching row spins: {}", line_text(&line)));
+    assert_eq!(spinner.style.fg, Some(theme::accent_2_color()));
+}
+
+/// A tps snapshot generated at an explicit epoch millisecond, so a test can
+/// pin the shared tps clock and still have the snapshot read fresh.
+fn snapshot_stamped_at(stamp_ms: i64, name: &str, rate: f64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(stamp_ms)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+        .to_string();
+    let figures = crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate,
+            speed: Some(40.0),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(name.into(), figures);
+    snap
+}
+
+#[test]
+fn the_active_shunt_row_carries_the_gateway_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.shunt_mark.names = vec!["a".to_string()];
+    // A burning shunt-backed account still shows the static mark: the
+    // membership test outranks the working line.
+    app.tps = Some(burning_snapshot("a", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let text = line_text(&line);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⥋")
+        .unwrap_or_else(|| panic!("an active shunt-backed row carries `⥋`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref())),
+        "the shunt mark is static, never the working line: {text}"
+    );
+}
+
+#[test]
+fn the_working_line_takes_the_ghostty_frames_on_a_ghostty_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps_now_override = Some(448);
+    app.tps = Some(snapshot_stamped_at(448, "a", 120.0));
+    let frame = |app: &App| -> Option<String> {
+        let widths = OverviewWidths::new(80, app, &readings);
+        render_overview_row(app, 0, &widths, false, true, &readings)
+            .spans
+            .iter()
+            .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()) || s.content == "✳")
+            .map(|s| s.content.to_string())
+    };
+    assert_eq!(
+        frame(&app).as_deref(),
+        Some("*"),
+        "448 ms into the cycle on a default terminal"
+    );
+    {
+        let _ghostty = crate::testutil::GhosttySandbox::new(true);
+        assert_eq!(
+            frame(&app).as_deref(),
+            Some("✳"),
+            "the same moment on the ghostty set"
+        );
+    }
+    assert_eq!(
+        frame(&app).as_deref(),
+        Some("*"),
+        "the guard puts the default family back"
+    );
+}
+
+/// The store is written by every mint, revoke and rename path (the Setup form,
+/// the Services card, the CLI), so the mark follows the file itself: a write
+/// made off the Services card shows on the next tick with no Services visit.
+#[test]
+fn the_shunt_mark_follows_the_token_store_on_the_next_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.bootstrap_started = true;
+    app.tab = crate::tui::app::Tab::Overview;
+    let marked = |app: &App| {
+        let widths = OverviewWidths::new(80, app, &readings);
+        render_overview_row(app, 0, &widths, false, true, &readings)
+            .spans
+            .iter()
+            .any(|s| s.content == "⥋")
+    };
+    assert!(!marked(&app), "no token held: no shunt mark");
+    let store = crate::gateway_tokens::store_path().unwrap();
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    // Every write stamps an explicit instant, so no leg rests on the wall clock
+    // or on the filesystem's mtime granule.
+    let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        marked(&app),
+        "a token written off the Services card marks the row on the next tick"
+    );
+    std::fs::write(&store, "[tokens]\nb = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base + std::time::Duration::from_secs(5));
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "a token renamed away from the account drops its mark on the next tick"
+    );
+    // A stamp that moved BACK still re-reads: a clock step back or an
+    // mtime-preserving restore must not leave a stale mark.
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        marked(&app),
+        "an older store stamp still re-reads the names"
+    );
+    // A store that disappears drops the cached names.
+    std::fs::remove_file(&store).unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "a deleted store drops the names on the next tick"
+    );
+    // The same mtime with contents of another length: the length moves the
+    // stamp where the mtime cannot.
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(marked(&app), "the restored store marks the row again");
+    std::fs::write(&store, "[tokens]\nb = \"tok\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "an equal-mtime write of another length re-reads the names"
+    );
+    // The store's own writer renames a fresh file onto the path: on unix that
+    // new inode moves the stamp even at the same mtime and the same length.
+    #[cfg(unix)]
+    {
+        let before = std::fs::metadata(&store).unwrap();
+        let fresh = store.with_extension("tmp");
+        std::fs::write(&fresh, "[tokens]\na = \"tok\"\n").unwrap();
+        crate::testutil::set_mtime(&fresh, base);
+        std::fs::rename(&fresh, &store).unwrap();
+        let after = std::fs::metadata(&store).unwrap();
+        assert_eq!(after.len(), before.len(), "precondition: the same length");
+        assert_eq!(
+            after.modified().unwrap(),
+            before.modified().unwrap(),
+            "precondition: the same mtime"
+        );
+        crate::tui::app::on_tick(&mut app);
+        assert!(
+            marked(&app),
+            "a same-mtime same-length rename onto the store re-reads the names"
+        );
+    }
+}
+
+#[test]
+fn a_burning_rows_mark_advances_with_the_working_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps_now_override = Some(0);
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let frame_at = |app: &App| {
+        let line = render_overview_row(app, 0, &widths, false, true, &readings);
+        line.spans
+            .iter()
+            .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()))
+            .map(|s| s.content.to_string())
+    };
+    assert_eq!(
+        frame_at(&app).as_deref(),
+        Some("·"),
+        "the cycle starts on its first frame"
+    );
+    app.tps_now_override = Some(640);
+    assert_eq!(
+        frame_at(&app).as_deref(),
+        Some("✻"),
+        "640 ms into the cycle is its eased crest"
+    );
+}
+
+#[test]
+fn the_active_shunt_mark_reads_the_client_token_store_at_startup() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dir = crate::profile::clauth_dir().expect("the sandbox's clauth dir");
+    std::fs::create_dir_all(&dir).expect("create the clauth dir");
+    std::fs::write(
+        dir.join("gateway-client-tokens.toml"),
+        "[tokens]\na = \"tok\"\n",
+    )
+    .expect("seed the client-token store");
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⥋")
+        .unwrap_or_else(|| {
+            panic!(
+                "construction seeds the shunt mark from the store: {}",
+                line_text(&line)
+            )
+        });
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
 }
