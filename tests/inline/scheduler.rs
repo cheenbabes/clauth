@@ -31578,7 +31578,7 @@ fn a_transient_poll_refresh_logs_its_status_and_quarantines_nothing() {
     let name = "poll-503";
     let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
         if path.starts_with("/v1/oauth/token") {
-            (503, "<html>busy</html>".to_string())
+            (503, "<html>POLL-503-WIRE-CANARY</html>".to_string())
         } else if path.starts_with("/api/oauth/usage") {
             (401, r#"{"error":"unauthorized"}"#.to_string())
         } else {
@@ -31625,7 +31625,9 @@ fn a_transient_poll_refresh_logs_its_status_and_quarantines_nothing() {
         "the status is logged: {logged:?}"
     );
     assert!(
-        !logged.iter().any(|l| l.contains("busy")),
+        !logged
+            .iter()
+            .any(|l| l.contains("WIRE-CANARY") || l.contains("<html>")),
         "no byte of the response body reaches the log: {logged:?}"
     );
 }
