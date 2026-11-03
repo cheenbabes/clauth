@@ -1,4 +1,4 @@
-# Found clauth pilot: v0.18.0-found.1
+# Found clauth pilot: v0.18.0-found.2
 
 Found's pilot fork of [uwuclxdy/clauth](https://github.com/uwuclxdy/clauth),
 based on upstream 0.18.0 (`cbc9e127feea725698dfc7f422a038aa12266184`).
@@ -9,11 +9,18 @@ replaces it, so a token rotated outside clauth is no longer lost. The fork's
 credential synchronization stays in place of upstream's live-file follower; see
 the upstream merge section of the recovery design.
 
+0.18.0-found.2 adds diagnostics only. Every refresh path now logs the token
+endpoint's answer (`refresh for '<name>' failed: HTTP 400 (invalid_grant)`,
+`HTTP 503`, ...), and the line that quarantines a profile names why: the
+endpoint refused its refresh token, the token was already spent so it was not
+sent again, or the login holds no refresh token. A quarantine after a lost
+rotation can now be told apart from a revoked login in the daemon log alone.
+
 The fork since 0.17.0-found.2 repairs credential publication after failed token rotations and
 restarts, recognizes previously managed stale credentials, and protects
 unfamiliar logins from automatic replacement. Synchronization status is exposed
 through the existing status/which JSON output. See
-[the recovery design](https://github.com/found-ai/clauth/blob/v0.18.0-found.1/docs/credential-sync-recovery.md) for migration and concurrency
+[the recovery design](https://github.com/found-ai/clauth/blob/v0.18.0-found.2/docs/credential-sync-recovery.md) for migration and concurrency
 limitations.
 
 ## Pilot installation
@@ -29,7 +36,7 @@ and daemon restart on October 16, 2026. See the
 expanding adoption.
 
 Download the binary matching your platform and `sha256sums.txt` from
-[this exact Found release](https://github.com/found-ai/clauth/releases/tag/v0.18.0-found.1).
+[this exact Found release](https://github.com/found-ai/clauth/releases/tag/v0.18.0-found.2).
 Verify the binary's SHA-256 against the corresponding entry before installation.
 On macOS/Linux, make the downloaded binary executable with `chmod +x` before
 installing it.
@@ -47,12 +54,12 @@ is installed. It refuses a missing or mismatched checksum. Source installation
 must also name the fork and tag explicitly:
 
 ```sh
-cargo install --git https://github.com/found-ai/clauth --tag v0.18.0-found.1 --locked clauth
+cargo install --git https://github.com/found-ai/clauth --tag v0.18.0-found.2 --locked clauth
 ```
 
 Before replacing an existing installation, retain its binary and stop every
 clauth daemon/TUI. Restart all clauth processes from the pilot binary, and
-verify `clauth --version` reports `0.18.0-found.1`. Claude sessions are external
+verify `clauth --version` reports `0.18.0-found.2`. Claude sessions are external
 credential writers and do not participate in clauth's installation lock.
 
 Background self-updates and remote automatic reinstalls are disabled in the
