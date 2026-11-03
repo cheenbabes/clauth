@@ -31502,3 +31502,132 @@ fn the_probe_leg_clears_a_credit_refusal_on_a_window_reset_in_the_chain_or_not()
         "a profile in no chain is cleared"
     );
 }
+
+/// The poll's own refresh writes the server's answer down before any adopt,
+/// carry or quarantine acts on it. Without it a quarantine after a lost
+/// rotation reads exactly like a revoked login: the 26 Oct `work` incident
+/// left a 503 on one path and a bare "(flagged auth_broken)" on this one.
+#[test]
+fn a_refused_poll_refresh_logs_the_answer_and_names_it_in_the_quarantine() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "poll-refused";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (400, r#"{"error":"invalid_grant"}"#.to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let _ = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    drop(capture);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the refresh must actually be refused: {seen:?}"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "fixture control: a confirmed invalid_grant on an unmoved store quarantines"
+    );
+    let logged = lines.snapshot();
+    let answer = logged
+        .iter()
+        .position(|l| l == "clauth: refresh for 'poll-refused' failed: HTTP 400 (invalid_grant)")
+        .unwrap_or_else(|| panic!("the server's answer is logged: {logged:?}"));
+    let flagged = logged
+        .iter()
+        .position(|l| {
+            l.ends_with(
+                "(flagged auth_broken: the token endpoint refused its refresh token: \
+                 HTTP 400 (invalid_grant))",
+            )
+        })
+        .unwrap_or_else(|| panic!("the quarantine names the answer: {logged:?}"));
+    assert!(answer < flagged, "the answer comes first: {logged:?}");
+}
+
+/// A 503 on the poll's refresh is logged with its status and quarantines
+/// nothing: the answer is the evidence a later `invalid_grant` on the same
+/// token is read against.
+#[test]
+fn a_transient_poll_refresh_logs_its_status_and_quarantines_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "poll-503";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (503, "<html>POLL-503-WIRE-CANARY</html>".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let _ = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    drop(capture);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the refresh must actually be attempted: {seen:?}"
+    );
+    assert!(
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "a 503 never quarantines"
+    );
+    let logged = lines.snapshot();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l == "clauth: refresh for 'poll-503' failed: HTTP 503"),
+        "the status is logged: {logged:?}"
+    );
+    assert!(
+        !logged
+            .iter()
+            .any(|l| l.contains("WIRE-CANARY") || l.contains("<html>")),
+        "no byte of the response body reaches the log: {logged:?}"
+    );
+}

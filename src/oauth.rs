@@ -414,9 +414,16 @@ pub(crate) enum RefreshError {
 
 impl RefreshError {
     /// The `logline!` rendering of either arm — the only place the endpoint's
-    /// status still surfaces now that the user-facing text is canned.
-    fn log_detail(&self) -> String {
+    /// status still surfaces now that the user-facing text is canned. A
+    /// confirmed `invalid_grant` is named: it is the answer that says the
+    /// server consumed or revoked this very token, which is what tells a lost
+    /// rotation apart from a refusal decided on status alone.
+    pub(crate) fn log_detail(&self) -> String {
         match self {
+            Self::Invalid {
+                failure: f,
+                invalid_grant: true,
+            } => format!("{} (invalid_grant)", f.log_detail()),
             Self::Invalid { failure: f, .. } | Self::Transient(f) => f.log_detail(),
         }
     }
@@ -817,7 +824,7 @@ pub(crate) fn auto_start_kick(
             };
         }
         SendRule::Quarantine => {
-            mark_auth_broken(config, name, true);
+            mark_auth_broken(config, name, BrokenBecause::AlreadySpent);
             return KickResult::not_opened_with(first_rl);
         }
         SendRule::Skip => return KickResult::not_opened_with(first_rl),
@@ -844,7 +851,13 @@ pub(crate) fn auto_start_kick(
     }
     let minted = match refreshed {
         Ok(minted) => minted,
-        Err(_) => return KickResult::not_opened_with(first_rl),
+        // An `invalid_grant` here lands the token in the spent record and the
+        // next spend quarantines on that record alone, so this line is the
+        // only place the server's answer is written down.
+        Err(e) => {
+            logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
+            return KickResult::not_opened_with(first_rl);
+        }
     };
 
     let (access, new_refresh) = minted.pair();
@@ -1218,7 +1231,7 @@ fn rotate_one_inner(
             Err(e) => Err(anyhow::anyhow!("{}", adopt_lock_transient(name, &e).text())),
         },
         Ok(SendRule::Quarantine) => {
-            mark_auth_broken(config, name, true);
+            mark_auth_broken(config, name, BrokenBecause::AlreadySpent);
             Err(anyhow::anyhow!("{}", dead_chain_detail(config, name)))
         }
         Ok(SendRule::Skip) => Err(anyhow::anyhow!("{}", spent_record_unreadable(name).text())),
@@ -2364,7 +2377,7 @@ fn land_staged_pair_carrying(
         );
     }
     if outcome == StageOutcome::Landed && config.lock().is_ok_and(|cfg| cfg.is_auth_broken(name)) {
-        mark_auth_broken(config, name, false);
+        clear_auth_broken(config, name);
     }
     Ok((outcome, landed))
 }
@@ -3761,7 +3774,7 @@ pub(crate) fn adopt_disk_rotation(
             Ok(())
         })?;
     }
-    mark_auth_broken(config, name, false);
+    clear_auth_broken(config, name);
     Ok(())
 }
 
@@ -3824,7 +3837,7 @@ fn gate_under_guard(
     let Some(rt) = refresh_token else {
         // Expiring OAuth token with no refresh token — unrecoverable without a
         // re-login.
-        mark_auth_broken(config, name, true);
+        mark_auth_broken(config, name, BrokenBecause::NoRefreshToken);
         return AuthGate::Broken;
     };
     let rule = match send_rule(config, name, &rt, guard) {
@@ -3854,7 +3867,7 @@ fn gate_under_guard(
             }
         }
         SendRule::Quarantine => {
-            mark_auth_broken(config, name, true);
+            mark_auth_broken(config, name, BrokenBecause::AlreadySpent);
             return AuthGate::Broken;
         }
         SendRule::Skip => return AuthGate::Transient(spent_record_unreadable(name)),
@@ -3895,7 +3908,7 @@ fn gate_under_guard(
                 // the old chain, so a standing quarantine describes neither
                 // that chain nor whatever replaced it.
                 Err(PersistError::Refused { .. }) => {
-                    mark_auth_broken(config, name, false);
+                    clear_auth_broken(config, name);
                     return match oauth_shape(config, name) {
                         Err(gate) => gate,
                         Ok((expires_at, _, _, flagged))
@@ -3912,7 +3925,7 @@ fn gate_under_guard(
                 Err(PersistError::Failed(_)) => return persist_failed(),
             }
             // A successful refresh clears any prior quarantine.
-            mark_auth_broken(config, name, false);
+            clear_auth_broken(config, name);
             AuthGate::Refreshed
         }
         Err(e) => {
@@ -3922,7 +3935,7 @@ fn gate_under_guard(
             logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
             match e {
                 RefreshError::Invalid { .. } => {
-                    mark_auth_broken(config, name, true);
+                    mark_auth_broken(config, name, BrokenBecause::Refused(&e));
                     AuthGate::Broken
                 }
                 RefreshError::Transient(f) => AuthGate::Transient(f.as_refresh_transient()),
@@ -3931,7 +3944,8 @@ fn gate_under_guard(
     }
 }
 
-/// Set or clear a profile's `auth_broken` flag in memory and persist it. The
+/// Set a profile's `auth_broken` flag in memory and persist it ([`clear_auth_broken`]
+/// is the other direction, under the same contract). The
 /// memory flip is unconditional — a refused write must not un-quarantine the
 /// account for live readers, since the scheduler's TokenEntry leg reads this
 /// flag to skip the refresh spend — and the persist runs on EVERY call, not
@@ -3956,8 +3970,53 @@ fn gate_under_guard(
 pub(crate) fn mark_auth_broken(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
-    broken: bool,
+    why: BrokenBecause<'_>,
 ) {
+    set_auth_flag(config, name, Some(why));
+}
+
+/// Clear a profile's `auth_broken` flag; the same persistence contract as
+/// [`mark_auth_broken`].
+pub(crate) fn clear_auth_broken(config: &crate::profile::ConfigHandle, name: &ProfileName) {
+    set_auth_flag(config, name, None);
+}
+
+/// Why a profile is quarantined. The transition line names it, so the log
+/// alone says whether the server refused the token on this request or clauth
+/// declined to send a token it already knew was dead.
+#[derive(Clone, Copy)]
+pub(crate) enum BrokenBecause<'a> {
+    /// The token endpoint refused the refresh token on this request.
+    Refused(&'a RefreshError),
+    /// The stored refresh token is in the spent-token record and the store
+    /// holds no newer login: an earlier answer consumed or refused it, so it is
+    /// not sent again.
+    AlreadySpent,
+    /// The access token is expiring and the login holds no refresh token.
+    NoRefreshToken,
+}
+
+impl BrokenBecause<'_> {
+    fn log_detail(self) -> String {
+        match self {
+            Self::Refused(e) => format!(
+                "the token endpoint refused its refresh token: {}",
+                e.log_detail()
+            ),
+            Self::AlreadySpent => "its stored refresh token was already spent or refused by an \
+                 earlier request, so it was not sent again"
+                .to_string(),
+            Self::NoRefreshToken => "its login holds no refresh token to renew it".to_string(),
+        }
+    }
+}
+
+fn set_auth_flag(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+    why: Option<BrokenBecause<'_>>,
+) {
+    let broken = why.is_some();
     let Ok(mut cfg) = config.lock() else {
         return;
     };
@@ -3965,13 +4024,16 @@ pub(crate) fn mark_auth_broken(
         // Log the transition only — guarded by `set_auth_broken`'s changed-return
         // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
         // dropped login leaves one stderr line, never a per-tick repeat.
-        if broken {
+        if let Some(why) = why {
             // The durable record of the quarantine names the same recovery the
             // live surfaces do: this leg fires for a third-party hybrid too (the
             // scheduler spends any profile holding a refresh token).
             let sentence = third_party_dead_chain_copy(cfg.find(name), name)
                 .unwrap_or_else(|| crate::format::login_expired(name).line());
-            logline!("clauth: {sentence} (flagged auth_broken)");
+            logline!(
+                "clauth: {sentence} (flagged auth_broken: {})",
+                why.log_detail()
+            );
         } else {
             logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
         }
