@@ -5889,20 +5889,27 @@ fn the_quarantine_logline_splits_the_recovery_like_every_other_surface() {
     let sink = crate::logline::LogLines::new();
     let _capture = sink.capture_here();
     for name in ["ql-oauth", "ql-keyed", "ql-keyless"] {
-        mark_auth_broken(&handle, &crate::profile::ProfileName::from(name), true);
+        mark_auth_broken(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            BrokenBecause::AlreadySpent,
+        );
     }
 
     assert_eq!(
         sink.snapshot(),
         vec![
             "clauth: login for 'ql-oauth' has expired: refresh token revoked or invalid: \
-             run `clauth login ql-oauth` (flagged auth_broken)"
+             run `clauth login ql-oauth` (flagged auth_broken: its stored refresh token was already spent or refused \
+             by an earlier request, so it was not sent again)"
                 .to_string(),
             "clauth: stored OAuth chain is dead, its api key still works: ql-keyed (run \
-             `clauth login ql-keyed --api-key <key>` to clear the quarantine) (flagged auth_broken)"
+             `clauth login ql-keyed --api-key <key>` to clear the quarantine) (flagged auth_broken: its stored refresh token was already spent or refused \
+             by an earlier request, so it was not sent again)"
                 .to_string(),
             "clauth: profile has no api key: ql-keyless (run `clauth login ql-keyless \
-             --api-key <key>`) (flagged auth_broken)"
+             --api-key <key>`) (flagged auth_broken: its stored refresh token was already spent or refused \
+             by an earlier request, so it was not sent again)"
                 .to_string(),
         ],
     );
@@ -5946,7 +5953,7 @@ fn mark_auth_broken_does_not_resurrect_a_deleted_profiles_row() {
     mark_auth_broken(
         &stale,
         &crate::profile::ProfileName::from("victim-row"),
-        true,
+        BrokenBecause::AlreadySpent,
     );
 
     let reloaded = crate::profile::load_config().expect("reload");
@@ -6027,7 +6034,7 @@ fn a_failed_set_persist_is_logged_and_retried_by_the_next_call() {
     let _capture = sink.capture_here();
 
     block_state_persist();
-    mark_auth_broken(&handle, &name, true);
+    mark_auth_broken(&handle, &name, BrokenBecause::AlreadySpent);
 
     assert!(
         handle.lock().expect("lock handle").is_auth_broken(&name),
@@ -6042,7 +6049,8 @@ fn a_failed_set_persist_is_logged_and_retried_by_the_next_call() {
     assert_eq!(
         lines[0],
         "clauth: login for 'qp-set' has expired: refresh token revoked or \
-         invalid: run `clauth login qp-set` (flagged auth_broken)"
+         invalid: run `clauth login qp-set` (flagged auth_broken: its stored refresh token was already spent or refused \
+             by an earlier request, so it was not sent again)"
     );
     assert!(
         lines[1]
@@ -6062,7 +6070,7 @@ fn a_failed_set_persist_is_logged_and_retried_by_the_next_call() {
             .is_auth_broken(&name),
         "fixture control: the restored last-good file carries no flag"
     );
-    mark_auth_broken(&handle, &name, true);
+    mark_auth_broken(&handle, &name, BrokenBecause::AlreadySpent);
     assert!(
         crate::profile::load_app_state()
             .expect("reload")
@@ -6088,7 +6096,7 @@ fn a_failed_clear_persist_is_logged_and_retried_by_the_next_call() {
     let _capture = sink.capture_here();
 
     block_state_persist();
-    mark_auth_broken(&handle, &name, false);
+    clear_auth_broken(&handle, &name);
 
     assert!(
         !handle.lock().expect("lock handle").is_auth_broken(&name),
@@ -6122,7 +6130,7 @@ fn a_failed_clear_persist_is_logged_and_retried_by_the_next_call() {
             .is_auth_broken(&name),
         "fixture control: the restored last-good file still carries the flag"
     );
-    mark_auth_broken(&handle, &name, false);
+    clear_auth_broken(&handle, &name);
     assert!(
         !crate::profile::load_app_state()
             .expect("reload")
@@ -6149,7 +6157,7 @@ fn a_failed_set_persist_that_never_retried_stays_invisible_to_a_fresh_load() {
 
     block_state_persist();
     // Refused; the "process" dies here, before any retry.
-    mark_auth_broken(&handle, &name, true);
+    mark_auth_broken(&handle, &name, BrokenBecause::AlreadySpent);
 
     unblock_state_persist(&AppState {
         profiles: vec![name.clone()],
@@ -7716,7 +7724,7 @@ fn gate_with_install_mid_refresh(
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = expiring_fixture(name);
     if flagged {
-        mark_auth_broken(&config, &pn(name), true);
+        mark_auth_broken(&config, &pn(name), BrokenBecause::AlreadySpent);
     }
     let refresher = move |rt: &str, _: Option<&str>| {
         assert_eq!(rt, "rt-old", "the gate spends the store's token");
@@ -9291,4 +9299,119 @@ fn a_spend_over_a_landed_stage_sends_the_landed_token_past_a_torn_store_read() {
         })
         .collect();
     assert_eq!(sent, vec!["rt-mid".to_string()]);
+}
+
+/// The 5-hour kick's refresh used to drop its answer: an `invalid_grant` there
+/// lands the token in the spent record and the NEXT spend quarantines on that
+/// record alone, so the log showed a quarantine with no server answer before
+/// it. Both lines now say what happened, in order.
+#[test]
+fn a_refused_kick_refresh_logs_the_answer_and_the_next_spend_says_it_was_spent() {
+    let home = HomeSandbox::new();
+    let name = "kick-refused";
+    let pn = crate::profile::ProfileName::from(name);
+    // First kick: messages 401 → token 400 invalid_grant. Second kick:
+    // messages 401, then the spent record refuses the send.
+    let (base, server) = crate::testutil::serve_endpoints(4, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (400, r#"{"error":"invalid_grant"}"#.to_string())
+        } else {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let first = auto_start_kick(&config, &pn, "at-old", Some("rt-old"), None, None);
+    assert!(
+        !config.lock().expect("lock").is_auth_broken(&pn),
+        "the kick itself does not quarantine; the spent record carries the verdict"
+    );
+    let second = auto_start_kick(&config, &pn, "at-old", Some("rt-old"), None, None);
+    drop(capture);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !first.opened && !second.opened,
+        "neither kick opens a window"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/oauth/token"))
+            .count(),
+        1,
+        "the spent token is sent once, never again: {seen:?}"
+    );
+    assert!(
+        config.lock().expect("lock").is_auth_broken(&pn),
+        "the second spend quarantines on the spent record"
+    );
+    let logged = lines.snapshot();
+    assert_eq!(
+        logged
+            .iter()
+            .filter(|l| l.starts_with("clauth: "))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "clauth: refresh for 'kick-refused' failed: HTTP 400 (invalid_grant)".to_string(),
+            "clauth: login for 'kick-refused' has expired: refresh token revoked or invalid: \
+             run `clauth login kick-refused` (flagged auth_broken: its stored refresh token \
+             was already spent or refused by an earlier request, so it was not sent again)"
+                .to_string(),
+        ],
+        "the answer, then the quarantine naming why: {logged:?}"
+    );
+}
+
+/// Each quarantine cause renders its own reason, and the refusal's detail
+/// names `invalid_grant` only when the endpoint confirmed it.
+#[test]
+fn each_quarantine_cause_names_itself() {
+    let _home = HomeSandbox::new();
+    let handle = quarantine_persist_fixture("qc-cause", false);
+    let name = crate::profile::ProfileName::from("qc-cause");
+    let confirmed = RefreshError::Invalid {
+        failure: TokenFailure::Status(400),
+        invalid_grant: true,
+    };
+    let status_only = RefreshError::Invalid {
+        failure: TokenFailure::Status(401),
+        invalid_grant: false,
+    };
+    assert_eq!(confirmed.log_detail(), "HTTP 400 (invalid_grant)");
+    assert_eq!(status_only.log_detail(), "HTTP 401");
+    assert_eq!(
+        RefreshError::Transient(TokenFailure::Status(503)).log_detail(),
+        "HTTP 503"
+    );
+
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    for why in [
+        BrokenBecause::Refused(&confirmed),
+        BrokenBecause::NoRefreshToken,
+    ] {
+        mark_auth_broken(&handle, &name, why);
+        clear_auth_broken(&handle, &name);
+    }
+    let flagged: Vec<String> = sink
+        .snapshot()
+        .into_iter()
+        .filter(|l| l.contains("flagged auth_broken"))
+        .collect();
+    assert_eq!(flagged.len(), 2, "{flagged:?}");
+    assert!(
+        flagged[0].ends_with(
+            "(flagged auth_broken: the token endpoint refused its refresh token: \
+             HTTP 400 (invalid_grant))"
+        ),
+        "{flagged:?}"
+    );
+    assert!(
+        flagged[1].ends_with("(flagged auth_broken: its login holds no refresh token to renew it)"),
+        "{flagged:?}"
+    );
 }

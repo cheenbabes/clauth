@@ -28092,7 +28092,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice, 
             // AUTH-1: the fresh login is the documented recovery for a revoked
             // chain, so a standing auth_broken quarantine is stale — same lift
             // every sibling fresh-login path runs.
-            oauth::mark_auth_broken(&app.config, &ProfileName::from(active), false);
+            oauth::clear_auth_broken(&app.config, &ProfileName::from(active));
             app.toast(
                 ToastKind::Success,
                 format!("saved live credentials into '{active}'"),
@@ -30215,7 +30215,7 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
                 // AUTH-1: an adopted first login is a fresh login — lift a
                 // standing auth_broken quarantine like the sibling fresh-login
                 // paths do.
-                oauth::mark_auth_broken(&app.config, active, false);
+                oauth::clear_auth_broken(&app.config, active);
                 app.apply_forgets();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));

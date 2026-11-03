@@ -1064,7 +1064,7 @@ fn carry_external_rotation(
     refetch: &RefetchQueue,
 ) -> Option<FetchOutcome> {
     let fresh = fresher_disk_pair(name, spent_refresh)?;
-    crate::oauth::mark_auth_broken(config, name, false);
+    crate::oauth::clear_auth_broken(config, name);
     if let Ok(mut q) = refetch.lock() {
         q.insert(name.to_string());
     }
@@ -1540,7 +1540,7 @@ fn fetch_with_rotation(
             return FetchOutcome::cached(name, FetchStatus::Cached, Some(pair), None);
         }
         crate::oauth::SendRule::Quarantine => {
-            crate::oauth::mark_auth_broken(config, name, true);
+            crate::oauth::mark_auth_broken(config, name, crate::oauth::BrokenBecause::AlreadySpent);
             return bail_unrotated(&mut profile_fetch);
         }
         crate::oauth::SendRule::Skip => {
@@ -1572,6 +1572,10 @@ fn fetch_with_rotation(
     let minted = match rotation {
         Ok(t) => t,
         Err(e) => {
+            // The server's answer is logged before anything acts on it: an
+            // adopt, a carry or a quarantine below each hide which answer
+            // came back, and a lost rotation is told apart only by it.
+            logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
             // Nothing was minted, so nothing is left to land.
             drop(claim);
             // A failed refresh on the ACTIVE profile usually means the live
@@ -1609,7 +1613,11 @@ fn fetch_with_rotation(
                 // A terminal failure (dead refresh token) quarantines the
                 // account on this tick; a transient one leaves the flag and
                 // retries. See `refresh_failure_is_terminal`.
-                crate::oauth::mark_auth_broken(config, name, true);
+                crate::oauth::mark_auth_broken(
+                    config,
+                    name,
+                    crate::oauth::BrokenBecause::Refused(&e),
+                );
                 return bail_unrotated(&mut profile_fetch);
             }
             // Transient: the chain may still be good, so this account keeps
@@ -1651,7 +1659,7 @@ fn fetch_with_rotation(
     drop(claim);
     // A successful refresh + persist clears any prior auth-broken quarantine
     // (mirrors `ensure_installable`); a no-op when the flag was already clear.
-    crate::oauth::mark_auth_broken(config, name, false);
+    crate::oauth::clear_auth_broken(config, name);
     // A refresh mints a new token for the SAME account, so no `/profile` field can
     // change because of it — the hourly TTL governs the plan here exactly as it
     // does on the plain leg above. Force a pull when holding NO plan (never
