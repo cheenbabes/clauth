@@ -179,7 +179,7 @@ Both fail closed already: `load_config` builds `AppConfig.profiles` from `profil
 
 ## Gotchas
 
-- CI (`.github/workflows/ci.yml`) runs `fmt --check`, `cargo-deny` and `cargo-audit` as parallel jobs beside a per-OS check job: release clippy `-D warnings` + nextest, then debug clippy + nextest, the only leg where the `cfg(debug_assertions)` lock-rank checks run.
+- CI (`.github/workflows/ci.yml`) runs `fmt --check`, `cargo-deny` and `cargo-audit` as parallel jobs beside a per-OS check job: release clippy `-D warnings` + nextest, then debug clippy + nextest, the only leg where the `cfg(debug_assertions)` lock-rank checks run. A pull request runs the debug leg on macOS only; a push to `mommy`, `dev` or `dev-*` runs it on all three OSes.
 - Do not reintroduce codex fields into `AppState`. The file split is what dissolves the mixed-version write-hole class.
 - Lock order: the codex-state mutex reuses existing `RankedMutex` ranks. No new rank, no inversion. Both files sit under `with_state_lock`.
 - `gc_runtime_trees`, the runtime-dir naming walk, and the GC pairing rule are STRICT by design: they act only on names matching `runtime*`/`sessions*` predicates, so a codex home falls through untouched. Do not loosen them into membership lookups. A dead codex marker dir with no paired runtime sibling is collected by the existing orphan branch (`runtime.rs:679-694`), which is the behavior you want.
