@@ -166,7 +166,16 @@ jobs:
       # without one skips instead of paying a second full compile. A bare
       # `debug_assert!` is deliberately not a trigger: it expands to a
       # `cfg!`-guarded assert that release still type- and lint-checks.
+      #
+      # A pull request runs this leg on macOS only; a push (mommy, dev, dev-*)
+      # runs it on all three. The leg doubles each job, and the slowest job sets
+      # a PR's wait. macOS keeps it because the debug build is where the lock
+      # rank checker (`src/lockorder.rs`) runs on every acquisition in every
+      # test, and macOS is the leg that also exercises the Keychain paths. A
+      # Linux- or Windows-only debug failure then shows on the merge push
+      # instead of the PR.
       - name: debug clippy + test
+        if: github.event_name == 'push' || runner.os == 'macOS'
         shell: bash
         env:
           CLAUTH_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
