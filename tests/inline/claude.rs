@@ -628,6 +628,55 @@ fn build_settings_switch_away_from_api_key_clears_helper() {
     assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "https://new.example.com");
 }
 
+/// A key outside the outgoing profile's managed env can have been written by
+/// Claude Code or by hand. It must not outrank the destination's helper or
+/// subscription login merely because it was present in the shared base.
+#[test]
+fn build_settings_drops_unowned_api_key_but_keeps_destination_env_override() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    fs::write(
+        &base,
+        r#"{"theme":"dark","env":{"ANTHROPIC_API_KEY":"old-key","EDITOR":"vim"}}"#,
+    )
+    .expect("seed shared settings");
+    let subscription = crate::profile::Profile::new("subscription".into(), None, None);
+    let mut api = crate::profile::Profile::new(
+        "api".into(),
+        Some("https://api.anthropic.com".into()),
+        Some("destination-key".into()),
+    );
+    for profile in [&subscription, &api] {
+        let json = build_runtime_claude_settings_json(Some(&base), profile, &[]).expect("build");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(value["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(value["env"]["EDITOR"], "vim");
+        assert_eq!(value["theme"], "dark");
+    }
+    let global = build_claude_settings_json(Some(&base), &subscription, &[]).expect("global build");
+    let global: serde_json::Value = serde_json::from_str(&global).expect("global parse");
+    assert_eq!(
+        global["env"]["ANTHROPIC_API_KEY"], "old-key",
+        "this patch must not delete an unmanaged global credential"
+    );
+    api.env
+        .insert("ANTHROPIC_API_KEY".into(), "explicit-key".into());
+    let json = build_runtime_claude_settings_json(Some(&base), &api, &[]).expect("build");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+    assert_eq!(value["env"]["ANTHROPIC_API_KEY"], "explicit-key");
+    assert!(
+        value["apiKeyHelper"]
+            .as_str()
+            .expect("helper")
+            .ends_with("__api-key api")
+    );
+    assert!(
+        fs::read_to_string(base)
+            .expect("source preserved")
+            .contains("old-key")
+    );
+}
+
 /// The helper command string shell-quotes a spaces-in-path exe so the system
 /// shell re-splits it into three tokens. Unix-only because the quoter branches
 /// on `cfg(unix)`; Windows quoting is covered structurally (it wraps the same
