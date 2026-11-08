@@ -2177,3 +2177,184 @@ fn live_rows_find_a_background_rows_record_in_the_background_tree() {
         Some("cccccccc-3333-4333-8333-cccccccccccc".to_string()),
     );
 }
+
+/// Exercise the actual enable and resume entry points with a fake child. The
+/// child-side edits model credentials a Claude session could persist locally;
+/// both synchronizers and runtime teardown must keep them off the global slot.
+#[cfg(unix)]
+#[test]
+fn enabling_and_resuming_api_keeps_four_subscription_profiles_and_global_auth() {
+    use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName};
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let subscriptions: Vec<ProfileName> = ["sub1", "sub2", "sub3", "sub4"]
+        .into_iter()
+        .map(ProfileName::from)
+        .collect();
+    for name in &subscriptions {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: format!("synthetic-{name}"),
+                refresh_token: Some(format!("synthetic-refresh-{name}")),
+                expires_at: Some(1_900_000_000_000),
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        });
+        p.rolling_token = true;
+        crate::profile::save_profile(&p).unwrap();
+        crate::claude::write_session_token(
+            name,
+            &format!("synthetic-sidecar-{name}"),
+            crate::usage::now_ms() as i64,
+        )
+        .unwrap();
+    }
+    let mut api = Profile::new(
+        "api".into(),
+        Some("https://api.anthropic.com".into()),
+        Some("synthetic-api-key".into()),
+    );
+    api.disabled = true;
+    crate::profile::save_profile(&api).unwrap();
+    let mut profiles = subscriptions.clone();
+    profiles.push(api.name.clone());
+    crate::profile::save_app_state(&AppState {
+        profiles,
+        active_profile: Some("sub2".into()),
+        fallback_chain: subscriptions.clone(),
+        ..AppState::default()
+    })
+    .unwrap();
+    crate::claude::force_link_profile_credentials(&"sub2".into()).unwrap();
+    fs::write(
+        claude_home.join("settings.json"),
+        br#"{"env":{},"theme":"dark","enabledPlugins":{}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.home().join(".claude.json"),
+        br#"{"numStartups":4,"oauthAccount":{"accountUuid":"subscription-two"}}"#,
+    )
+    .unwrap();
+    let workspace = home.home().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let transcript = claude_home.join("projects/workspace/resume-api-test.jsonl");
+    write_jsonl(
+        &transcript,
+        &[user_line(
+            "resume-api-test",
+            &workspace.to_string_lossy(),
+            "continue the same chat",
+        )],
+    );
+    let mut protected = vec![
+        home.home().join(".clauth/profiles.toml"),
+        home.home().join(".clauth/credential-sync.json"),
+        claude_home.join(".credentials.json"),
+        claude_home.join("settings.json"),
+        home.home().join(".claude.json"),
+    ];
+    for name in &subscriptions {
+        for file in ["config.toml", "credentials.json", "session-token.json"] {
+            protected.push(
+                home.home()
+                    .join(".clauth/profiles")
+                    .join(name.as_str())
+                    .join(file),
+            );
+        }
+    }
+    let before: Vec<_> = protected
+        .into_iter()
+        .map(|p| {
+            let b = fs::read(&p).unwrap();
+            (p, b)
+        })
+        .collect();
+    crate::cmd_enable("api").unwrap();
+    let enabled = crate::profile::read_profile(&api.name).unwrap();
+    assert!(!enabled.is_disabled());
+    assert!(enabled.credentials.is_none());
+    assert!(enabled.env.is_empty());
+    assert_eq!(enabled.api_key.as_deref(), Some("synthetic-api-key"));
+    for (p, b) in &before {
+        assert_eq!(&fs::read(p).unwrap(), b, "enable changed {}", p.display());
+    }
+
+    let shim = crate::testutil::SlowClaude::new(&home);
+    let task_home = home.home().to_path_buf();
+    let observer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !task_home.join(".slow-claude.pid").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resume never started its fake child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let runtime = fs::read_dir(task_home.join(".clauth/profiles/api"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("runtime-")
+            })
+            .unwrap();
+        let settings_path = runtime.join("settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert!(
+            settings["apiKeyHelper"]
+                .as_str()
+                .unwrap()
+                .ends_with("__api-key api")
+        );
+        assert!(settings["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert!(
+            !fs::read_to_string(&settings_path)
+                .unwrap()
+                .contains("synthetic-api-key")
+        );
+        assert!(
+            runtime
+                .join("projects/workspace/resume-api-test.jsonl")
+                .exists()
+        );
+        settings["env"]["ANTHROPIC_API_KEY"] = json!("synthetic-child-env-key");
+        crate::profile::atomic_write_600(&settings_path, serde_json::to_vec(&settings).unwrap())
+            .unwrap();
+        let json_path = runtime.join(".claude.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&json_path).unwrap()).unwrap();
+        state["primaryApiKey"] = json!("synthetic-child-login-key");
+        crate::profile::atomic_write_600(&json_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        crate::settings_sync::sync_once().unwrap();
+        crate::claude_json::sync_once().unwrap();
+    });
+    run_resume("resume-api-test", Some("api")).unwrap();
+    observer.join().unwrap();
+    drop(shim);
+    for (p, b) in &before {
+        assert_eq!(
+            &fs::read(p).unwrap(),
+            b,
+            "resume or teardown changed {}",
+            p.display()
+        );
+    }
+    let final_api = crate::profile::read_profile(&api.name).unwrap();
+    assert!(
+        final_api.credentials.is_none(),
+        "resume must not adopt global OAuth into the API profile"
+    );
+    assert!(final_api.env.is_empty());
+    assert_eq!(final_api.api_key.as_deref(), Some("synthetic-api-key"));
+    assert!(transcript.exists());
+}

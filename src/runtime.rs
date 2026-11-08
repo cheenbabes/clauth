@@ -76,7 +76,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::claude::{build_claude_settings_json, create_symlink};
+use crate::claude::{build_runtime_claude_settings_json, create_symlink};
 use crate::claude_jobs::JobTrees;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
@@ -10028,7 +10028,7 @@ fn write_merged_settings(
     stale_env_keys: &[String],
 ) -> Result<()> {
     let base = settings_base(claude_home, isolation);
-    let merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
+    let merged = build_runtime_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
     let settings_dst = runtime.join("settings.json");
     // This file carries the api-key profile's top-level `apiKeyHelper` command
     // string (plus the base_url/model env keys), so it must land 0o600 like
@@ -10130,12 +10130,13 @@ fn is_owner_only(path: &Path) -> bool {
 /// profile starts identity-less and Claude Code re-derives it from THIS
 /// profile's own credentials on first boot; that boot (or the next OAuth login)
 /// writes the correct identity, which the syncer then preserves as this copy's
-/// own per-profile field.
+/// own per-profile field. The seed also excludes `primaryApiKey` and
+/// `customApiKeyResponses`, so it cannot import the global saved API login.
 ///
 /// Seeds from the global file when this profile has no real copy yet, or
 /// migrates the old shared symlink (pre-per-profile behavior) to a copy. The
-/// copy is written at owner-only mode (the seed carries the account's
-/// `oauthAccount` billing/identity caches), replacing a symlink in one step —
+/// copy is written at owner-only mode (it still carries private shared
+/// configuration), replacing a symlink in one step —
 /// no window where a sibling session sees the file missing. Existing real
 /// copies keep their own identity and synced shared fields.
 ///
@@ -10189,7 +10190,7 @@ fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
     let Some((home_mtime, home_size, home_bytes)) = read_home_for_seed(&global) else {
         return Ok(());
     };
-    let bytes = strip_oauth_account_on_seed(&home_bytes);
+    let bytes = strip_account_auth_on_seed(&home_bytes);
     let carried_rank =
         crate::jsonsync::carried_rank_of(&record, &global, home_mtime, home_size, &home_bytes);
     crate::jsonsync::write_copy_and_record(
@@ -10251,7 +10252,7 @@ fn seed_unrecorded(global: &Path, dst: &Path) -> Result<()> {
     let Some((_mtime, _size, home_bytes)) = read_home_for_seed(global) else {
         return Ok(()); // nothing to seed
     };
-    let bytes = strip_oauth_account_on_seed(&home_bytes);
+    let bytes = strip_account_auth_on_seed(&home_bytes);
     crate::jsonsync::write_copy_and_record(
         None,
         dst,
@@ -10263,15 +10264,21 @@ fn seed_unrecorded(global: &Path, dst: &Path) -> Result<()> {
     .with_context(|| format!("failed to seed {}", dst.display()))
 }
 
-/// Remove `oauthAccount` from freshly seeded `.claude.json` bytes. A no-op
-/// (returns the bytes unchanged) when the key is already absent or the source
-/// doesn't parse as a JSON object, so the common case stays a plain byte copy.
-fn strip_oauth_account_on_seed(bytes: &[u8]) -> Vec<u8> {
+/// A fresh runtime must not inherit the global account's identity, saved API
+/// key, or API-key approval decisions. The regular JSON synchronizer already
+/// keeps these fields per-account; the initial seed must do so too. Existing
+/// runtime files never pass through this function. A source without these
+/// fields (or one that does not parse as an object) is returned unchanged.
+fn strip_account_auth_on_seed(bytes: &[u8]) -> Vec<u8> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice::<serde_json::Value>(bytes)
     else {
         return bytes.to_vec();
     };
-    if obj.remove("oauthAccount").is_none() {
+    let mut removed = false;
+    for key in ["oauthAccount", "primaryApiKey", "customApiKeyResponses"] {
+        removed |= obj.remove(key).is_some();
+    }
+    if !removed {
         return bytes.to_vec();
     }
     serde_json::to_vec_pretty(&serde_json::Value::Object(obj)).unwrap_or_else(|_| bytes.to_vec())

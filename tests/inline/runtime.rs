@@ -2434,7 +2434,7 @@ fn build_runtime_dir_writes_settings_not_symlink() {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(
             claude_home.join("settings.json"),
-            br#"{"env":{"EXISTING":"1"}}"#,
+            br#"{"env":{"EXISTING":"1","ANTHROPIC_API_KEY":"global-unmanaged-key"}}"#,
         )
         .expect("write settings");
         let runtime = tmp.path().join("runtime");
@@ -2459,11 +2459,22 @@ fn build_runtime_dir_writes_settings_not_symlink() {
             "settings.json must not be a symlink"
         );
 
-        let expected =
-            build_claude_settings_json(Some(&claude_home.join("settings.json")), &profile, &[])
-                .expect("build_claude_settings_json");
+        let expected = build_runtime_claude_settings_json(
+            Some(&claude_home.join("settings.json")),
+            &profile,
+            &[],
+        )
+        .expect("build_claude_settings_json");
         let actual = fs::read_to_string(&settings_dst).expect("read settings");
         assert_eq!(actual, expected);
+        let settings: serde_json::Value = serde_json::from_str(&actual).expect("parse settings");
+        assert!(settings["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(settings["env"]["EXISTING"], "1");
+        let global = fs::read_to_string(claude_home.join("settings.json")).expect("read global");
+        assert_eq!(
+            global,
+            r#"{"env":{"EXISTING":"1","ANTHROPIC_API_KEY":"global-unmanaged-key"}}"#
+        );
     });
 }
 
@@ -4425,9 +4436,12 @@ fn runtime_settings_retightens_a_loose_file_with_current_bytes() {
         );
 
         // Byte-identical to what the merge produces, at the old umask mode.
-        let current =
-            build_claude_settings_json(Some(&claude_home.join("settings.json")), &profile, &[])
-                .expect("build_claude_settings_json");
+        let current = build_runtime_claude_settings_json(
+            Some(&claude_home.join("settings.json")),
+            &profile,
+            &[],
+        )
+        .expect("build_claude_settings_json");
         let settings = runtime.join("settings.json");
         fs::write(&settings, &current).expect("write legacy settings");
         fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).expect("chmod");
@@ -4480,6 +4494,38 @@ fn seed_claude_json_strips_oauth_account_from_fresh_member() {
     });
 }
 
+/// The regular synchronizer keeps these fields per-account; the initial seed
+/// must honor the same boundary even when there is no oauthAccount to remove.
+#[test]
+fn seed_claude_json_drops_login_api_key_and_approvals_without_changing_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let global = home.home().join(".claude.json");
+    let source = br#"{"primaryApiKey":"other-account-key","customApiKeyResponses":{"approved":["other-hash"]},"numStartups":4}"#;
+    fs::write(&global, source).expect("write global");
+    for recorded in [true, false] {
+        let runtime = home
+            .home()
+            .join(if recorded { "recorded" } else { "unrecorded" });
+        fs::create_dir_all(&runtime).expect("runtime");
+        if recorded {
+            seed_claude_json(&runtime, &claude_home).expect("seed");
+        } else {
+            seed_unrecorded(&global, &runtime.join(".claude.json")).expect("seed without record");
+        }
+        let seeded: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime.join(".claude.json")).expect("read seed"))
+                .expect("parse");
+        assert!(seeded.get("primaryApiKey").is_none());
+        assert!(seeded.get("customApiKeyResponses").is_none());
+        assert_eq!(seeded["numStartups"], 4);
+        assert_eq!(
+            fs::read(&global).expect("home still owns its login"),
+            source
+        );
+    }
+}
+
 /// A profile whose runtime already has its own real `.claude.json` (its own
 /// prior login wrote a genuine identity) must keep it — seeding only applies
 /// to a missing file or a leftover shared symlink, never to an existing copy.
@@ -4496,7 +4542,7 @@ fn seed_claude_json_leaves_existing_real_copy_untouched() {
         let runtime = tmp.path().join("runtime");
         fs::create_dir_all(&runtime).expect("mkdir runtime");
         let dst = runtime.join(".claude.json");
-        let own: &[u8] = br#"{"oauthAccount":{"emailAddress":"own@x"},"numStartups":1}"#;
+        let own: &[u8] = br#"{"oauthAccount":{"emailAddress":"own@x"},"primaryApiKey":"own-key","customApiKeyResponses":{"approved":["own-hash"]},"numStartups":1}"#;
         fs::write(&dst, own).expect("write existing runtime copy");
 
         seed_claude_json(&runtime, &claude_home).expect("seed");

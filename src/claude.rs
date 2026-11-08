@@ -5220,7 +5220,7 @@ pub(crate) fn runtime_model_sources(
     stale_env_keys: &[String],
 ) -> RuntimeModelSources {
     let empty = RuntimeModelSources::default();
-    let Ok(json) = build_claude_settings_json(base, profile, stale_env_keys) else {
+    let Ok(json) = build_runtime_claude_settings_json(base, profile, stale_env_keys) else {
         return empty;
     };
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -5431,6 +5431,32 @@ pub(crate) fn build_claude_settings_json(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<String> {
+    build_settings_for(base, profile, prev_env_keys, SettingsDestination::Global)
+}
+
+/// Runtime copies must not inherit an unmanaged API key from the global base.
+/// The base retains that credential: this is a copy boundary, not a migration
+/// or deletion of a login clauth does not own. Explicit profile env still wins.
+pub(crate) fn build_runtime_claude_settings_json(
+    base: Option<&Path>,
+    profile: &Profile,
+    prev_env_keys: &[String],
+) -> Result<String> {
+    build_settings_for(base, profile, prev_env_keys, SettingsDestination::Runtime)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsDestination {
+    Global,
+    Runtime,
+}
+
+fn build_settings_for(
+    base: Option<&Path>,
+    profile: &Profile,
+    prev_env_keys: &[String],
+    destination: SettingsDestination,
+) -> Result<String> {
     let mut settings: serde_json::Value = match base {
         Some(p) if p.exists() => read_json_file(p)?,
         _ => serde_json::json!({}),
@@ -5458,11 +5484,15 @@ pub(crate) fn build_claude_settings_json(
             env.remove("ANTHROPIC_BASE_URL");
         }
     }
-    // Always clear `env.ANTHROPIC_AUTH_TOKEN`. An api-key profile now mints
-    // the key per request via the top-level `apiKeyHelper` (written below, after
-    // the env borrow ends), and a non-api-key profile must not inherit the
-    // previous profile's token.
+    // An API profile supplies its key through apiKeyHelper below. Keep the
+    // existing global AUTH_TOKEN cleanup; additionally, a runtime copy cannot
+    // inherit a raw API key that would outrank its selected profile. Do not
+    // silently delete that unmanaged key from the global settings file.
+    // Explicit destination profile.env entries are applied last.
     env.remove("ANTHROPIC_AUTH_TOKEN");
+    if destination == SettingsDestination::Runtime {
+        env.remove("ANTHROPIC_API_KEY");
+    }
 
     // Model-tier and subagent overrides — clauth-owned env keys, always set or
     // cleared deterministically so a switch never inherits the prior profile's.
